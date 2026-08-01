@@ -479,7 +479,10 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 		// follow the convention (#765).
 		when := "-"
 		if !s.Updated.IsZero() {
-			when = s.Updated.Format("2006-01-02")
+			// The reader's zone, like the brief and stats: a session stamped
+			// 22:00 UTC is 01:00 tomorrow for its author, and this line put it
+			// on the day before the other two screens did (#849).
+			when = s.Updated.Local().Format("2006-01-02")
 		}
 		fmt.Printf("[%s · %s · %s · %s]", s.Harness, s.Project, when, s.ID)
 		title := s.Title
@@ -664,6 +667,15 @@ func printNoMatches(w io.Writer, dir, q string) {
 	// nothing is indexed, and `last`, `blame` and the brief all say what to do
 	// instead. Search is the command a new machine reaches for first (#832).
 	if n, err := index.SessionCount(dir); err == nil && n == 0 {
+		// "Zero indexed sessions" has two very different causes, and the early
+		// return named only the first: a machine with no history, and a machine
+		// where the reader forgot everything themselves. `deja index` cannot
+		// bring back a tombstoned session (#844).
+		if note := hiddenByOwnSettings(); note != "" {
+			fmt.Fprintf(w, "deja: no matches for %q\n", q)
+			fmt.Fprint(w, note)
+			return
+		}
 		fmt.Fprintln(w, emptyIndexHint(fmt.Sprintf("no matches for %q", q)))
 		return
 	}
@@ -1444,6 +1456,19 @@ func runForget(dir string, args []string) error {
 		for _, k := range result.Keys {
 			dropped[k] = true
 		}
+		// Only when the reader named a session: a note swept up by --project or
+		// --before is a decision they deliberately kept, and destroying it is
+		// what #690 exists to prevent. Naming the note's own id is the one
+		// case where "forget this" can only mean its text (#841).
+		if o.Session != "" {
+			if gone, err := sources.ForgetPromotedNotes(func(noteID string) bool {
+				return dropped["deja:"+noteID]
+			}); err != nil {
+				fmt.Fprintf(os.Stdout, "could not remove %s from %s: %v\n", pluralNote(result.Notes), sources.NotesFile(), err)
+			} else if gone > 0 {
+				fmt.Fprintf(os.Stdout, "removed %d promoted note%s from %s\n", gone, pluralS(gone), sources.NotesFile())
+			}
+		}
 		n, err := sources.ForgetPromotedTitles(func(src string) bool {
 			return dropped[src]
 		})
@@ -1460,7 +1485,12 @@ func runForget(dir string, args []string) error {
 			// (#808).
 			fmt.Fprintf(os.Stdout, "it is still in %s — %s and run this again\n", sources.NotesFile(), forgetTitleFix(err))
 		case n > 0:
-			fmt.Fprintf(os.Stdout, "cleared the borrowed title from %d promoted note%s\n", n, pluralS(n))
+			// The note keeps the decision it was promoted for — often the
+			// reason the raw session was safe to forget (#666) — so say that
+			// its content is still there rather than let the line read as
+			// "the note was handled" (#841).
+			fmt.Fprintf(os.Stdout, "cleared the borrowed title from %d promoted note%s; %s still holds what you wrote there — `deja forget --session deja-note-…` removes it\n",
+				n, pluralS(n), sources.NotesFile())
 		}
 	}
 	// Nothing matched is a different answer from nothing was dropped: the
@@ -1663,6 +1693,14 @@ func noAgentHistoryFound() bool {
 		}
 	}
 	return true
+}
+
+// pluralNote words the notes in the failure line above.
+func pluralNote(n int) string {
+	if n == 1 {
+		return "the promoted note"
+	}
+	return "the promoted notes"
 }
 
 // forgetTitleFix names the fix by the cause. The first version of this line

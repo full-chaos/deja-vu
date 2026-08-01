@@ -952,12 +952,8 @@ func FindByPrefix(dir, p string) (model.Session, bool, error) {
 		}
 	}
 	if len(matches) == 0 {
-		// Result lines elide the middle of a long id, so what a reader copies
-		// out of a search is a head and a tail rather than a prefix (#707).
-		// Falling back to a substring match costs nothing when the prefix
-		// worked and saves the copy-paste when it did not.
 		for _, meta := range m.Sessions {
-			if strings.Contains(meta.ID, p) {
+			if idLooselyMatches(meta.ID, p) {
 				matches = append(matches, meta)
 			}
 		}
@@ -991,7 +987,39 @@ func PrefixMatches(dir, p string) int {
 			n++
 		}
 	}
+	if n == 0 {
+		// The count and the resolver have to agree, or a reader is told an id
+		// matches nothing and then watches it open (#853).
+		for _, meta := range m.Sessions {
+			if idLooselyMatches(meta.ID, p) {
+				n++
+			}
+		}
+	}
 	return n
+}
+
+// idLooselyMatches accepts what a reader can actually copy off the screen.
+// Result lines elide the middle of a long id, so the copied text is a head and
+// a tail rather than a prefix (#707) — and it carries the "…" itself, which
+// appears in no id, so a prefix or substring test can never hit it (#853).
+func idLooselyMatches(id, p string) bool {
+	if idElided(p) {
+		return idMatchesElided(id, p)
+	}
+	return strings.Contains(id, p)
+}
+
+// idElided reports whether p is an id as a result line printed it.
+func idElided(p string) bool { return strings.Contains(p, "…") }
+
+// idMatchesElided reads the printed form back: the head and tail it stands for.
+// A destructive selector takes only this half of idLooselyMatches — a substring
+// selector would make `forget --session s1` also match `deja-note-claude-s1`
+// and destroy the decision #690 and #841 keep (#855).
+func idMatchesElided(id, p string) bool {
+	head, tail, ok := strings.Cut(p, "…")
+	return ok && strings.HasPrefix(id, head) && strings.HasSuffix(id, tail)
 }
 
 // PrefixHarnesses names the harnesses holding a session whose id is exactly the
