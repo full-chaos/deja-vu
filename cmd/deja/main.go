@@ -254,10 +254,23 @@ func cmdIndex(dir string, rest []string) error {
 		fmt.Fprintf(os.Stderr, "deja: %s: %d path%s could not be read — `deja doctor` names %s\n",
 			h, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
 	}
+	// The parse count and the indexed count differ by exactly these, and this
+	// is where both are on screen (#868).
+	if n := index.ReportEmptySessions(); n > 0 {
+		fmt.Fprintf(os.Stderr, "deja: %d transcript%s held no message deja could index — not counted as %s\n",
+			n, pluralS(n), pluralSessionWord(n))
+	}
 	if n := index.ReportCollisions(); n > 0 {
 		fmt.Fprintf(os.Stderr, "deja: %d session%s %s an id with another transcript — each pair is filed under one project, the one whose file sorts first\n", n, pluralS(n), verbShare(n))
 	}
 	maybeFirstIndexGreeting(dir)
+	// The live display erases itself on the way out, so a rebuild on a
+	// terminal ended with an empty screen — three seconds of animation and no
+	// record of what was built. Piped output has said it all along; this is
+	// the same two numbers for the reader who watched it happen (#867).
+	if b := index.LastBuild; !b.Initial && b.Messages > 0 && logoWanted(os.Stdout) && os.Getenv("DEJA_WARMUP_SENTINEL") == "" {
+		fmt.Fprintf(os.Stderr, "deja: indexed %d session%s, %d message%s\n", b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages))
+	}
 	return nil
 }
 
@@ -309,21 +322,8 @@ func cmdShow(dir string, rest []string, sourceInstance string) error {
 	} else if n := len(s.Messages); n > showLargeSession {
 		fmt.Fprintf(os.Stderr, "deja: %d messages — `--offset n --limit n` reads a slice\n", n)
 	}
-	// The prefix picks the newest of its matches, which is the right default
-	// and, until now, a silent one: "2" resolved eleven sessions on a real
-	// store and the reader had no way to know they were shown a choice.
 	if o.harness == "" {
-		if n := index.PrefixMatches(dir, o.id); n > 1 {
-			// When the matches are the same id in different harnesses there is
-			// no longer prefix to reach for, and --harness is the only thing
-			// that separates them (#719).
-			if hs := index.PrefixHarnesses(dir, o.id); len(hs) > 1 {
-				fmt.Fprintf(os.Stderr, "deja: %d sessions share the id %q — showing the most recent; use --harness %s\n",
-					len(hs), o.id, strings.Join(hs, "|"))
-			} else {
-				fmt.Fprintf(os.Stderr, "deja: %d sessions start with %q — showing the most recent; use a longer prefix for another\n", n, o.id)
-			}
-		}
+		noteAmbiguousPrefix(dir, o.id, "showing")
 	}
 	search.PrintSession(os.Stdout, s)
 	return nil
@@ -851,6 +851,36 @@ func isSubcommand(word string) bool {
 	return false
 }
 
+// noteAmbiguousPrefix says when a selector reached more than one session.
+//
+// The prefix picks the newest of its matches, which is the right default and
+// was a silent one: "2" resolved eleven sessions on a real store. `show`
+// learned to say so in #719 and #859; promote, handoff, resume and share
+// resolve the same way and still picked in silence — promote records a state
+// against whichever session it chose (#872).
+func noteAmbiguousPrefix(dir, id, action string) {
+	n := index.PrefixMatches(dir, id)
+	if n <= 1 {
+		return
+	}
+	// When the matches are the same id in different harnesses there is no
+	// longer prefix to reach for, and --harness is the only thing that
+	// separates them (#719).
+	if hs := index.PrefixHarnesses(dir, id); len(hs) > 1 {
+		fmt.Fprintf(os.Stderr, "deja: %d sessions share the id %q — %s the most recent; use --harness %s\n",
+			len(hs), id, action, strings.Join(hs, "|"))
+		return
+	}
+	// "A longer prefix" is not available when the reader copied an elided id
+	// off a result line: the characters that would disambiguate are the ones
+	// the elision replaced (#859).
+	advice := "use a longer prefix for another"
+	if strings.Contains(id, "…") {
+		advice = "the ids differ in the middle the line elides — `deja last` prints them whole"
+	}
+	fmt.Fprintf(os.Stderr, "deja: %d sessions match %q — %s the most recent; %s\n", n, id, action, advice)
+}
+
 func findByPrefix(dir, p string) (model.Session, bool, error) {
 	if err := index.Ensure(dir, "", false, os.Stderr); err == nil {
 		if s, ok, err := index.FindByPrefix(dir, p); err == nil {
@@ -1355,9 +1385,28 @@ func printSources(dir string) {
 	fmt.Printf("opencode\t%s\tsessions=%d messages=%d size=%s redacted=%d%s\n", sources.OpencodeDB(), s, m, humanBytes(size), redactions[sources.OpencodeDB()], note)
 }
 
+// forgetScopeRefusal stops a destructive run whose selector reaches further
+// than the reader can have meant.
+//
+// `--session` takes a prefix, which is documented and useful for a day's ids —
+// but it also let one exact-looking id drop twelve sessions, and the count
+// arrived in the past tense afterwards (#870). An id copied off a result line
+// is worse still: the characters that tell the sessions apart are the ones the
+// line elided, so no longer prefix exists to reach for (#859).
+func forgetScopeRefusal(selector string, matches int, allMatches bool) error {
+	if matches <= 1 || allMatches {
+		return nil
+	}
+	if strings.Contains(selector, "…") {
+		return fmt.Errorf("%q matches %d sessions — the ids differ in the middle the line elides; `deja last` prints them whole", selector, matches)
+	}
+	return fmt.Errorf("%q is a prefix of %d sessions — `deja forget --session %s --dry-run` lists what would go; add --all-matches to drop them all", selector, matches, selector)
+}
+
 func runForget(dir string, args []string) error {
 	var o index.ForgetOptions
 	list := false
+	allMatches := false
 	unforget := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -1365,6 +1414,8 @@ func runForget(dir string, args []string) error {
 			list = true
 		case "--dry-run":
 			o.DryRun = true
+		case "--all-matches":
+			allMatches = true
 		case "--session", "--project", "--before", "--unforget":
 			if i+1 >= len(args) {
 				return fmt.Errorf("forget: %s needs value", args[i])
@@ -1425,16 +1476,34 @@ func runForget(dir string, args []string) error {
 		fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index\n", lifted, pluralS(lifted))
 		return nil
 	}
+	// The scope check runs on a dry pass first: a refusal printed after
+	// index.Forget has already written the tombstones is not a refusal.
+	if o.Session != "" && !o.DryRun {
+		probe := o
+		probe.DryRun = true
+		pr, perr := index.Forget(dir, probe)
+		if perr != nil {
+			return perr
+		}
+		if err := forgetScopeRefusal(o.Session, pr.Sessions, allMatches); err != nil {
+			return err
+		}
+	}
 	result, err := index.Forget(dir, o)
 	if err != nil {
 		return err
 	}
-	// A dry run changes nothing, so reporting it in the past tense — the same
-	// three lines the real command prints — tells the reader their sessions are
-	// gone when they are not.
 	if o.DryRun {
 		fmt.Fprintf(os.Stdout, "dry run — nothing was changed\nwould drop: %d session(s), %d message(s)\nwould add: %d tombstone(s)\n",
 			result.Sessions, result.Messages, result.Tombstones)
+		// The dry run is where someone checks the scope, so it says the same
+		// thing the real run would refuse with rather than erroring: nothing
+		// is being changed here, and the note is the answer they came for.
+		if o.Session != "" {
+			if scope := forgetScopeRefusal(o.Session, result.Sessions, allMatches); scope != nil {
+				fmt.Fprintln(os.Stdout, scope.Error())
+			}
+		}
 		if result.Notes > 0 {
 			fmt.Fprintf(os.Stdout, "%d of them %s promoted note%s — the decisions you kept, not raw sessions\n",
 				result.Notes, verbWere(result.Notes), pluralS(result.Notes))
@@ -1624,7 +1693,7 @@ Usage:
   deja last [n] [--json] [--project name] [--harness name] [--since duration] [--role user|assistant|tool]
   deja sources
   deja completion <bash|zsh|fish>
-  deja forget --session <id-prefix> [--project <substring>] [--before <duration|date>] [--dry-run]
+  deja forget --session <id-prefix> [--project <substring>] [--before <duration|date>] [--dry-run] [--all-matches]
   deja forget --list | --unforget <id>
   deja doctor [--json] [--deep] [--offline]
   deja warmup
@@ -1725,6 +1794,14 @@ func sortedHarnesses(m map[string]index.HarnessIngest) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// pluralSessionWord words the tail of the empty-transcript line.
+func pluralSessionWord(n int) string {
+	if n == 1 {
+		return "a session"
+	}
+	return "sessions"
 }
 
 // pluralWhich matches the pronoun to the count in the ingest warning.

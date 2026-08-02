@@ -217,9 +217,27 @@ func performUpdate(cfg updateConfig, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("extract %s: %w", archiveName, err)
 	}
+	// Reaching here with a manager-owned binary means the reader passed
+	// --force: the branch above returns otherwise. That is their decision, so
+	// deja writes — but the consequence it spells out without --force is the
+	// one it never mentioned with it, and the next manager run silently puts
+	// the old binary back (#866).
+	if mgr, command := packageManagerOwning(cfg.executable); mgr != "" {
+		fmt.Fprintf(out, "warning: %s manages this binary — the next %s run puts its own version back; `%s` updates it for good\n", mgr, mgr, command)
+	}
 	if err := installUpdateBinary(cfg.executable, binary); err != nil {
 		if errors.Is(err, os.ErrPermission) {
-			return fmt.Errorf("replace %s: %w; rerun with permission to write its install directory or use your package manager", cfg.executable, err)
+			// The raw error names the temporary file deja was about to write,
+			// which does not exist and cannot be acted on; the directory is
+			// what the reader has to change. And when a package manager owns
+			// the binary, deja knows its name and its command — it prints
+			// them when the same command succeeds — so "use your package
+			// manager" was advice deja could have finished (#865).
+			dir := filepath.Dir(cfg.executable)
+			if _, command := packageManagerOwning(cfg.executable); command != "" {
+				return fmt.Errorf("cannot replace %s: no permission to write %s — `%s` updates it, or rerun with permission to write that directory", cfg.executable, dir, command)
+			}
+			return fmt.Errorf("cannot replace %s: no permission to write %s — rerun with permission to write that directory", cfg.executable, dir)
 		}
 		return fmt.Errorf("replace %s: %w", cfg.executable, err)
 	}

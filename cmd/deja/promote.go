@@ -66,6 +66,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		return fmt.Errorf("promote: state must be accepted, rejected, superseded or stale — `--state accepted` takes an earlier mark back")
 	}
 	s, ok, err := findByPrefix(dir, prefix)
+	noteAmbiguousPrefix(dir, prefix, "promoting")
 	if err != nil {
 		return err
 	}
@@ -86,18 +87,17 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		title = firstLine(text)
 	}
 	if err := sources.AppendPromotedTagged(s.Project, title, text, src, state, tags, time.Now()); err != nil {
-		// A decision the user wants to keep is what this command exists for,
-		// and `open …: permission denied` names a syscall and nothing to do
-		// about it — while index and forget both say what to change (#806).
-		if errors.Is(err, fs.ErrPermission) {
-			return fmt.Errorf("cannot write %s — check that file and its directory's permissions, or set DEJA_NOTES_FILE somewhere writable", sources.NotesFile())
-		}
-		return err
+		return notesWriteError(err)
 	}
 	if exportPath != "" {
 		masked, err := exportPromoted(exportPath, title, text, src, state, s.Updated)
 		if err != nil {
-			return err
+			// The note is already written by this point, so failing with a bare
+			// syscall told the reader their decision was lost when it was not
+			// — and named a path with nothing to do about it (#871).
+			fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, title)
+			return fmt.Errorf("the note is kept, but %s could not be written (%s) — export it somewhere you can, or read the note back with `deja show %s`",
+				exportPath, exportFailureReason(err), "deja-note-"+strings.ReplaceAll(src, ":", "-"))
 		}
 		// The one outbound path that said nothing: `--to` exists to hand a
 		// decision to someone, and `share` and `sync export` both end with this
@@ -122,6 +122,19 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	}
 	fmt.Fprintln(stdout, "the note now outranks the raw transcript in recall; corrections append with `deja promote", prefix, "--state <state>`")
 	return nil
+}
+
+// notesWriteError turns a refused write of the notes file into something the
+// reader can act on. A decision someone wants to keep is what these commands
+// exist for, and `open …: permission denied` names a syscall and nothing to do
+// about it — while index and forget both say what to change (#806). The same
+// file is written by promote, `deja remember` and the MCP remember tool, and
+// only promote said it (#869).
+func notesWriteError(err error) error {
+	if errors.Is(err, fs.ErrPermission) {
+		return fmt.Errorf("cannot write %s — check that file and its directory's permissions, or set DEJA_NOTES_FILE somewhere writable", sources.NotesFile())
+	}
+	return err
 }
 
 // markTakenBack says that an accepted mark cleared the rejected/superseded/
@@ -207,10 +220,52 @@ func exportPromoted(path, title, text, src, state string, updated time.Time) (in
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
+	// The separating blank line is the leading "\n" below, which assumes the
+	// file already ends with one. A markdown file whose last line has no
+	// newline — a hand-written list, most often — got the heading glued to it
+	// (#871).
+	lead := ""
+	if fi, statErr := f.Stat(); statErr == nil && fi.Size() > 0 && !endsWithNewline(path) {
+		lead = "\n"
+	}
 	day := updated.UTC().Format("2006-01-02")
 	if updated.IsZero() {
 		day = time.Now().UTC().Format("2006-01-02")
 	}
-	_, err = fmt.Fprintf(f, "\n## %s\n\n- state: %s\n- source: %s (%s)\n\n%s\n", title, state, src, day, text)
+	_, err = fmt.Fprintf(f, "%s\n## %s\n\n- state: %s\n- source: %s (%s)\n\n%s\n", lead, title, state, src, day, text)
 	return masked, err
+}
+
+// exportFailureReason names why the export path could not be written, without
+// repeating the path the caller already prints.
+func exportFailureReason(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, fs.ErrNotExist):
+		return "its directory does not exist"
+	case strings.Contains(err.Error(), "is a directory"):
+		return "that path is a directory"
+	}
+	return err.Error()
+}
+
+// endsWithNewline reports whether the file's last byte is a newline. Reading
+// one byte is cheaper than reading the file, and the answer decides whether
+// the appended section needs its own separator.
+func endsWithNewline(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return true
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return true
+	}
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, fi.Size()-1); err != nil {
+		return true
+	}
+	return buf[0] == '\n'
 }

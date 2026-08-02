@@ -82,7 +82,7 @@ func runDoctor(w io.Writer, args []string, lookup doctorVersionLookup, dir strin
 		}
 		return deepDriftErr(deepReport)
 	}
-	doctorHarnesses(w)
+	doctorHarnesses(w, dir)
 	printDoctorStoreWarnings(w, report.Stores)
 	fmt.Fprintln(w)
 	doctorTools(w)
@@ -92,6 +92,10 @@ func runDoctor(w io.Writer, args []string, lookup doctorVersionLookup, dir strin
 	doctorMCP(w)
 	fmt.Fprintln(w)
 	doctorHooks(w)
+	// After doctorHooks, not inside it: that function returns early on a
+	// machine without claude settings, which is exactly a machine whose other
+	// harnesses may still be wired to a binary that moved.
+	doctorWiringExe(w)
 	fmt.Fprintln(w)
 	doctorIndex(w, report.Index, dir)
 	fmt.Fprintln(w)
@@ -166,6 +170,25 @@ func doctorHooks(w io.Writer) {
 	fmt.Fprintf(w, "  %-12s %-11s %s\n", "precompact", status, path)
 	doctorCodexHook(w)
 	doctorAutoRecall(w)
+}
+
+// doctorWiringExe reports configs that name a binary which is no longer there.
+//
+// Every hook and MCP entry deja writes holds an absolute path. Move the binary
+// and those configs keep naming the old one: the harness fails to start deja
+// on every session, and doctor happily printed "wired" for a hook that cannot
+// run. The repair from #773 exists but runs from the hook path — the one path
+// a dead binary cannot reach — so doctor is where a person finds out (#876).
+func doctorWiringExe(w io.Writer) {
+	st := readWiringState()
+	if st.Exe == "" || len(st.Targets) == 0 {
+		return
+	}
+	if _, err := os.Stat(st.Exe); err == nil {
+		return
+	}
+	fmt.Fprintf(w, "  %-12s %-11s configs name %s, which is not there — `deja install %s` rewrites them for this binary\n",
+		"wiring", "stale", st.Exe, strings.Join(st.Targets, " "))
 }
 
 // doctorCodexHook reports the codex session-start hook state. Codex gates
@@ -296,14 +319,28 @@ func printDoctorStoreWarnings(w io.Writer, stores []doctorStore) {
 	}
 }
 
-func doctorHarnesses(w io.Writer) {
+func doctorHarnesses(w io.Writer, dir string) {
 	fmt.Fprintln(w, "Harness stores:")
 	sqlite := sources.SQLite3Available()
+
+	// Files are what deja found; sessions are what they became. The two differ
+	// whenever ids collide — a resumed transcript, a copied one, a harness that
+	// reuses a thread id — and the difference is invisible in a row that only
+	// counts files (#861).
+	indexed := index.HarnessSessionCounts(dir)
 
 	printRow := func(name, path string, present bool, detail string) {
 		status := "missing"
 		if present {
 			status = "found"
+		}
+		if present {
+			if n, ok := indexed[name]; ok {
+				if detail != "" {
+					detail += ", "
+				}
+				detail += doctorCount(n, "indexed session")
+			}
 		}
 		line := fmt.Sprintf("  %-12s %-8s %s", name, status, path)
 		if detail != "" {
@@ -671,6 +708,10 @@ func doctorTOMLWired(path string) bool {
 	return false
 }
 
+// indexOlderFormat is a variable so a test can put doctor in front of an index
+// this build cannot read without shipping a manifest writer.
+var indexOlderFormat = index.OlderFormat
+
 func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 	fmt.Fprintln(w, "Index:")
 	loc := idx.Path
@@ -683,6 +724,14 @@ func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 	// boundary in the tool itself, not only in the security docs.
 	fmt.Fprintln(w, "  security plaintext on disk — protected by file permissions only, no encryption or access control")
 	if idx.State == "missing" {
+		// A build already running is not a missing index, and "run `deja
+		// warmup`" tells the reader to start what is under way — doctor is
+		// the command people run when memory looks absent, so this is the
+		// worst place to describe it as absent (#873).
+		if st := readWarmupStatus(dir); st != nil {
+			fmt.Fprintf(w, "  status   building now (%s) — recall comes online in a few seconds\n", st.progress())
+			return
+		}
 		fmt.Fprintln(w, "  status   not built (run `deja warmup`)")
 		return
 	}
@@ -691,6 +740,13 @@ func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 		updated = fi.ModTime().Format("2006-01-02 15:04")
 	}
 	fmt.Fprintf(w, "  status   built (size=%s, updated=%s)\n", humanBytes(pathSize(dir)), updated)
+	// An index written by an older format is unreadable to this binary: the
+	// hook paths refuse it and ask for a rebuild, which is why memory goes
+	// quiet after an upgrade. doctor called that "up to date" — the one
+	// command someone runs to find out why nothing is recalled (#877).
+	if indexOlderFormat(dir) {
+		fmt.Fprintln(w, "  format   written by an older deja — this build cannot read it; the next session rebuilds it, or run `deja index` now")
+	}
 	// A store whose postings vanished or whose record log was truncated cannot
 	// answer anything, and said "up to date" until #735. The next search
 	// rebuilds it, which is worth saying too — the reader has not lost memory,

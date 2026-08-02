@@ -330,7 +330,12 @@ func cachedHookDigest(dir string) (string, int, int64, []string) {
 	// in hookDigestResult, so an index left behind by an upgrade was served
 	// stale and never rebuilt (#777). The cached digest is still the user's
 	// own history, so serve it — just ask for the rebuild too.
-	if index.HasManifest(dir) && (!index.IsCurrentVersion(dir) || index.Damaged(dir)) {
+	// A deleted index is the same situation with the manifest gone: the cache
+	// answered from a store that no longer exists and asked for nothing, so it
+	// kept serving that snapshot forever — every session recorded after the
+	// deletion invisible to the hook (#874). Caches do get wiped: ~/.cache is
+	// fair game for cleanup tools and CI images.
+	if !index.HasManifest(dir) || !index.IsCurrentVersion(dir) || index.Damaged(dir) {
 		requestWarmup(dir)
 	}
 	gate := hookGate()
@@ -532,6 +537,25 @@ func hookDigestResult(dir string) (string, int, int64, []string) {
 	return text, result.Sessions, rawSize(ss), matched
 }
 
+// warmupDeadAfter is how long a warmup may go without publishing progress
+// before the next hook treats it as dead and starts another. It is far longer
+// than any gap between progress reports — those come at every phase and every
+// harness — and far shorter than warmupRetryAfter, which was the whole wait a
+// killed build used to cost.
+const warmupDeadAfter = 2 * time.Minute
+
+// warmupLooksDead reports whether the build the sentinel stands for has
+// stopped without clearing it. A warmup killed mid-build — a closed laptop, an
+// OOM, a terminal that took its process group with it — left the sentinel
+// behind, and for the next ten minutes every hook returned nothing, spawned
+// nothing and said nothing (#875).
+func warmupLooksDead(dir string, now time.Time, stamp int64) bool {
+	if st := readWarmupStatus(dir); st != nil {
+		return false
+	}
+	return now.Sub(time.Unix(0, stamp)) > warmupDeadAfter
+}
+
 func requestWarmup(dir string) {
 	if os.Getenv("DEJA_WARMUP_SENTINEL") != "" {
 		return
@@ -548,7 +572,7 @@ func requestWarmup(dir string) {
 		}
 		b, readErr := os.ReadFile(sentinel)
 		stamp, parseErr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-		if readErr == nil && parseErr == nil && now.Sub(time.Unix(0, stamp)) < warmupRetryAfter {
+		if readErr == nil && parseErr == nil && now.Sub(time.Unix(0, stamp)) < warmupRetryAfter && !warmupLooksDead(dir, now, stamp) {
 			return
 		}
 		if os.Remove(sentinel) != nil {
