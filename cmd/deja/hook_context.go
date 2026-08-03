@@ -158,6 +158,26 @@ func rewireNote(targets []string) string {
 	return fmt.Sprintf("deja: rewrote its wiring for %s after an upgrade — `deja install` is what writes those commands", strings.Join(targets, ", "))
 }
 
+// buildNotice is what a session start says while a build runs: the published
+// progress if there is any, the bare promise if the build was only just asked
+// for, and the reason instead when the index cannot be written at all. It is
+// shared with the environment-facts path, which returned before ever reaching
+// it — so a machine that had environment facts heard nothing at all through an
+// entire post-upgrade rebuild, while the statusline showed the progress bar
+// (#927).
+func buildNotice(dir string) string {
+	if st := readWarmupStatus(dir); st != nil {
+		return st.line()
+	}
+	if !warmupJustRequested(dir) {
+		return ""
+	}
+	if !indexDirWritable(dir) {
+		return fmt.Sprintf("deja: the index needs rebuilding and %s is not writable — `deja index` says what to change", filepath.Dir(dir))
+	}
+	return "deja: indexing your history — recall comes online in a few seconds"
+}
+
 // runHookContext prints session-start context. plain=false emits the Claude
 // Code / Codex hook JSON envelope; plain=true prints the bare digest for
 // hosts that inject raw text (the opencode plugin).
@@ -202,6 +222,10 @@ func runHookContext(dir string, plain bool) error {
 			var resp sessionStartHookResponse
 			resp.HookSpecificOutput.HookEventName = "SessionStart"
 			resp.HookSpecificOutput.AdditionalContext = out
+			// The environment block is not the project's memory, and while a
+			// build runs it is all there is: without this the whole rebuild
+			// passed in silence on any machine with facts to report (#927).
+			resp.SystemMessage = joinNotes(rewireNote(rewired), buildNotice(dir))
 			if b, err := json.Marshal(resp); err == nil {
 				fmt.Fprintln(os.Stdout, string(b))
 			}
