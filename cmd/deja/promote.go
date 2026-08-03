@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/redact"
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -109,6 +110,19 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	if line := markTakenBack(src, state, prior); line != "" {
 		fmt.Fprintln(stdout, line)
 	}
+	// Taking a decision back is the same moment forget is: the machines that
+	// already have this session keep the note as it was, and deja knows which
+	// ones (#898). Only for the states that withdraw something — an ordinary
+	// `accepted` is not a retraction.
+	if state != "accepted" {
+		if peers, exported := index.PushedTo(dir, s.Harness, s.ID); len(peers) > 0 || exported {
+			where := "another machine"
+			if len(peers) > 0 {
+				where = strings.Join(peers, ", ")
+			}
+			fmt.Fprintf(stdout, "already sent to %s — this mark stays here; a copy over there still reads as it did\n", where)
+		}
+	}
 	if state == "accepted" {
 		all := sources.LoadPromotedNotes()
 		me := sources.PromotedNote{Project: s.Project, Session: src, State: state, Title: title, Text: text, Tags: sources.NormalizeTags(tags)}
@@ -120,7 +134,10 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	if exportPath != "" {
 		fmt.Fprintf(stdout, "exported to %s\n", exportPath)
 	}
-	fmt.Fprintln(stdout, "the note now outranks the raw transcript in recall; corrections append with `deja promote", prefix, "--state <state>`")
+	// The id deja resolved, not the one the reader typed: a prefix that stood
+	// for several sessions would send the correction to whichever is newest —
+	// measured, that was a different session from the one just marked (#884).
+	fmt.Fprintln(stdout, "the note now outranks the raw transcript in recall; corrections append with `deja promote", s.ID, "--state <state>`")
 	return nil
 }
 

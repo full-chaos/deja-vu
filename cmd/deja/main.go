@@ -251,8 +251,14 @@ func cmdIndex(dir string, rest []string) error {
 		if e.FailedFiles == 0 {
 			continue
 		}
+		// "deja: deja: 1 path could not be read" is the notes file, and reads
+		// like a stutter. It is the user's own writing, so it says so (#901).
+		name := h
+		if h == "deja" {
+			name = "your notes"
+		}
 		fmt.Fprintf(os.Stderr, "deja: %s: %d path%s could not be read — `deja doctor` names %s\n",
-			h, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
+			name, e.FailedFiles, pluralS(e.FailedFiles), pluralWhich(e.FailedFiles))
 	}
 	// The parse count and the indexed count differ by exactly these, and this
 	// is where both are on screen (#868).
@@ -484,6 +490,14 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 			// on the day before the other two screens did (#849).
 			when = s.Updated.Local().Format("2006-01-02")
 		}
+		// A day of notes is one session whose id *is* a date, minted in UTC.
+		// Converting its timestamp to the reader's zone put a different day on
+		// the line than the id it sits next to — and the id a reader rebuilt
+		// from what they saw matched nothing (#883).
+		if day, ok := search.NoteBucketDay(s); ok {
+			when = day
+		}
+
 		fmt.Printf("[%s · %s · %s · %s]", s.Harness, s.Project, when, s.ID)
 		title := s.Title
 		if title == "" {
@@ -1817,11 +1831,25 @@ func pluralWhich(n int) string {
 // — the path of an internal lock file and a syscall error, which says nothing
 // about what to change.
 func ensureError(dir string, err error) error {
+	if dir == "" {
+		dir = index.DefaultDir()
+	}
 	if errors.Is(err, fs.ErrPermission) {
-		if dir == "" {
-			dir = index.DefaultDir()
-		}
 		return fmt.Errorf("cannot write the index at %s — check the directory's permissions, or point DEJA_INDEX_DIR somewhere writable", dir)
+	}
+	// A full disk arrived as `ensure: write /…/index.db.tmp/records.bin: no
+	// space left on device`: an internal path nobody can act on, and the same
+	// shape #798 replaced for permissions. The build needs room beside the
+	// index, so the directory to free is the one named here (#888).
+	// A volume that went away mid-write — an unmounted disk, a network share
+	// that dropped — arrives as `write /…/index.db.tmp/records.bin:
+	// input/output error`: the same internal path as #888, and a reader who
+	// cannot tell that the disk is simply gone (#899).
+	if errors.Is(err, syscall.EIO) || errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.ENODEV) {
+		return fmt.Errorf("the index directory is not reachable (%s) — the disk it lives on may have been unmounted or dropped; reconnect it, or point DEJA_INDEX_DIR somewhere local", filepath.Dir(dir))
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return fmt.Errorf("no space left where the index is built (%s) — free some room there, or point DEJA_INDEX_DIR at a disk that has it", filepath.Dir(dir))
 	}
 	return fmt.Errorf("ensure: %w", err)
 }

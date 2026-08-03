@@ -116,6 +116,48 @@ func runHookPrecompact(dir string) {
 	requestWarmup(dir)
 }
 
+// joinNotes puts a maintenance line ahead of the memory line without letting
+// an empty one leave a stray separator.
+func joinNotes(a, b string) string {
+	switch {
+	case a == "":
+		return b
+	case b == "":
+		return a
+	}
+	return a + "\n" + b
+}
+
+// indexDirWritable reports whether a rebuild could write where the index
+// lives. Ensure builds into a sibling directory and renames it over the old
+// one, so the parent is what has to be writable — not the index directory
+// itself, which is why a store can rebuild fine while its own directory is
+// read-only.
+func indexDirWritable(dir string) bool {
+	parent := filepath.Dir(dir)
+	f, err := os.CreateTemp(parent, ".deja-probe-")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
+}
+
+// rewireNote is the one line a session start spends on maintenance: which
+// targets were rewritten when the binary moved or upgraded.
+func rewireNote(targets []string) string {
+	if len(targets) == 0 {
+		return ""
+	}
+	// States what happened rather than guessing why: on a routine upgrade
+	// nothing was hand-edited, and claiming an edit was destroyed reads as an
+	// accusation. Someone who did edit those commands still learns that they
+	// were rewritten, and where to put the change instead.
+	return fmt.Sprintf("deja: rewrote its wiring for %s after an upgrade — `deja install` is what writes those commands", strings.Join(targets, ", "))
+}
+
 // runHookContext prints session-start context. plain=false emits the Claude
 // Code / Codex hook JSON envelope; plain=true prints the bare digest for
 // hosts that inject raw text (the opencode plugin).
@@ -123,9 +165,13 @@ func runHookContext(dir string, plain bool) error {
 	// A session start is the one moment deja is guaranteed to run on every
 	// harness, which makes it the only reliable place to repair wiring left
 	// behind by an older binary. It costs one small file read when nothing
-	// changed, and it says nothing: the user asked for memory, not for
-	// maintenance notes.
-	refreshWiringAfterUpgrade()
+	// changed.
+	//
+	// When it does change something it says so, once: the rewrite replaces
+	// whatever those commands held, including a wrapper someone put there on
+	// purpose, and silently reverting a person's edit is not a maintenance
+	// note anybody can act on afterwards (#886).
+	rewired := refreshWiringAfterUpgrade()
 	// SessionStart fires for startup, resume, clear and compact; the payload
 	// says which. After a compaction the model just lost its working context,
 	// so the lead line changes to say the memory below survived it.
@@ -168,10 +214,33 @@ func runHookContext(dir string, plain bool) error {
 		// whereas the plain path is injected into the model's context, where
 		// a progress line is noise.
 		if !plain {
+			line := ""
 			if st := readWarmupStatus(dir); st != nil {
+				line = st.line()
+			} else if warmupJustRequested(dir) && index.HasManifest(dir) {
+				// The session that asks for the build is the one that hears
+				// nothing about it: the child has not written its first
+				// progress line yet. That session is the first one after an
+				// upgrade or a damaged store — the moment deja most looks
+				// broken (#878).
+				//
+				// Only with an index already on disk. A machine with no
+				// history at all also asks for a build, and promising it
+				// recall would be a promise about nothing: that machine is
+				// what the environment block above is for.
+				line = "deja: indexing your history — recall comes online in a few seconds"
+				// …unless it cannot: a read-only cache directory lets the
+				// request be made and the build fail, so this promised recall
+				// "in a few seconds" on every session forever (#887).
+				if !indexDirWritable(dir) {
+					line = fmt.Sprintf("deja: the index needs rebuilding and %s is not writable — `deja index` says what to change", filepath.Dir(dir))
+				}
+			}
+			line = joinNotes(rewireNote(rewired), line)
+			if line != "" {
 				var resp sessionStartHookResponse
 				resp.HookSpecificOutput.HookEventName = "SessionStart"
-				resp.SystemMessage = st.line()
+				resp.SystemMessage = line
 				if b, err := json.Marshal(resp); err == nil {
 					fmt.Fprintln(os.Stdout, string(b))
 				}
@@ -234,14 +303,14 @@ func runHookContext(dir string, plain bool) error {
 		if r, ok := findReusedMemory(dir); ok {
 			earned = fmt.Sprintf(" · most re-used recently: %q, %d×", trimBriefTitle(r.Title), r.Times)
 		}
-		resp.SystemMessage = fmt.Sprintf("deja: recalled %d prior session%s %s (~%dKB) — the agent starts already knowing them%s%s%s", sessions, plural, why, (len(digest)+1023)/1024, serviceReceipt(dir), polNote, earned)
+		resp.SystemMessage = joinNotes(rewireNote(rewired), fmt.Sprintf("deja: recalled %d prior session%s %s (~%dKB) — the agent starts already knowing them%s%s%s", sessions, plural, why, (len(digest)+1023)/1024, serviceReceipt(dir), polNote, earned))
 	}
 	// Nothing to recall yet because the index is still being built: say so
 	// rather than starting in silence. The build runs detached, so the agent
 	// is already usable — this only explains why memory is not here yet.
 	if resp.SystemMessage == "" {
 		if st := readWarmupStatus(dir); st != nil {
-			resp.SystemMessage = st.line()
+			resp.SystemMessage = joinNotes(rewireNote(rewired), st.line())
 		}
 	}
 	b, err := json.Marshal(resp)
@@ -543,6 +612,21 @@ func hookDigestResult(dir string) (string, int, int64, []string) {
 // harness — and far shorter than warmupRetryAfter, which was the whole wait a
 // killed build used to cost.
 const warmupDeadAfter = 2 * time.Minute
+
+// warmupJustRequested reports that a build was asked for moments ago and has
+// not published progress yet. The sentinel carries the time of the request,
+// which is exactly what this needs.
+func warmupJustRequested(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, "warmup.sentinel"))
+	if err != nil {
+		return false
+	}
+	stamp, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return false
+	}
+	return time.Since(time.Unix(0, stamp)) < warmupStatusStale
+}
 
 // warmupLooksDead reports whether the build the sentinel stands for has
 // stopped without clearing it. A warmup killed mid-build — a closed laptop, an

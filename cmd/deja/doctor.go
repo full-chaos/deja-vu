@@ -328,18 +328,33 @@ func doctorHarnesses(w io.Writer, dir string) {
 	// reuses a thread id — and the difference is invisible in a row that only
 	// counts files (#861).
 	indexed := index.HarnessSessionCounts(dir)
+	fromElsewhere := index.ImportedSessionCounts(dir)
 
 	printRow := func(name, path string, present bool, detail string) {
 		status := "missing"
 		if present {
 			status = "found"
 		}
-		if present {
-			if n, ok := indexed[name]; ok {
-				if detail != "" {
-					detail += ", "
-				}
+		// Also when the store is missing: a machine whose history arrived by
+		// `sync import` has no files at all, and doctor said nothing about the
+		// sessions it does hold — the only surface that names them was stats
+		// (#892).
+		if n, ok := indexed[name]; ok {
+			if detail != "" {
+				detail += ", "
+			}
+			// Local and imported counted apart: on a store with both, "3
+			// files, 8 indexed sessions" reads as a miscount, and the reader
+			// who learned from #861 that files-against-sessions shows
+			// collapsing has no way to read the other direction (#894).
+			imported := fromElsewhere[name]
+			switch imported {
+			case 0:
 				detail += doctorCount(n, "indexed session")
+			case n:
+				detail += doctorCount(n, "indexed session") + " from elsewhere"
+			default:
+				detail += doctorCount(n-imported, "indexed session") + fmt.Sprintf(", %d more from elsewhere", imported)
 			}
 		}
 		line := fmt.Sprintf("  %-12s %-8s %s", name, status, path)
@@ -708,9 +723,9 @@ func doctorTOMLWired(path string) bool {
 	return false
 }
 
-// indexOlderFormat is a variable so a test can put doctor in front of an index
-// this build cannot read without shipping a manifest writer.
-var indexOlderFormat = index.OlderFormat
+// indexFormatDirection is a variable so a test can put doctor in front of an
+// index this build cannot read without shipping a manifest writer.
+var indexFormatDirection = index.FormatDirection
 
 func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 	fmt.Fprintln(w, "Index:")
@@ -744,8 +759,13 @@ func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 	// hook paths refuse it and ask for a rebuild, which is why memory goes
 	// quiet after an upgrade. doctor called that "up to date" — the one
 	// command someone runs to find out why nothing is recalled (#877).
-	if indexOlderFormat(dir) {
+	switch indexFormatDirection(dir) {
+	case -1:
 		fmt.Fprintln(w, "  format   written by an older deja — this build cannot read it; the next session rebuilds it, or run `deja index` now")
+	case 1:
+		// The binary was rolled back, not the index. Saying "older" here sent
+		// that reader looking in the wrong direction (#890).
+		fmt.Fprintln(w, "  format   written by a newer deja than this one — this build rebuilds it in its own format; upgrading again rebuilds it back")
 	}
 	// A store whose postings vanished or whose record log was truncated cannot
 	// answer anything, and said "up to date" until #735. The next search
