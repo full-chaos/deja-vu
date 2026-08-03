@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/vshulcz/deja-vu/internal/index"
@@ -55,8 +56,17 @@ func runSync(dir string, args []string) error {
 			// name nobody chose. The directory is what has to change, the same
 			// as for the index (#798) and the notes file (#869) — this was the
 			// last write path still handing back the syscall (#893).
+			if parent := filepath.Dir(out); !dirExists(out) && !dirExists(parent) {
+				return fmt.Errorf("cannot write the export into %s — %s is not there; the disk it lives on may have been unmounted", out, parent)
+			}
 			if errors.Is(err, fs.ErrPermission) {
 				return fmt.Errorf("cannot write the export into %s — check that directory's permissions, or choose one you can write", out)
+			}
+			// A full or vanished disk in the same words as everywhere else
+			// (#906); anything deja does not recognise still comes through
+			// whole rather than being guessed at.
+			if reason := writeFailureReason(err); reason != err.Error() {
+				return fmt.Errorf("cannot write the export into %s — %s", out, reason)
 			}
 			return err
 		}

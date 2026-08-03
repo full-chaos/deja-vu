@@ -6,12 +6,15 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/redact"
+	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
@@ -90,6 +93,13 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	if err := sources.AppendPromotedTagged(s.Project, title, text, src, state, tags, time.Now()); err != nil {
 		return notesWriteError(err)
 	}
+	// The note has to reach the index before the line below claims it outranks
+	// the transcript. `remember` has done this since it was written; promote
+	// did not, so a decision recorded here was invisible to the hook — which
+	// never builds — until some other command happened to run (#910).
+	if err := index.EnsureForSearch(dir, search.Options{All: true}, false, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "deja: the note is written; the index could not be updated yet — %v\n", err)
+	}
 	if exportPath != "" {
 		masked, err := exportPromoted(exportPath, title, text, src, state, s.Updated)
 		if err != nil {
@@ -148,8 +158,23 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 // file is written by promote, `deja remember` and the MCP remember tool, and
 // only promote said it (#869).
 func notesWriteError(err error) error {
+	if err == nil {
+		return nil
+	}
+	// The directory before the errno: a volume that was unmounted fails with
+	// EACCES on macOS, because deja is then trying to create a directory under
+	// /Volumes — and "check that file's permissions" sends the reader after a
+	// permission problem they do not have (#907).
+	if dir := filepath.Dir(sources.NotesFile()); !dirExists(dir) {
+		return fmt.Errorf("cannot write %s — %s is not there; the disk it lives on may have been unmounted", sources.NotesFile(), dir)
+	}
 	if errors.Is(err, fs.ErrPermission) {
 		return fmt.Errorf("cannot write %s — check that file and its directory's permissions, or set DEJA_NOTES_FILE somewhere writable", sources.NotesFile())
+	}
+	// Everything else the disk can do to a write, in the same words the rest
+	// of deja uses (#906).
+	if reason := writeFailureReason(err); reason != err.Error() {
+		return fmt.Errorf("cannot write %s — %s", sources.NotesFile(), reason)
 	}
 	return err
 }
@@ -257,12 +282,36 @@ func exportPromoted(path, title, text, src, state string, updated time.Time) (in
 // repeating the path the caller already prints.
 func exportFailureReason(err error) string {
 	switch {
-	case errors.Is(err, fs.ErrPermission):
-		return "permission denied"
 	case errors.Is(err, fs.ErrNotExist):
 		return "its directory does not exist"
 	case strings.Contains(err.Error(), "is a directory"):
 		return "that path is a directory"
+	}
+	return writeFailureReason(err)
+}
+
+// dirExists reports whether p is there as a directory. A path whose directory
+// is gone is not a permission problem, whatever errno the platform picks.
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
+// writeFailureReason words why a write did not happen, in the same vocabulary
+// everywhere. The index has said "no space left where the index is built"
+// since #888 while every other path handed back the syscall — the notes file,
+// the sync export and the stats page all reported ENOSPC as
+// `open /…: no space left on device` (#906).
+func writeFailureReason(err error) string {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return "its directory does not exist"
+	case errors.Is(err, fs.ErrPermission):
+		return "permission denied"
+	case errors.Is(err, syscall.ENOSPC):
+		return "no space left on that disk"
+	case errors.Is(err, syscall.EIO), errors.Is(err, syscall.ENXIO), errors.Is(err, syscall.ENODEV):
+		return "that disk is not reachable"
 	}
 	return err.Error()
 }
