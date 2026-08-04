@@ -61,7 +61,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		}
 	}
 	if prefix == "" {
-		return fmt.Errorf("promote needs a session id prefix (see `deja last`)")
+		return idPrefixNeeded(dir, "promote needs a session id prefix", "promote needs a session id prefix (see `deja last`)")
 	}
 	if !sources.NoteStates[state] {
 		// Taking a mark back is the state nobody guesses: users reach for
@@ -347,6 +347,19 @@ func endsWithNewline(path string) bool {
 		return true
 	}
 	return buf[0] == '\n'
+}
+
+// promotedNoteSources maps every promoted note's id to the session it came
+// from, in one pass over the note log.
+func promotedNoteSources() map[string]string {
+	out := map[string]string{}
+	for _, n := range sources.LoadPromotedNotes() {
+		if n.Session == "" {
+			continue
+		}
+		out["deja-note-"+strings.ReplaceAll(n.Session, ":", "-")] = n.Session
+	}
+	return out
 }
 
 // promotedNoteSource maps a promoted note's id back to the session it was

@@ -25,6 +25,11 @@ import (
 var version = "dev"
 
 func main() {
+	// A command that lands mid-rebuild waits for the whole of it, and silence
+	// there reads as a hang rather than as a queue (#994).
+	index.LockWaitNotice = func() {
+		fmt.Fprintln(os.Stderr, "deja: another deja is building the index — waiting for it to finish")
+	}
 	stopProfiling := startProfiling()
 	if err := run(os.Args[1:]); err != nil {
 		stopProfiling()
@@ -484,7 +489,7 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 	}
 	if len(ss) == 0 {
 		if o.JSON {
-			return printRecentJSON(os.Stdout, nil, sourceInstance)
+			return printRecentJSONWithheld(os.Stdout, nil, sourceInstance, policyHidden)
 		}
 		// The rule that emptied the list was named a line above; "no sessions
 		// indexed yet — run `deja index`" is advice for a state deja is not in,
@@ -505,7 +510,7 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 		return nil
 	}
 	if o.JSON {
-		return printRecentJSON(os.Stdout, ss, sourceInstance)
+		return printRecentJSONWithheld(os.Stdout, ss, sourceInstance, policyHidden)
 	}
 	for _, s := range ss {
 		// A session whose timestamp was missing or unparseable carries the Go
@@ -623,6 +628,7 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 		hits, o.Total, o.Capped = detailed.Hits, detailed.Total, detailed.Capped
 	}
 	hits, policyHidden := policyFilterHitsCounted(policy.ActivationSearch, hits)
+	o.PolicyWithheld = policyHidden
 	if !o.NoEmbed && os.Getenv("DEJA_EMBED") != "off" {
 		hits = maybeRerank(dir, hits, o, os.Stderr)
 	}
@@ -1865,6 +1871,17 @@ Examples:
 See README.md for the full CLI reference.`)
 }
 
+// idPrefixNeeded is the refusal for a command that needs a session named on the
+// command line. "see `deja last`" is a step the reader can take and learn
+// nothing from when the store is empty: the listing answers with the same
+// emptiness deja already knows about here (#992).
+func idPrefixNeeded(dir, subject, refusal string) error {
+	if n, err := index.SessionCount(dir); err == nil && n == 0 {
+		return errors.New(strings.TrimPrefix(emptyIndexHint(subject+", and nothing is indexed yet"), "deja: "))
+	}
+	return errors.New(refusal)
+}
+
 // emptyIndexHint phrases the nothing-here answer the same way everywhere, and
 // points at the next command rather than leaving the user to guess.
 //
@@ -1884,8 +1901,18 @@ func emptyIndexHint(what string) string {
 // opposed to an index that merely has not been built yet.
 func noAgentHistoryFound() bool {
 	for _, check := range doctorStoreChecks() {
-		if store, _ := inspectDoctorStore(check); store.Files > 0 {
-			return false
+		store, _ := inspectDoctorStore(check)
+		if store.Files == 0 {
+			continue
+		}
+		// By content, not by existence: an empty notes file — one `deja
+		// remember` later forgotten, or a file someone touched — counted as
+		// history and turned the answer into "run `deja index`", which is the
+		// one piece of advice this branch exists to avoid (#996).
+		for _, f := range check.files {
+			if fi, err := os.Stat(f); err == nil && fi.Size() > 0 {
+				return false
+			}
 		}
 	}
 	return true
