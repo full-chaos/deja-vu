@@ -112,14 +112,20 @@ func runStats(dir string, args []string) error {
 		progress = io.Discard
 	}
 	if err := index.Ensure(dir, "", false, progress); err != nil {
-		return err
+		// `mkdir …/idx.tmp: permission denied` names a path nobody chose and a
+		// syscall nobody can act on. index and search have worded this since
+		// #798; stats was the one screen still handing it back raw (#1004).
+		return ensureError(dir, err)
 	}
 	if redaction {
 		return printRedactionReport(dir, jsonOut)
 	}
 	ss, err := index.SearchWithRecovery(dir, search.Options{All: true}, progress)
 	if err != nil {
-		return err
+		// `mkdir …/idx.tmp: permission denied` names a path nobody chose and a
+		// syscall nobody can act on. index and search have worded this since
+		// #798; stats was the one screen still handing it back raw (#1004).
+		return ensureError(dir, err)
 	}
 	// stats is the one screen deja calls "wrapped for sharing", and it was
 	// naming projects the trust policy keeps off every other surface — the
@@ -135,6 +141,9 @@ func runStats(dir string, args []string) error {
 	// indexed yet — run `deja index`" is advice for a state deja is not in:
 	// the same backside `last` grew when it learned to filter (#949, #983).
 	report.EmptiedByPolicy = report.TotalSessions == 0 && policyHidden > 0
+	if report.TotalSessions == 0 {
+		report.HiddenBySettings = hiddenByOwnSettings()
+	}
 	// Replaced spans are kept out of ordinary retrieval, so they are not in
 	// the sessions above and take a pass of their own.
 	if spans, files, err := index.SpanInventory(dir); err == nil {
@@ -231,6 +240,10 @@ func printStats(w io.Writer, r stats.Report) {
 			// The rule is named on stderr a line above; repeating "run `deja
 			// index`" here sends the reader after a build that changes nothing.
 			fmt.Fprintln(w, "deja: nothing to report — the trust policy withholds every indexed session from this path")
+			return
+		}
+		if r.HiddenBySettings != "" {
+			fmt.Fprint(w, "deja: nothing indexed yet\n"+r.HiddenBySettings)
 			return
 		}
 		fmt.Fprintln(w, emptyIndexHint("nothing indexed yet"))
