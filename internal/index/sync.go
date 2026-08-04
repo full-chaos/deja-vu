@@ -243,6 +243,35 @@ var lastImportSkippedForgotten int
 // leave alone (#968).
 func ImportSkippedForgotten() int { return lastImportSkippedForgotten }
 
+// noteStateFromText reads the state a promoted note's line carries. deja writes
+// them as "[accepted] …" or "[rejected] did not hold", and that prefix is the
+// only copy of the state that crosses a machine boundary (#975).
+func noteStateFromText(text string) (state, note string, ok bool) {
+	if !strings.HasPrefix(text, "[") {
+		return "", "", false
+	}
+	end := strings.IndexByte(text, ']')
+	if end <= 1 {
+		return "", "", false
+	}
+	state = text[1:end]
+	switch state {
+	case "accepted", "rejected", "superseded", "stale":
+	default:
+		return "", "", false
+	}
+	return state, strings.TrimSpace(text[end+1:]), true
+}
+
+// dayBucketKey identifies a note in a day bucket without the bucket id. Empty
+// for anything else, so ordinary sessions keep the key they have always had.
+func dayBucketKey(sr SyncRecord, textHash uint64) string {
+	if sr.Harness != "deja" || !strings.HasPrefix(sr.SessionID, "deja-20") {
+		return ""
+	}
+	return "deja-note-day:" + sr.Project + ":" + sr.Time.UTC().Format(time.RFC3339Nano) + ":" + sr.Role + ":" + strconv.FormatUint(textHash, 16)
+}
+
 func Import(dir, inDir string) (int, error) {
 	if dir == "" {
 		dir = DefaultDir()
@@ -332,17 +361,6 @@ func Import(dir, inDir string) (int, error) {
 			if strings.TrimSpace(sr.Text) == "" {
 				return nil
 			}
-			// Key includes role and a text hash: two messages can legally share
-			// a timestamp (aider stamps a whole session with its start time).
-			// The legacy time-only key is still honored so batches imported by
-			// older versions stay idempotent.
-			legacy := sr.Harness + ":" + origID + ":" + sr.Time.UTC().Format(time.RFC3339Nano)
-			th := fnv.New64a()
-			_, _ = th.Write([]byte(sr.Text))
-			dedupe := legacy + ":" + sr.Role + ":" + strconv.FormatUint(th.Sum64(), 16)
-			if m.ImportedRecords[dedupe] || m.ImportedRecords[legacy] {
-				return nil
-			}
 			importID := ImportedSessionID(sr.Harness, origID)
 			// Forgetting is primary data, not cache: a tombstoned session
 			// must stay dead even when the peer still holds the batch and
@@ -352,8 +370,34 @@ func Import(dir, inDir string) (int, error) {
 			// its own id: checking only the imported one let a peer's copy walk
 			// the same text back into local search under a new id, while
 			// `forget --list` still called it forgotten (#968).
+			//
+			// Ahead of the dedupe ledger, which answers first for the ordinary
+			// case — the same batch handed over twice. Both drop the record;
+			// only this one knows why, and behind the ledger the import went
+			// silent exactly when the peer re-sent what you forgot (#980).
 			if dead[sr.Harness+":"+importID] || dead[sr.Harness+":"+origID] {
 				forgottenSkipped++
+				return nil
+			}
+			// Key includes role and a text hash: two messages can legally share
+			// a timestamp (aider stamps a whole session with its start time).
+			// The legacy time-only key is still honored so batches imported by
+			// older versions stay idempotent.
+			legacy := sr.Harness + ":" + origID + ":" + sr.Time.UTC().Format(time.RFC3339Nano)
+			th := fnv.New64a()
+			_, _ = th.Write([]byte(sr.Text))
+			dedupe := legacy + ":" + sr.Role + ":" + strconv.FormatUint(th.Sum64(), 16)
+			// A day bucket's id is the sending machine's rendering of a date,
+			// not the identity of what it holds: after that machine changes
+			// zone the same note arrives under a new bucket and every peer
+			// grew a second copy (#977). Key those on what does not move.
+			if bucket := dayBucketKey(sr, th.Sum64()); bucket != "" {
+				if m.ImportedRecords[bucket] {
+					return nil
+				}
+				dedupe = bucket
+			}
+			if m.ImportedRecords[dedupe] || m.ImportedRecords[legacy] {
 				return nil
 			}
 			// The exclude list keeps a project out of this machine's memory;
@@ -366,7 +410,7 @@ func Import(dir, inDir string) (int, error) {
 			recsByKey[key] = append(recsByKey[key], Record{Key: key, Role: sr.Role, Text: text, Time: sr.Time, SourcePath: syncImportPath})
 			meta := metas[key]
 			if meta.ID == "" {
-				meta = SessionMeta{ID: importID, Harness: sr.Harness, Project: "imported:" + sr.Project, Path: syncImportPath}
+				meta = SessionMeta{ID: importID, Harness: sr.Harness, Project: "imported:" + sr.Project, Path: syncImportPath, OrigID: origID}
 			}
 			if meta.Started.IsZero() || (!sr.Time.IsZero() && sr.Time.Before(meta.Started)) {
 				meta.Started = sr.Time
@@ -388,6 +432,18 @@ func Import(dir, inDir string) (int, error) {
 					meta.Title = truncateTitle(strings.TrimSpace(text), 60)
 					titleAt[key] = sr.Time
 					titleRankOf[key] = rank
+				}
+			}
+			// A promoted note carries its state in the text: "[rejected] …".
+			// The states themselves live in the other machine's notes.jsonl,
+			// which never travels, so without reading them here a decision
+			// retracted there reads as accepted on this machine (#975).
+			if strings.HasPrefix(origID, "deja-note-") {
+				if st, note, ok := noteStateFromText(sr.Text); ok {
+					meta.Lifecycle, meta.LifecycleNote = st, note
+					if !sr.Time.IsZero() {
+						meta.LifecycleAt = sr.Time.Format("2006-01-02")
+					}
 				}
 			}
 			metas[key] = meta

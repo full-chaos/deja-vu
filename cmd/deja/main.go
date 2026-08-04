@@ -1571,7 +1571,10 @@ func runForget(dir string, args []string) error {
 		probe.DryRun = true
 		pr, perr := index.Forget(dir, probe)
 		if perr != nil {
-			return perr
+			// The probe fails the same ways the real pass does — a vanished
+			// volume, a read-only cache — and handing its syscall back was the
+			// shape #798 replaced everywhere else.
+			return ensureError(dir, perr)
 		}
 		if o.Session != "" {
 			if err := forgetScopeRefusal(o.Session, pr.Sessions, allMatches); err != nil {
@@ -1582,7 +1585,14 @@ func runForget(dir string, args []string) error {
 	}
 	result, err := index.Forget(dir, o)
 	if err != nil {
-		return err
+		// The tombstone is already written; what failed is the rebuild that
+		// takes the records out. Handing back `mkdir /…/idx.tmp: permission
+		// denied` names an internal path and leaves the reader believing the
+		// session is gone while search still returns it (#976).
+		if !o.DryRun && index.Tombstoned(forgetKeyOf(dir, o)) {
+			return fmt.Errorf("%v\nthe session is marked forgotten and is still in the index until it can be rebuilt — search keeps returning it until then", ensureError(dir, err))
+		}
+		return ensureError(dir, err)
 	}
 	if o.DryRun {
 		fmt.Fprintf(os.Stdout, "dry run — nothing was changed\nwould drop: %d session(s), %d message(s)\nwould add: %d tombstone(s)\n",
@@ -1934,17 +1944,12 @@ func ensureError(dir string, err error) error {
 	if dir == "" {
 		dir = index.DefaultDir()
 	}
-	// Before permissions: a volume that was ejected takes its mount point with
-	// it, and creating that point back fails with EPERM on macOS — so the
-	// errno says permissions while the disk is simply gone. The same trap the
-	// notes and export paths hit (#893, #906), and the reader is sent to check
-	// the permissions of a directory that no longer exists (#931).
 	if errors.Is(err, fs.ErrPermission) {
 		// An ejected volume takes its mount point with it, and creating that
 		// point back fails with EPERM on macOS — so the errno says permissions
-		// while the disk is simply gone, and the reader is sent to check the
-		// permissions of a directory that no longer exists. The same check the
-		// notes and export paths make (#893, #906, #931).
+		// while the disk is simply gone. The same trap the notes and export
+		// paths hit (#893, #906), and the reader is sent to check the
+		// permissions of a directory that no longer exists (#931).
 		if parent := filepath.Dir(dir); !dirExists(dir) && !dirExists(parent) {
 			return fmt.Errorf("the index directory is not there (%s) — the disk it lives on may have been unmounted; reconnect it, or point DEJA_INDEX_DIR somewhere local", parent)
 		}
@@ -2117,4 +2122,22 @@ func noteForgottenSource(s model.Session, selector string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "deja: %s is forgotten — this is the note promoted from it; `deja forget --list` names what is gone\n", key)
+}
+
+// forgetKeyOf names the exact session a selector reached, so a failed forget
+// can tell whether the tombstone landed (#976).
+func forgetKeyOf(dir string, o index.ForgetOptions) string {
+	if o.Session == "" {
+		return ""
+	}
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return ""
+	}
+	for _, m := range metas {
+		if index.SelectorMatches(m, o.Session) {
+			return m.Harness + ":" + m.ID
+		}
+	}
+	return ""
 }
