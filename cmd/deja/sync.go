@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/vshulcz/deja-vu/internal/index"
+	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/search"
 )
 
@@ -114,6 +115,14 @@ func runSync(dir string, args []string) error {
 		// Whether or not anything arrived: a batch that is entirely someone
 		// else's copy of what this machine forgot imports zero records, and
 		// "imported 0 records" alone reads as an empty batch (#968).
+		// A shared folder is an outbox as well as an inbox, so a batch this
+		// machine wrote comes back to it. Saying nothing made "imported 0
+		// records" read as a failed transfer (#987). The claim is what deja
+		// checked — the same session, instant and text — not who wrote it: a
+		// batch carries no machine id (#955).
+		if own := index.ImportSkippedOwn(); own > 0 {
+			fmt.Fprintf(os.Stdout, "deja: %d record%s were already here word for word — this folder holds a copy of what this machine has\n", own, pluralS(own))
+		}
 		if skipped := index.ImportSkippedForgotten(); skipped > 0 {
 			fmt.Fprintf(os.Stdout, "deja: %d record%s left out — they belong to sessions you forgot here (`deja forget --list`)\n", skipped, pluralS(skipped))
 		}
@@ -126,7 +135,9 @@ func runSync(dir string, args []string) error {
 		}
 		// The end of a move to a new machine is the same moment as an install,
 		// and install proves it with real lines rather than a count (#929).
-		printMemoryProof(dir, "deja now knows, from the machine you came from:")
+		printMemoryProofOf(dir, "deja now knows, from the machine you came from:", func(s model.Session) bool {
+			return strings.HasPrefix(s.Project, "imported:")
+		})
 		return nil
 	default:
 		return fmt.Errorf("unknown sync command %q", args[0])
