@@ -454,6 +454,10 @@ func cmdCtx(dir string, rest []string) error {
 		}
 		return fmt.Errorf("no session matches %q", q)
 	}
+	// A short selector never reaches the id branch above, so a forgotten
+	// session's note arrives as an ordinary hit — and the answer still has to
+	// say the session is gone (#971).
+	noteForgottenSource(hits[0].Session, q)
 	search.PrintContext(os.Stdout, hits[0].Session, q)
 	return nil
 }
@@ -935,6 +939,9 @@ func noteAmbiguousPrefix(dir, id, action string) {
 func findByPrefix(dir, p string) (model.Session, bool, error) {
 	if err := index.Ensure(dir, "", false, os.Stderr); err == nil {
 		if s, ok, err := index.FindByPrefix(dir, p); err == nil {
+			if ok {
+				noteForgottenSource(s, p)
+			}
 			return s, ok, nil
 		}
 	}
@@ -1538,21 +1545,40 @@ func runForget(dir string, args []string) error {
 			fmt.Fprintf(os.Stdout, "no tombstone matches %q — `deja forget --list` shows what is forgotten\n", unforget)
 			return nil
 		}
-		fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index\n", lifted, pluralS(lifted))
+		// Lifting a tombstone brings a session back only if the transcript is
+		// still on this machine. An imported one lives only in the index, so
+		// forget took the last copy — and the undo reported a restore that did
+		// not happen (#967).
+		back, gone := restoredSessions(dir, unforget, lifted)
+		restorePromotedTitles(dir, unforget)
+		if back > 0 {
+			fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index\n", back, pluralS(back))
+		}
+		if gone > 0 {
+			fmt.Fprintf(os.Stdout, "%d of them came from another machine and deja held the only copy — the tombstone is lifted, but the records are gone; `deja sync import` brings them back\n", gone)
+		}
 		return nil
 	}
 	// The scope check runs on a dry pass first: a refusal printed after
 	// index.Forget has already written the tombstones is not a refusal.
-	if o.Session != "" && !o.DryRun {
+	//
+	// The same pass answers what is about to go: after the real Forget the rows
+	// are out of the manifest, so a row that covered two conversations can no
+	// longer be recognised (#970).
+	shared := 0
+	if !o.DryRun {
 		probe := o
 		probe.DryRun = true
 		pr, perr := index.Forget(dir, probe)
 		if perr != nil {
 			return perr
 		}
-		if err := forgetScopeRefusal(o.Session, pr.Sessions, allMatches); err != nil {
-			return err
+		if o.Session != "" {
+			if err := forgetScopeRefusal(o.Session, pr.Sessions, allMatches); err != nil {
+				return err
+			}
 		}
+		shared = sharedRowsAmong(dir, pr.Keys)
 	}
 	result, err := index.Forget(dir, o)
 	if err != nil {
@@ -1571,6 +1597,16 @@ func runForget(dir string, args []string) error {
 		}
 		if line := forgetNotesLine(result); line != "" {
 			fmt.Fprintln(os.Stdout, line)
+		}
+		// Two transcripts can write the same harness:id, and then one manifest
+		// row holds both conversations. The build says so once (#698); forget
+		// said "1 session" and took two, from two projects (#970).
+		if o.DryRun {
+			shared = sharedRowsAmong(dir, result.Keys)
+		}
+		if n := shared; n > 0 {
+			fmt.Fprintf(os.Stdout, "%s covered more than one conversation — transcripts that share an id are filed under one row, and both go\n",
+				doctorCount(n, "of them"))
 		}
 		return nil
 	}
@@ -1635,6 +1671,12 @@ func runForget(dir string, args []string) error {
 		return nil
 	}
 	fmt.Fprintf(os.Stdout, "sessions dropped: %d\nmessages dropped: %d\ntombstones added: %d\n", result.Sessions, result.Messages, result.Tombstones)
+	// "1 session" can be two conversations: transcripts that share an id are
+	// filed under one row, and the message count is the only tell (#970).
+	if shared > 0 {
+		fmt.Fprintf(os.Stdout, "%s covered more than one conversation — transcripts that share an id are filed under one row, and both went\n",
+			doctorCount(shared, "of them"))
+	}
 	// Forgetting keeps the session out of later pushes but cannot reach a
 	// machine that already has it. Three lines about what was dropped read as
 	// "it is gone everywhere" to someone forgetting a customer name (#788).
@@ -1975,4 +2017,104 @@ func dayWord(n int) string {
 		return "a day"
 	}
 	return fmt.Sprintf("%d days", n)
+}
+
+// restoredSessions splits what a lifted tombstone actually returned from what
+// it could not: a session whose transcript is on this machine is re-read by the
+// rebuild, while an imported one existed only in the index that forget rewrote.
+func restoredSessions(dir, selector string, lifted int) (back, gone int) {
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return lifted, 0
+	}
+	for _, m := range metas {
+		if index.SelectorMatches(m, selector) {
+			back++
+		}
+	}
+	if back > lifted {
+		back = lifted
+	}
+	return back, lifted - back
+}
+
+// restorePromotedTitles gives a promoted note back the title it borrowed from a
+// session that has just been restored. forget clears it so the text of a
+// forgotten session does not live on in the note (#666); unforget is the moment
+// that reason stops applying (#969).
+func restorePromotedTitles(dir, selector string) {
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return
+	}
+	titles := map[string]string{}
+	for _, m := range metas {
+		if !index.SelectorMatches(m, selector) {
+			continue
+		}
+		s, ok, err := index.FindByPrefix(dir, m.ID)
+		if err != nil || !ok {
+			continue
+		}
+		if t := firstUserTitle(s); t != "" {
+			titles[m.Harness+":"+m.ID] = t
+		}
+	}
+	if len(titles) == 0 {
+		return
+	}
+	_, _ = sources.RestorePromotedTitles(func(src string) string { return titles[src] })
+}
+
+// sharedRowsAmong counts the manifest rows in keys that hold more than one
+// conversation, so forget can say what it is about to take (#970).
+func sharedRowsAmong(dir string, keys []string) int {
+	if len(keys) == 0 {
+		return 0
+	}
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return 0
+	}
+	want := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		want[k] = true
+	}
+	n := 0
+	for _, m := range metas {
+		if m.Shared && want[m.Harness+":"+m.ID] {
+			n++
+		}
+	}
+	return n
+}
+
+// noteForgottenSource says when an id lookup landed on the note promoted from a
+// session that has been forgotten. Asking for the session by the id you
+// remember answered with the note and said nothing, so the reply looked like
+// the session itself until you noticed the id had changed (#971).
+func noteForgottenSource(s model.Session, selector string) {
+	if s.Harness != "deja" || !strings.HasPrefix(s.ID, "deja-note-") {
+		return
+	}
+	src, ok := strings.CutPrefix(s.ID, "deja-note-")
+	if !ok || src == "" {
+		return
+	}
+	// The selector named the source, not the note: a reader who typed the note
+	// id knows what they asked for.
+	if strings.HasPrefix(s.ID, selector) {
+		return
+	}
+	key := strings.Replace(src, "-", ":", 1)
+	// Only when the reader named that session: an ordinary topical query that
+	// happens to land on the note is not asking about the forgotten source, and
+	// the line would be noise on every such search.
+	if selector == "" || !strings.Contains(key, selector) {
+		return
+	}
+	if !index.Tombstoned(key) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "deja: %s is forgotten — this is the note promoted from it; `deja forget --list` names what is gone\n", key)
 }
