@@ -492,7 +492,15 @@ func cmdCtx(dir string, rest []string) error {
 	// session's note arrives as an ordinary hit — and the answer still has to
 	// say the session is gone (#971).
 	noteForgottenSource(hits[0].Session, q)
-	search.PrintContext(os.Stdout, hits[0].Session, q)
+	// The hit carries the matching snippets, not the session: for a promoted
+	// note that meant the correction — which rarely repeats the words of the
+	// decision — was missing, and the command whose whole job is packaging
+	// context handed an agent a decision that had been withdrawn (#1011).
+	whole := hits[0].Session
+	if full, ok, ferr := findByPrefix(dir, whole.ID); ferr == nil && ok {
+		whole = full
+	}
+	search.PrintContext(os.Stdout, whole, q)
 	return nil
 }
 
@@ -1590,7 +1598,11 @@ func runForget(dir string, args []string) error {
 		// session; the undo restored them all and said so afterwards, while the
 		// hint printed beside the list promises one (#961).
 		if n := index.TombstoneMatches(unforget); n > 1 && !allMatches {
-			return fmt.Errorf("%q brings back %d forgotten sessions — `deja forget --list` names them; add --all-matches to restore them all", unforget, n)
+			// "`deja forget --list` names them" sends the reader to a list of
+			// everything this machine ever forgot, where the three that match
+			// are theirs to find. Name them here instead (#1014).
+			return fmt.Errorf("%q brings back %d forgotten sessions (%s) — add --all-matches to restore them all, or name one",
+				unforget, n, joinCapped(index.TombstonesMatching(unforget), 5))
 		}
 		var lifted int
 		if err := withBuildProgress(func() error {
@@ -2049,6 +2061,12 @@ func ensureError(dir string, err error) error {
 	if errors.Is(err, syscall.ENOSPC) {
 		return fmt.Errorf("no space left where the index is built (%s) — free some room there, or point DEJA_INDEX_DIR at a disk that has it", filepath.Dir(dir))
 	}
+	// Already worded where it was raised — the leftover-swap case names the
+	// directory to remove and the command to rerun, and "ensure:" in front of
+	// it is internal noise (#1009).
+	if strings.HasPrefix(err.Error(), "an earlier index swap left ") {
+		return err
+	}
 	return fmt.Errorf("ensure: %w", err)
 }
 
@@ -2237,4 +2255,13 @@ func reachableSessionCount(dir string) (int, int, bool) {
 		}
 	}
 	return reach, len(metas), true
+}
+
+// joinCapped lists at most n items and says how many it left out, so a refusal
+// stays one line on a machine with many tombstones.
+func joinCapped(items []string, n int) string {
+	if len(items) <= n {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:n], ", ") + fmt.Sprintf(", +%d more", len(items)-n)
 }
