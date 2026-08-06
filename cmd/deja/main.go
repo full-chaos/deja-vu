@@ -524,6 +524,31 @@ func cmdCtx(dir string, rest []string) error {
 	return nil
 }
 
+// clearedNoteIDs names the notes whose borrowed title was just cleared. The
+// line used to offer `--session deja-note-…`, an id that matches nothing —
+// deja knows them here, and the ellipsis sent the reader to `deja last` to
+// look up what this command was already holding (#1030).
+func clearedNoteIDs(keys []string) string {
+	// Only keys a note was actually promoted from: the dropped set also holds
+	// the notes' own rows, and turning one of those into an id produced
+	// `deja-note-deja-deja-note-claude-s1`, which matches nothing.
+	known := promotedNoteSources()
+	ids := make([]string, 0, len(keys))
+	for _, k := range keys {
+		id := "deja-note-" + strings.ReplaceAll(k, ":", "-")
+		if _, ok := known[id]; !ok {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	const shown = 3
+	if len(ids) > shown {
+		return strings.Join(ids[:shown], "`, `") + fmt.Sprintf("` and %d more", len(ids)-shown)
+	}
+	return strings.Join(ids, "`, `")
+}
+
 func cmdLast(dir string, rest []string, sourceInstance string) error {
 	n, o, sinceRaw, err := parseLast(rest)
 	if err != nil {
@@ -1694,15 +1719,23 @@ func runForget(dir string, args []string) error {
 		return ensureError(dir, err)
 	}
 	if o.DryRun {
-		fmt.Fprintf(os.Stdout, "dry run — nothing was changed\nwould drop: %d session(s), %d message(s)\nwould add: %d tombstone(s)\n",
-			result.Sessions, result.Messages, result.Tombstones)
 		// The dry run is where someone checks the scope, so it says the same
 		// thing the real run would refuse with rather than erroring: nothing
 		// is being changed here, and the note is the answer they came for.
+		// It goes above the counts, and the counts say whose run they are:
+		// under an ambiguous selector the numbers were those of
+		// `--all-matches`, while the command as typed drops nothing (#1032).
+		scope := error(nil)
 		if o.Session != "" {
-			if scope := forgetScopeRefusal(o.Session, result.Sessions, allMatches); scope != nil {
-				fmt.Fprintln(os.Stdout, scope.Error())
-			}
+			scope = forgetScopeRefusal(o.Session, result.Sessions, allMatches)
+		}
+		if scope != nil {
+			fmt.Fprintln(os.Stdout, scope.Error())
+			fmt.Fprintf(os.Stdout, "dry run — nothing was changed\nas it stands this run drops nothing; with --all-matches it would drop: %d session(s), %d message(s)\nwould add: %d tombstone(s)\n",
+				result.Sessions, result.Messages, result.Tombstones)
+		} else {
+			fmt.Fprintf(os.Stdout, "dry run — nothing was changed\nwould drop: %d session(s), %d message(s)\nwould add: %d tombstone(s)\n",
+				result.Sessions, result.Messages, result.Tombstones)
 		}
 		if line := forgetNotesLine(result); line != "" {
 			fmt.Fprintln(os.Stdout, line)
@@ -1767,8 +1800,16 @@ func runForget(dir string, args []string) error {
 			// reason the raw session was safe to forget (#666) — so say that
 			// its content is still there rather than let the line read as
 			// "the note was handled" (#841).
-			fmt.Fprintf(os.Stdout, "cleared the borrowed title from %d promoted note%s; %s still holds what you wrote there — `deja forget --session deja-note-…` removes it\n",
-				n, pluralS(n), sources.NotesFile())
+			// The ids, not an ellipsis: this line knows which notes it just
+			// cleared, and `deja forget --session deja-note-…` matched
+			// nothing — it sent the reader to `deja last` to look up
+			// something the command was already holding (#1030).
+			what := "it"
+			if n > 1 {
+				what = "them"
+			}
+			fmt.Fprintf(os.Stdout, "cleared the borrowed title from %d promoted note%s; %s still holds what you wrote there — `deja forget --session %s` removes %s\n",
+				n, pluralS(n), sources.NotesFile(), clearedNoteIDs(result.Keys), what)
 		}
 	}
 	// Nothing matched is a different answer from nothing was dropped: the
@@ -1776,6 +1817,18 @@ func runForget(dir string, args []string) error {
 	// successful removal of zero leaves the reader believing they deleted
 	// something that is in fact still there under a different id.
 	if result.Sessions == 0 && result.Messages == 0 {
+		// A note whose own project was forgotten keeps its line in
+		// notes.jsonl while its index row is gone, and the id the forget
+		// line offers then matched nothing at all — the file, not the
+		// index, is what holds a note (#1030).
+		if o.Session != "" {
+			if gone, err := sources.ForgetPromotedNotes(func(noteID string) bool {
+				return noteID == strings.TrimPrefix(o.Session, "deja:")
+			}); err == nil && gone > 0 {
+				fmt.Fprintf(os.Stdout, "removed %d promoted note%s from %s\n", gone, pluralS(gone), sources.NotesFile())
+				return nil
+			}
+		}
 		fmt.Fprintf(os.Stdout, "nothing matched %s — no session was dropped\n", forgetSelector(o))
 		return nil
 	}
@@ -2074,6 +2127,16 @@ func staleReadOnlyIndex(dir string, err error) bool {
 	return errors.Is(err, fs.ErrPermission) && index.HasManifest(dir)
 }
 
+// deniedPath names the file a permission error was actually about, so the fix
+// deja suggests points at it rather than at the index directory (#1031).
+func deniedPath(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return pe.Path
+	}
+	return ""
+}
+
 // ensureError turns a failed build into something the reader can act on.
 // A denied write surfaced as `ensure: open /…/index.db.lock: permission
 // denied` — the path of an internal lock file and a syscall error, which says
@@ -2090,6 +2153,13 @@ func ensureError(dir string, err error) error {
 		// permissions of a directory that no longer exists (#931).
 		if parent := filepath.Dir(dir); !dirExists(dir) && !dirExists(parent) {
 			return fmt.Errorf("the index directory is not there (%s) — the disk it lives on may have been unmounted; reconnect it, or point DEJA_INDEX_DIR somewhere local", parent)
+		}
+		// The denial is not always about the index: forget writes the
+		// tombstone file first, and a read-only ~/.config/deja arrived here
+		// as "check the index directory", which was writable — the reader was
+		// sent to change a permission that was already right (#1031, #808).
+		if p := deniedPath(err); p != "" && !strings.HasPrefix(p, dir) {
+			return fmt.Errorf("cannot write %s — check that file's permissions", p)
 		}
 		return fmt.Errorf("cannot write the index at %s — check the directory's permissions, or point DEJA_INDEX_DIR somewhere writable", dir)
 	}
