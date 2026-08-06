@@ -15,6 +15,7 @@ import (
 	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/jsonout"
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
@@ -27,8 +28,11 @@ type doctorStore struct {
 	// at the directory to fix rather than at the harness (#802). Partial says
 	// the rest of the store was readable: sessions are missing from recall
 	// rather than the whole harness (#816).
-	Denied  string `json:"denied,omitempty"`
-	Partial bool   `json:"partial,omitempty"`
+	// Unchecked says the permission walk stopped at its budget, so no
+	// permission problem past that point was looked for (#1025).
+	Denied    string `json:"denied,omitempty"`
+	Partial   bool   `json:"partial,omitempty"`
+	Unchecked bool   `json:"unchecked,omitempty"`
 }
 
 type doctorComponent struct {
@@ -51,8 +55,50 @@ type doctorReport struct {
 	SQLite3       doctorComponent                `json:"sqlite3"`
 	Version       doctorVersionReport            `json:"version"`
 	Embed         *doctorEmbedReport             `json:"embed,omitempty"`
+	Policy        doctorPolicyReport             `json:"policy"`
 	Ingest        map[string]index.HarnessIngest `json:"ingest_health,omitempty"`
 	Deep          *index.DeepReport              `json:"deep,omitempty"`
+}
+
+// doctorPolicyReport is the trust policy in the machine form. The text report
+// has had a block for it since #661 while `--json` had no key at all, so a
+// script could not see that recall is switched off on a machine (#1027).
+type doctorPolicyReport struct {
+	// State is one of default, active, unreadable — what is in force, not what
+	// the file says, which is the distinction the text block draws too.
+	State       string                      `json:"state"`
+	Path        string                      `json:"path"`
+	Error       string                      `json:"error,omitempty"`
+	Total       int                         `json:"indexed_sessions"`
+	Activations map[string]doctorPolicyRule `json:"activations"`
+	Ignored     []string                    `json:"ignored,omitempty"`
+	Inert       []string                    `json:"inert,omitempty"`
+}
+
+type doctorPolicyRule struct {
+	Rule     string `json:"rule"`
+	Withheld int    `json:"withheld"`
+}
+
+func collectDoctorPolicy(dir string) doctorPolicyReport {
+	r := doctorPolicyReport{State: "active", Path: policy.Path(), Activations: map[string]doctorPolicyRule{}}
+	exists, unknown, err := policy.Diagnose()
+	switch {
+	case !exists:
+		r.State = "default"
+	case err != nil:
+		r.State = "unreadable"
+		r.Error = err.Error()
+	}
+	pol := policy.Load()
+	withheld, total := policyWithheldCounts(dir)
+	r.Total = total
+	for _, a := range []string{policy.ActivationSearch, policy.ActivationMCP, policy.ActivationAuto} {
+		r.Activations[a] = doctorPolicyRule{Rule: pol.Describe(a), Withheld: withheld[a]}
+	}
+	r.Ignored = unknown
+	r.Inert = unmatchedImportGroups(dir)
+	return r
 }
 
 type doctorEmbedReport struct {
@@ -91,6 +137,7 @@ func collectDoctorReport(lookup doctorVersionLookup, dir string) doctorReport {
 	if sources.SQLite3Available() {
 		report.SQLite3.State = "ok"
 	}
+	report.Policy = collectDoctorPolicy(dir)
 	report.Version = collectDoctorVersion(lookup)
 	report.Embed = collectDoctorEmbed(dir)
 	return report
@@ -98,14 +145,19 @@ func collectDoctorReport(lookup doctorVersionLookup, dir string) doctorReport {
 
 // firstDeniedDir walks the store roots until something refuses to be read and
 // returns that path. The walk is bounded: doctor is a diagnostic command, but
-// a harness root can hold tens of thousands of transcripts.
-func firstDeniedDir(paths []string) string {
+// a harness root can hold tens of thousands of transcripts. The second result
+// is false when the budget cut the walk short, so the caller can avoid calling
+// a half-checked store whole (#1025).
+func firstDeniedDir(paths []string) (string, bool) {
 	// Directories, not entries: a store of 50k transcripts sits in a few
 	// hundred of them, and counting files spent the budget in the first
 	// project — a locked directory later in the walk was never reached, and
-	// doctor reported the store whole (#864).
-	const budget = 5000
+	// doctor reported the store whole (#864). A machine with a few thousand
+	// projects hit the same wall at the directory bound, so it is high enough
+	// that only a pathological tree reaches it (#1025).
+	const budget = 200_000
 	visited := 0
+	whole := true
 	home := sources.Home()
 	for _, root := range paths {
 		// aider's root is the home directory itself: any locked directory
@@ -127,15 +179,16 @@ func firstDeniedDir(paths []string) string {
 				return nil
 			}
 			if visited++; visited > budget {
+				whole = false
 				return filepath.SkipAll
 			}
 			return nil
 		})
 		if denied != "" {
-			return denied
+			return denied, true
 		}
 	}
-	return ""
+	return "", whole
 }
 
 // storeNeedsSQLite3 names the harnesses deja reads through the sqlite3 CLI.
@@ -266,12 +319,17 @@ func inspectDoctorStore(check doctorStoreCheck) (doctorStore, time.Time) {
 	// its sessions out of recall. With no files at all that read as a harness
 	// nobody has used (#802); with some files it read as a complete store
 	// missing a few, which is quieter still (#816).
-	if denied := firstDeniedDir(check.paths); denied != "" {
+	denied, whole := firstDeniedDir(check.paths)
+	if denied != "" {
 		store.State = "denied"
 		store.Denied = denied
 		store.Partial = len(check.files) > 0
 		return store, time.Time{}
 	}
+	// Nothing refused to be read *of what was walked*. Saying "found" for a
+	// store whose walk stopped early is the same silence #864 closed, one
+	// order of magnitude up (#1025).
+	store.Unchecked = !whole
 	if len(check.files) == 0 {
 		// The text rows have separated a store whose disk went away from one
 		// that was deleted since #933; a script reading this could not (#999).

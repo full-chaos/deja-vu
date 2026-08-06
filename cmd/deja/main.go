@@ -202,6 +202,8 @@ func cmdVersion(_ string, _ []string) error {
 }
 
 func cmdWarmup(dir string, _ []string) error {
+	stop := publishBuildProgress(dir)
+	defer stop()
 	prepareFirstIndexGreeting(dir)
 	if err := withBuildProgress(func() error { return index.Ensure(dir, "", false, os.Stderr) }); err != nil {
 		return err
@@ -222,7 +224,12 @@ func cmdIndex(dir string, rest []string) error {
 	// Silence reads as "it did not run". `update` on the newest release and
 	// `doctor` on a fresh index both say so; this one returned to the prompt
 	// with nothing (#824). Only here: on a search the same line would be noise.
+	// The freshness check walks every store, which on a slow volume is the
+	// longest part of the whole command, and it ran before the progress sink
+	// existed (#1021).
+	stopProgress := publishBuildProgress(dir)
 	if fresh, n := index.UpToDate(dir, ""); fresh && !force {
+		stopProgress()
 		// The warmup child runs this command, so returning before the sentinel
 		// is cleared leaves a build that is not running: the next request is
 		// suppressed until the retry window, and readWarmupStatus tells the
@@ -231,6 +238,7 @@ func cmdIndex(dir string, rest []string) error {
 		fmt.Fprintf(os.Stderr, "deja: index is up to date (%d session%s)\n", n, pluralS(n))
 		return nil
 	}
+	stopProgress()
 	prepareFirstIndexGreeting(dir)
 	// The detached warmup publishes its progress so hooks can tell the user
 	// memory is on its way; an interactive run draws the live display.
@@ -456,6 +464,13 @@ func cmdCtx(dir string, rest []string) error {
 			return err
 		}
 		if ok {
+			// Every other reading surface stops here when a rule denies the
+			// session's origin; ctx handed the whole session over, and it is
+			// the command the hook tells an agent to call (#1026).
+			if kept, hidden := policyFilterSessionsCounted(policy.ActivationSearch, []model.Session{s}); len(kept) == 0 {
+				fmt.Fprint(os.Stderr, policyHiddenNote(policy.ActivationSearch, hidden))
+				return fmt.Errorf("no session matches %q", q)
+			}
 			// The one command an agent is told to call — the hook's lead line
 			// names recall_context — answered from one of several sessions
 			// behind an elided id without saying it was a choice, while show,
@@ -479,6 +494,11 @@ func cmdCtx(dir string, rest []string) error {
 	hits, err := search.Run(ss, o)
 	if err != nil {
 		return err
+	}
+	hits, policyHidden := policyFilterHitsCounted(policy.ActivationSearch, hits)
+	if len(hits) == 0 && policyHidden > 0 {
+		fmt.Fprint(os.Stderr, policyHiddenNote(policy.ActivationSearch, policyHidden))
+		return fmt.Errorf("no session matches %q", q)
 	}
 	if len(hits) == 0 {
 		// Same as #834 in files and restore: an empty store is not a miss on
@@ -1318,7 +1338,9 @@ func findBlameHits(dir string, target search.BlameTarget, o search.BlameOptions,
 	if err != nil {
 		return nil, err
 	}
-	return policyFilterBlame(activation, search.Blame(withFileTouchers(dir, result.Sessions, target), target, o)), nil
+	hits := policyFilterBlame(activation, search.Blame(withFileTouchers(dir, result.Sessions, target), target, o))
+	attachBlameLifecycles(hits)
+	return hits, nil
 }
 
 // blameToucherCap bounds how many extra sessions a blame reads from the
@@ -1454,8 +1476,10 @@ func printSources(dir string) {
 		// `deja sources` is where the empty-machine advice sends people, and a
 		// store deja is not allowed to read looked exactly like one nobody has
 		// used: `sessions=0 messages=0 size=0 B` (#1000).
-		if denied := firstDeniedDir(it.roots); denied != "" {
+		if denied, whole := firstDeniedDir(it.roots); denied != "" {
 			note = "\t(cannot be read — permission denied on " + denied + ")"
+		} else if !whole {
+			note = "\t(permissions not fully checked — too many directories to walk)"
 		}
 		if it.name == "cursor" && len(sources.CursorDBs()) > 0 && !sources.SQLite3Available() {
 			note = "\t(sqlite3 CLI not found — Cursor IDE sessions unavailable)"
@@ -1577,7 +1601,11 @@ func runForget(dir string, args []string) error {
 		}
 	}
 	if !list && unforget == "" && o.Session == "" && o.Project == "" && o.Before.IsZero() {
-		return fmt.Errorf("forget: selector required")
+		// Naming the selectors here is what separates one call from hundreds:
+		// forgetting 100 sessions one id at a time took 10.5s against 0.2s for
+		// `--project`, and nothing on this path said the second form exists
+		// (#1022).
+		return fmt.Errorf("forget: selector required — `--session <id>`, `--project <name>` or `--before <date>`; `--dry-run` shows what would go, `--list` what already went")
 	}
 	if list {
 		keys := index.Tombstones()
@@ -1946,9 +1974,27 @@ func idPrefixNeeded(dir, subject, refusal string) error {
 // found at all, the useful next step is finding out where deja looked.
 func emptyIndexHint(what string) string {
 	if noAgentHistoryFound() {
+		// "no agent history was found" is a claim about the machine, and it
+		// was made over a store deja is not allowed to open: the sessions are
+		// there, behind a permission wall doctor and sources both name (#1020).
+		if denied := deniedStoreCount(); denied > 0 {
+			return fmt.Sprintf("deja: %s — %d store%s could not be read (permission denied); `deja doctor` names %s",
+				what, denied, pluralS(denied), pluralWhich(denied))
+		}
 		return "deja: " + what + " — no agent history was found on this machine; `deja sources` shows where deja looked"
 	}
 	return "deja: " + what + " — run `deja index`, or `deja doctor` to see which agent stores were found"
+}
+
+// deniedStoreCount reports how many harness stores exist but cannot be opened.
+func deniedStoreCount() int {
+	n := 0
+	for _, check := range doctorStoreChecks() {
+		if store, _ := inspectDoctorStore(check); store.State == "denied" {
+			n++
+		}
+	}
+	return n
 }
 
 // noAgentHistoryFound reports whether the stores themselves are empty, as
