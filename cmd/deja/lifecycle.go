@@ -12,7 +12,11 @@ import (
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
-const lifecycleRejected = "rejected"
+const (
+	lifecycleRejected   = "rejected"
+	lifecycleSuperseded = "superseded"
+	lifecycleStale      = "stale"
+)
 
 // promotedNoteID returns the id a promoted note has on the machine that made
 // it: after a sync the local id is imported-<hash>, and every rule written for
@@ -140,14 +144,19 @@ func lifecycleLine(h search.Hit) string {
 	case "stale":
 		b.WriteString("[marked stale — may no longer hold")
 	default:
-		b.WriteString("[" + h.Lifecycle)
+		b.WriteString("[" + recallListingLine(h.Lifecycle))
 	}
 	if h.LifecycleAt != "" {
 		fmt.Fprintf(&b, ", %s", h.LifecycleAt)
 	}
 	b.WriteString("]")
 	if h.LifecycleNote != "" {
-		b.WriteString(" " + h.LifecycleNote)
+		// The note is free text the writer chose, and it travels between
+		// machines with the session. On its own line above the snippets, a
+		// note spanning several lines prints a "2. [claude] …" header and a
+		// "- …" snippet that no session in the store produced — the forgery
+		// #1080 fixed for imported project names, here on the note channel.
+		b.WriteString(" " + recallListingLine(h.LifecycleNote))
 	}
 	return b.String()
 }
@@ -241,6 +250,12 @@ func demotedNote(hits []search.Hit, moved int) string {
 		if strings.HasPrefix(h.Session.Project, "imported:") {
 			elsewhere++
 		}
+	}
+	// Reordering the whole result set and then paging it can leave a page with
+	// no rejected hit on it; "0 sessions you marked rejected" is not a fact
+	// worth spending a line on.
+	if n == 0 {
+		return ""
 	}
 	if elsewhere == n {
 		return fmt.Sprintf("%d session%s marked rejected on the machine %s came from %s below the rest", n, pluralS(n), theyOrIt(n), verbWere2(n))

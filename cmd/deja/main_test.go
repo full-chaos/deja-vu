@@ -461,7 +461,9 @@ func TestStatsCommandJSONAndNoColor(t *testing.T) {
 	if report.BusiestDay.Date != "2026-07-04" || report.BusiestDay.Messages != 3 {
 		t.Fatalf("busiest = %#v", report.BusiestDay)
 	}
-	if report.Recall.Recalls != 3 || report.Recall.Injections != 1 || report.Recall.InjectedSessions != 2 || report.Recall.EmptyResultRate != 0.5 {
+	// Two agent recalls and one injection: recalls_served no longer carries
+	// the injection it prints on the next line.
+	if report.Recall.Recalls != 2 || report.Recall.Injections != 1 || report.Recall.InjectedSessions != 2 || report.Recall.EmptyResultRate != 0.5 {
 		t.Fatalf("recall = %#v", report.Recall)
 	}
 	byHarness := map[string]stats.HarnessStats{}
@@ -479,7 +481,10 @@ func TestStatsCommandJSONAndNoColor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "\x1b[") || strings.Contains(out, "█") || !strings.Contains(out, "##") || !strings.Contains(out, "[claude]") || !strings.Contains(out, "Recalls served   3") {
+	if strings.Contains(out, "\x1b[") || strings.Contains(out, "█") || !strings.Contains(out, "##") || !strings.Contains(out, "[claude]") || !strings.Contains(out, "Recalls served   2") ||
+		// The headline is about memory handed over at all, so it still sums
+		// the two agent recalls and the one injection.
+		!strings.Contains(out, "memory served 3 times") {
 		t.Fatalf("NO_COLOR/plain output wrong: %q", out)
 	}
 }
@@ -1181,14 +1186,17 @@ func TestSearchFlagsAcceptTheEqualsForm(t *testing.T) {
 func TestLastWithFiltersNamesTheFilter(t *testing.T) {
 	dir := seedBriefIndex(t)
 	_ = dir
-	out, err := captureRunStderr(t, "last", "3", "--harness", "nosuchharness")
+	// A real harness with no sessions here (the fixture is claude-only): the
+	// filter emptied the result, and the message must name it. An unknown name
+	// is refused earlier now, so this path needs a valid-but-empty one.
+	out, err := captureRunStderr(t, "last", "3", "--harness", "codex")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(out, "no sessions indexed yet") {
 		t.Fatalf("blamed the index for a filter: %q", out)
 	}
-	if !strings.Contains(out, `harness "nosuchharness"`) {
+	if !strings.Contains(out, `harness "codex"`) {
 		t.Fatalf("did not name the filter: %q", out)
 	}
 	// Unfiltered on an empty store keeps the original advice, which is right

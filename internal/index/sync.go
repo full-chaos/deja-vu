@@ -17,6 +17,7 @@ import (
 	"unicode"
 
 	"github.com/vshulcz/deja-vu/internal/redact"
+	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
@@ -249,6 +250,16 @@ var lastImportSkippedForgotten int
 // leave alone (#968).
 func ImportSkippedForgotten() int { return lastImportSkippedForgotten }
 
+// lastImportSkippedIncomplete holds how many records the last Import dropped
+// because they could not be attributed to a session — no harness or no
+// session_id. deja's own exports always carry both; a hand-made or foreign
+// batch may not, and dropping such a record silently made "imported 2 records"
+// from a 3-record batch read as a complete transfer (#1118).
+var lastImportSkippedIncomplete int
+
+// ImportSkippedIncomplete reports that count.
+func ImportSkippedIncomplete() int { return lastImportSkippedIncomplete }
+
 // noteStateFromText reads the state a promoted note's line carries. deja writes
 // them as "[accepted] …" or "[rejected] did not hold", and that prefix is the
 // only copy of the state that crosses a machine boundary (#975).
@@ -289,7 +300,7 @@ func Import(dir, inDir string) (int, error) {
 	fi, err := os.Stat(inDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, fmt.Errorf("no such directory: %s", inDir)
+			return 0, fmt.Errorf("no such directory: %s", search.SafeLine(inDir))
 		}
 		return 0, err
 	}
@@ -375,8 +386,10 @@ func Import(dir, inDir string) (int, error) {
 	var skipped []string
 	ownSkipped := 0
 	forgottenSkipped := 0
+	incompleteSkipped := 0
 	defer func() { lastImportSkippedForgotten = forgottenSkipped }()
 	defer func() { lastImportSkippedOwn = ownSkipped }()
+	defer func() { lastImportSkippedIncomplete = incompleteSkipped }()
 	for _, p := range paths {
 		// A file is imported whole or not at all, so what it contributed is
 		// remembered before it is read and rolled back if it turns out to be
@@ -405,6 +418,9 @@ func Import(dir, inDir string) (int, error) {
 		if err := readSyncFile(p, func(sr SyncRecord) error {
 			origID := sr.SessionID
 			if sr.Harness == "" || origID == "" {
+				// No session to attribute it to. Count it so the summary does not
+				// call a partial transfer complete (#1118).
+				incompleteSkipped++
 				return nil
 			}
 			// The same rule the local ingest applies: a message that strips to
@@ -498,11 +514,15 @@ func Import(dir, inDir string) (int, error) {
 				better := rank > titleRankOf[key]
 				sameRank := rank == titleRankOf[key] && !sr.Time.IsZero() && sr.Time.Before(titleAt[key])
 				if _, seen := titleAt[key]; !seen || better || sameRank {
-					meta.Title = truncateTitle(strings.TrimSpace(text), 60)
+					if rank == titleRank(roleToolOutput) {
+						meta.Title = toolOutputTitle(strings.TrimSpace(text))
+					} else {
+						meta.Title = truncateTitle(strings.TrimSpace(text), 60)
+					}
 					// The listing marks a title that is the agent's own words
 					// rather than the reader's question (#1100); the import
 					// path derived the title the same way and lost the mark.
-					meta.AgentTitle = titleRank("user") != rank
+					meta.AgentTitle = rank == titleRank("assistant")
 					titleAt[key] = sr.Time
 					titleRankOf[key] = rank
 				}
@@ -619,8 +639,12 @@ func initEmptyIndex(dir string) error {
 func titleRank(role string) int {
 	switch role {
 	case "user":
-		return 2
+		return 3
 	case "assistant":
+		return 2
+	case roleToolOutput:
+		// A session of nothing but tool output would otherwise arrive titleless
+		// and list as a bare id on the receiving machine.
 		return 1
 	}
 	return 0
@@ -632,17 +656,28 @@ func readSyncFile(path string, fn func(SyncRecord) error) error {
 		return err
 	}
 	defer func() { _ = f.Close() }()
+	// A last line the writer never terminated is the signature of a transfer cut
+	// off mid-write, not a foreign record: deja wrote it, it just did not all
+	// arrive. The file is still refused whole (#891), but the reason is a
+	// truncation to re-fetch, not a batch deja mistrusts (#1117).
+	torn := !fileEndsWithNewline(f)
 	s := bufio.NewScanner(f)
 	s.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	line := 0
-	for s.Scan() {
+	have := s.Scan()
+	for have {
 		line++
+		cur := append([]byte(nil), s.Bytes()...)
+		next := s.Scan()
 		var rec SyncRecord
-		if err := json.Unmarshal(s.Bytes(), &rec); err != nil {
+		if err := json.Unmarshal(cur, &rec); err != nil {
 			// The line number, because "invalid character 'o' in literal null"
 			// on a file of thousands is not something anyone can act on. The
 			// file is still refused whole: a half-imported transfer is worse
 			// than one the reader can retry (#891).
+			if !next && torn {
+				return fmt.Errorf("%s looks truncated at line %d — the transfer may have been cut off; fetch the batch again", filepath.Base(path), line)
+			}
 			return fmt.Errorf("%s line %d is not a record deja wrote: %w", filepath.Base(path), line, err)
 		}
 		// Metadata from a batch is another machine's text: it lands in the
@@ -656,11 +691,28 @@ func readSyncFile(path string, fn func(SyncRecord) error) error {
 		if err := fn(rec); err != nil {
 			return err
 		}
+		have = next
 	}
 	if err := s.Err(); err != nil && err != io.EOF {
 		return err
 	}
 	return nil
+}
+
+// fileEndsWithNewline reports whether the file's last byte is a newline. A batch
+// deja wrote always ends in one; a missing final newline means the last line was
+// never finished — a transfer cut off mid-write. An empty file counts as
+// terminated: it has no torn tail.
+func fileEndsWithNewline(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return true
+	}
+	buf := make([]byte, 1)
+	if _, err := f.ReadAt(buf, fi.Size()-1); err != nil {
+		return true
+	}
+	return buf[0] == '\n'
 }
 
 func appendImportedRecords(dir string, m *Manifest, recsByKey map[string][]Record, metas map[string]SessionMeta) error {

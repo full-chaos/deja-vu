@@ -179,6 +179,7 @@ func run(args []string) error {
 		return nil
 	}
 	sourceInstance := os.Getenv("DEJA_SOURCE_INSTANCE")
+	warnBrokenPolicy(args[0], os.Stderr)
 	if wantsHelp(args[1:]) {
 		if h := helpForCommand(args[0]); h != "" {
 			fmt.Print(h)
@@ -213,7 +214,11 @@ func cmdWarmup(dir string, _ []string) error {
 	defer stop()
 	prepareFirstIndexGreeting(dir)
 	if err := withBuildProgress(func() error { return index.Ensure(dir, "", false, os.Stderr) }); err != nil {
-		return err
+		// Every other build path runs through ensureError; this one returned
+		// the raw error, so a read-only index directory read as
+		// `open /…/index.lock: permission denied` — an internal lock file and
+		// a syscall, the shape #798 replaced everywhere else.
+		return ensureError(dir, err)
 	}
 	maybeFirstIndexGreeting(dir)
 	return nil
@@ -235,6 +240,7 @@ func cmdIndex(dir string, rest []string) error {
 	// longest part of the whole command, and it ran before the progress sink
 	// existed (#1021).
 	stopProgress := publishBuildProgress(dir)
+	index.SweepStaleTmp(dir)
 	fresh, n := index.UpToDate(dir, "")
 	// A note bucket's id names the local day of whichever process indexed the
 	// line, so a `remember` under TZ=UTC and one under the machine's own zone
@@ -306,6 +312,13 @@ func cmdIndex(dir string, rest []string) error {
 			fmt.Fprintf(os.Stderr, "deja: indexed %d session%s, %d message%s — the per-harness lines above count transcripts, not rows\n",
 				b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages))
 		}
+	}
+	// A machine with no agent history built an empty index and said nothing:
+	// the step whose whole job is filling memory returned to the prompt after
+	// a bare "indexing ..." line, and the state (no history anywhere, or a
+	// store behind a permission wall) only surfaced on the next command.
+	if b := index.LastBuild; b.Sessions == 0 && b.Messages == 0 && (noAgentHistoryFound() || deniedStoreCount() > 0) {
+		fmt.Fprintln(os.Stderr, emptyIndexHint("nothing to index yet"))
 	}
 	maybeFirstIndexGreeting(dir)
 	// The live display erases itself on the way out, so a rebuild on a
@@ -515,17 +528,44 @@ func cmdCtx(dir string, rest []string) error {
 	}
 	o := search.Options{Query: q, All: true}
 	if err := index.EnsureForSearch(dir, o, false, os.Stderr); err != nil {
-		if !staleReadOnlyIndex(dir, err) {
+		if !staleUnwritableIndex(dir, err) {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "deja: answering from the index as it was — %v\n", ensureError(dir, err))
 	}
-	ss, err := index.SearchWithRecovery(dir, o, os.Stderr)
+	// Detailed, not the plain form: retrieval answers a sentence by dropping
+	// the terms nothing carries and returning the session under the close or
+	// relevance tier. Handing those sessions to Run without the tier and its
+	// variant map made scoring hunt for the whole literal query, score zero,
+	// and report "no session matches" — about a store `deja search` answered
+	// on the same words. ctx is the command the hook names to an agent, and
+	// agents ask in sentences (#R8).
+	result, err := index.SearchWithRecoveryDetailed(dir, o, os.Stderr)
 	if err != nil {
 		return err
 	}
-	hits, err := search.Run(ss, o)
-	if err != nil {
+	ss := result.Sessions
+	o.Tier = result.Tier
+	// Which rung answered, said out loud on stderr as the search screen says
+	// it — stdout stays the context block an agent parses. ctx served an
+	// answer to a word the caller never typed and said nothing about it.
+	if result.Stemmed {
+		printStemmed(os.Stderr, result.Variants)
+		o.Stemmed = true
+		o.FuzzyVariants = result.Variants
+	} else if result.Fuzzy {
+		printSpellings(os.Stderr, result.Variants)
+		o.Fuzzy = true
+		o.FuzzyVariants = result.Variants
+	}
+	if result.Tier == search.TierClose && o.FuzzyVariants == nil {
+		o.FuzzyVariants = result.Variants
+	}
+	var hits []search.Hit
+	if result.Tier == search.TierRelevance {
+		fmt.Fprintln(os.Stderr, "deja: no exact match; showing sessions ranked by relevance to the whole query")
+		hits = search.RelevanceHits(ss, index.RelevanceMatchTerms(o.Query))
+	} else if hits, err = search.Run(ss, o); err != nil {
 		return err
 	}
 	hits, policyHidden := policyFilterHitsCounted(policy.ActivationSearch, hits)
@@ -592,6 +632,12 @@ func clearedNoteIDs(keys []string) string {
 func cmdLast(dir string, rest []string, sourceInstance string) error {
 	n, o, sinceRaw, err := parseLast(rest)
 	if err != nil {
+		return err
+	}
+	if err := checkHarness(o.Harness); err != nil {
+		return err
+	}
+	if err := checkRole(o.Role); err != nil {
 		return err
 	}
 	ss, err := recentMatching(dir, n, o)
@@ -710,6 +756,12 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	if err != nil {
 		return err
 	}
+	if err := checkHarness(o.Harness); err != nil {
+		return err
+	}
+	if err := checkRole(o.Role); err != nil {
+		return err
+	}
 	sinceRaw := sinceRawArg(filtered)
 	o.SourceInstance = sourceInstance
 	o.RecallWorn = usage.WornSessions(dir)
@@ -717,7 +769,7 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	if err := withBuildProgress(func() error { return index.EnsureForSearch(dir, o, force, os.Stderr) }); err != nil {
 		// A store that cannot be written still has an index that can be read:
 		// answering from it beats answering nothing (#904).
-		if !staleReadOnlyIndex(dir, err) {
+		if !staleUnwritableIndex(dir, err) {
 			return ensureError(dir, err)
 		}
 		fmt.Fprintf(os.Stderr, "deja: answering from the index as it was — %v\n", ensureError(dir, err))
@@ -791,6 +843,9 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	if note := demotedNote(hits, demoted); note != "" {
 		fmt.Fprintf(os.Stderr, "deja: %s\n", note)
 	}
+	if note := otherWordFormsNote(dir, o, hits); note != "" {
+		fmt.Fprint(os.Stderr, note)
+	}
 	if len(hits) == 0 {
 		// The policy is named before the generic advice: "try fewer words" is
 		// wrong counsel for someone whose words were fine (#680). A filter the
@@ -827,6 +882,87 @@ func printStemmed(w io.Writer, variants map[string][]string) {
 			}
 		}
 	}
+}
+
+// otherWordFormsNote says that a word form the query did not use has sessions
+// of its own that this answer does not contain.
+//
+// The exact tier wins and stops, so `retry` returns what wrote "retry" and
+// never reaches "retries" — the stem tier below it only runs when exact comes
+// up empty. deja narrates every other time the ladder shapes an answer (close
+// spellings, dropped terms, the trust policy); this rung was the silent one,
+// and silence here reads as "that is all there is". Only the forms that bring
+// sessions the answer does not already hold are worth a line.
+func otherWordFormsNote(dir string, o query.Options, hits []search.Hit) string {
+	if o.Regex || o.Tier != search.TierExact || len(hits) == 0 {
+		return ""
+	}
+	terms := query.Tokens(o.Query)
+	if len(terms) == 0 || len(terms) > 4 {
+		return ""
+	}
+	forms := index.OtherWordForms(dir, terms)
+	if len(forms) == 0 {
+		return ""
+	}
+	var flat []string
+	for _, list := range forms {
+		flat = append(flat, list...)
+	}
+	counts := index.TermSessionCounts(dir, flat)
+	var parts []string
+	for _, term := range terms {
+		for _, form := range forms[term] {
+			extra := counts[form] - sessionsHolding(hits, form)
+			if extra <= 0 {
+				continue
+			}
+			parts = append(parts, fmt.Sprintf("%q in %d more", form, extra))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("deja: word forms this answer leaves out: %s — search the form to see them\n", strings.Join(parts, ", "))
+}
+
+// sessionsHolding counts the returned sessions that already contain a word
+// form, so the note reports what is missing rather than what is on the page.
+func sessionsHolding(hits []search.Hit, form string) int {
+	n := 0
+	for _, h := range hits {
+		for _, m := range h.Session.Messages {
+			if containsWord(strings.ToLower(m.Text), form) {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// containsWord matches a whole word, not a substring: "retry" inside
+// "retrying" is a different form and counting it would hide the one the note
+// exists to name.
+func containsWord(low, word string) bool {
+	for i := 0; ; {
+		j := strings.Index(low[i:], word)
+		if j < 0 {
+			return false
+		}
+		start := i + j
+		end := start + len(word)
+		beforeOK := start == 0 || !isWordByte(low[start-1])
+		afterOK := end == len(low) || !isWordByte(low[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		i = start + 1
+	}
+}
+
+func isWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b >= 0x80
 }
 
 // termCountLine names the terms that do match on their own, so "try fewer
@@ -1029,6 +1165,42 @@ func olderThanWindow(dir string, since time.Duration) string {
 		ov.Sessions, ov.Newest.Local().Format("2006-01-02"))
 }
 
+// checkHarness rejects a --harness value deja does not know. A typo used to be
+// indistinguishable from a real harness with no sessions — both said "matched
+// nothing under harness X" — so `--harness cluade` read as "you have no claude
+// history" instead of "that is not a harness". A known-but-empty harness is
+// still valid; only an unknown name is refused (#1113).
+func checkHarness(name string) error {
+	if name == "" || sources.IsKnownHarness(name) {
+		return nil
+	}
+	return fmt.Errorf("%q is not a harness deja knows — one of: %s", name, strings.Join(sources.HarnessNames(), ", "))
+}
+
+// knownRoles is the set `--role` accepts. It lists the documented spellings the
+// help text prints plus "tool-output", the stored form "tool" is an alias for —
+// both reach tool records, so both must be accepted.
+var knownRoles = []string{
+	"user", "assistant", "tool", sources.RoleToolOutput,
+	sources.RoleFiles, sources.RoleCommand, sources.RoleEdit,
+}
+
+// checkRole rejects a --role value that is not a known role. Like an unknown
+// --harness, a typo used to be indistinguishable from a real role with no
+// matches: `--role toool` said "matched nothing under role toool" instead of
+// naming the mistake (#1113).
+func checkRole(role string) error {
+	if role == "" {
+		return nil
+	}
+	for _, r := range knownRoles {
+		if r == role {
+			return nil
+		}
+	}
+	return fmt.Errorf("%q is not a role deja knows — one of: %s", role, strings.Join(knownRoles, ", "))
+}
+
 // activeFilters names the filters a caller set, so an empty result can say
 // which of them emptied it rather than blaming the index. sinceRaw carries
 // what the reader actually typed: "168h0m0s" is not the flag they passed.
@@ -1070,26 +1242,41 @@ func clearWarmupSentinel() {
 	}
 }
 
-func printFuzzy(w io.Writer, variants map[string][]string) {
+// printSpellings names the words the close tier substituted. ctx uses this
+// rather than printFuzzy: "did you mean the command" is advice for a person
+// at a shell, and ctx is called by an agent that typed nothing.
+func printSpellings(w io.Writer, variants map[string][]string) {
 	keys := make([]string, 0, len(variants))
 	for token := range variants {
 		keys = append(keys, token)
 	}
 	sort.Strings(keys)
-	hinted := false
 	for _, token := range keys {
 		for _, variant := range variants[token] {
 			if variant != token {
 				fmt.Fprintf(w, "deja: no exact match, trying close spellings: %s -> %s\n", token, variant)
-				// A misspelled subcommand is searched for as a word: `deja
-				// isntall` corrects to "install" and returns sessions that
-				// mention installing, which is not what the typist wanted.
-				// Spelled correctly it would have run the command, so the only
-				// case this fires on is the one where the hint is wanted.
-				if !hinted && isSubcommand(variant) {
-					fmt.Fprintf(w, "deja: `%s` is also a command — run `deja %s` if that is what you meant\n", variant, variant)
-					hinted = true
-				}
+			}
+		}
+	}
+}
+
+func printFuzzy(w io.Writer, variants map[string][]string) {
+	printSpellings(w, variants)
+	keys := make([]string, 0, len(variants))
+	for token := range variants {
+		keys = append(keys, token)
+	}
+	sort.Strings(keys)
+	for _, token := range keys {
+		for _, variant := range variants[token] {
+			// A misspelled subcommand is searched for as a word: `deja
+			// isntall` corrects to "install" and returns sessions that
+			// mention installing, which is not what the typist wanted.
+			// Spelled correctly it would have run the command, so the only
+			// case this fires on is the one where the hint is wanted.
+			if variant != token && isSubcommand(variant) {
+				fmt.Fprintf(w, "deja: `%s` is also a command — run `deja %s` if that is what you meant\n", variant, variant)
+				return
 			}
 		}
 	}
@@ -1172,7 +1359,12 @@ func recent(dir string, n int) ([]model.Session, error) {
 func recentMatching(dir string, n int, o search.Options) ([]model.Session, error) {
 	if err := index.Ensure(dir, "", false, os.Stderr); err == nil {
 		if o.Role != "" {
-			ss, err := index.SearchWithRecovery(dir, search.Options{All: true}, io.Discard)
+			// The role has to travel into the index query, not just the filter
+			// below: a scan with no role set drops file, command and edit
+			// records on the way out — they are indexed but served only when
+			// asked for — so `last --role files` saw sessions with the very
+			// records it was selecting on already removed.
+			ss, err := index.SearchWithRecovery(dir, search.Options{All: true, Role: o.Role}, io.Discard)
 			if err == nil {
 				ss = filterRecentSources(ss, o)
 				return search.Recent(ss, n), nil
@@ -1615,7 +1807,7 @@ func printSources(dir string) {
 		if excluded > 0 {
 			note += fmt.Sprintf("\texcluded-sessions=%d", excluded)
 		}
-		fmt.Printf("%s\t%s\tsessions=%d messages=%d size=%s redacted=%d%s\n", it.name, it.location, len(ss), msg, humanBytes(size), redacted, note)
+		fmt.Printf("%s\t%s\tsessions=%d messages=%d size=%s redacted=%d%s\n", it.name, it.location, sources.CountSessions(ss), msg, humanBytes(size), redacted, note)
 	}
 	aiderFiles := sources.AiderFiles()
 	var aiderSize int64
@@ -1643,7 +1835,7 @@ func printSources(dir string) {
 	if excluded := len(rawAiderSessions) - len(aiderSessions); excluded > 0 {
 		note += fmt.Sprintf("\texcluded-sessions=%d", excluded)
 	}
-	fmt.Printf("aider\t%s\tsessions=%d messages=%d size=%s redacted=%d%s\n", aiderLocation, len(aiderSessions), aiderMessages, humanBytes(aiderSize), aiderRedactions, note)
+	fmt.Printf("aider\t%s\tsessions=%d messages=%d size=%s redacted=%d%s\n", aiderLocation, sources.CountSessions(aiderSessions), aiderMessages, humanBytes(aiderSize), aiderRedactions, note)
 	var size int64
 	if fi, err := os.Stat(sources.OpencodeDB()); err == nil {
 		size = fi.Size()
@@ -2098,7 +2290,7 @@ Usage:
   deja share <id-prefix>
   deja resume <id-prefix> [--exec]
   deja handoff [--to <agent>] [id-prefix] [--exec]
-  deja hook-prompt   (UserPromptSubmit hook: relevance recall per prompt)
+  deja hook-prompt [--plain]  (UserPromptSubmit hook: relevance recall per prompt)
   deja hook-antigravity (Antigravity PreInvocation hook: inject on first turn)
   deja view [--no-open]  (browse your memory: sessions, recalls, notes — one local HTML)
   deja ctx <query|id-prefix>
@@ -2128,7 +2320,7 @@ Usage:
   deja version
   deja <command> --help
   deja update [--force]
-  deja install <target> | --all | --auto
+  deja install <target> | --all | --auto  [--no-guidance] [--no-index]
   deja uninstall <target> | --all | --auto
     targets:
 %s
@@ -2371,12 +2563,18 @@ func pluralWhich(n int) string {
 	return "them"
 }
 
-// staleReadOnlyIndex reports that a build could not run because the store is
-// not writable, while an index that can still answer is right there. Refusing
-// the whole search then is deja withholding what it has: the reader gets
-// nothing instead of slightly old memory and a line saying why (#904).
-func staleReadOnlyIndex(dir string, err error) bool {
-	return errors.Is(err, fs.ErrPermission) && index.HasManifest(dir)
+// staleUnwritableIndex reports that a build could not run because the store
+// cannot be written, while an index that can still answer is right there.
+// Refusing the whole search then is deja withholding what it has: the reader
+// gets nothing instead of slightly old memory and a line saying why (#904).
+// A full disk belongs here next to a denied one: it is the commoner of the
+// two, and it took every answer with it — empty stdout and exit 1 while a
+// complete index sat in the store.
+func staleUnwritableIndex(dir string, err error) bool {
+	if !errors.Is(err, fs.ErrPermission) && !errors.Is(err, syscall.ENOSPC) {
+		return false
+	}
+	return index.HasManifest(dir)
 }
 
 // deniedPath names the file a permission error was actually about, so the fix

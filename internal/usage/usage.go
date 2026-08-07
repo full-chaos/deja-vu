@@ -24,8 +24,17 @@ const (
 	// and it is the largest thing the server hands over — whole sessions
 	// rather than budgeted snippets — so leaving it out understated what the
 	// agent was given (#682).
-	KindBlame   = "blame"
-	KindHandoff = "handoff"
+	KindBlame = "blame"
+	// KindResource is a read of deja://session/… over the MCP resources
+	// surface. It hands the agent a whole session in the same frame
+	// recall_context uses, so leaving it out understated what was served the
+	// same way blame did before #682.
+	KindResource = "resource"
+	KindHandoff  = "handoff"
+	// KindRemember is the MCP remember tool — the one tool that writes to the
+	// store. #682 covered the read tools only, so an agent could add a note
+	// that showed up nowhere in the journal the user reads.
+	KindRemember = "remember"
 	// KindDejaVu marks a per-prompt recall: the user asked something their
 	// own history already answers — the product's namesake moment.
 	KindDejaVu = "dejavu"
@@ -46,6 +55,10 @@ type Event struct {
 }
 
 type Summary struct {
+	// Recalls counts agent-initiated recalls only. Injections are counted
+	// separately and printed on their own line — folding them into Recalls
+	// made one surface say 5 and `deja stats --impact` say 2 about the same
+	// five events.
 	Recalls          int     `json:"recalls_served"`
 	Injections       int     `json:"injections"`
 	RecallSessions   int     `json:"recall_sessions"`
@@ -189,7 +202,6 @@ func Totals(indexDir string) Summary {
 				empty++
 			}
 		case KindHook, KindDejaVu:
-			out.Recalls++
 			out.Injections++
 			out.InjectedSessions += e.Sessions
 			out.InjectedBytes += e.Bytes
@@ -200,8 +212,8 @@ func Totals(indexDir string) Summary {
 			}
 		}
 	}
-	if served := out.Recalls - out.Injections; served > 0 {
-		out.EmptyResultRate = float64(empty) / float64(served)
+	if out.Recalls > 0 {
+		out.EmptyResultRate = float64(empty) / float64(out.Recalls)
 	}
 	return out
 }
@@ -256,29 +268,47 @@ func read(p string) []Event {
 // rotate rewrites the log keeping only the recent window once it grows past
 // rotateAt. Concurrent writers may lose an event during the swap; usage data
 // is advisory, so that trade keeps the hot path lock-free.
+//
+// Size is the trigger, but the window is what actually bounds the file, and
+// past 1MB the two disagree: a log that is large because it is busy — not
+// because it is old — is over the trigger with nothing to drop, and then every
+// recall rewrote the whole thing and left it exactly as long. Measured on a
+// 10k-session store, per-recall cost went 123ms at an empty log to 342ms at
+// 1.2MB and 870ms at 5.8MB, none of those rewrites dropping a single event.
+// Reading the log to find that out is nearly free; writing it back is not, so
+// the write is what gets skipped when every event survives the cutoff. Which
+// event is oldest cannot be assumed from the order — a clock that steps back
+// appends an older event behind a newer one, and dropping on that assumption
+// would leave stale recalls weighing on ranking forever.
 func rotate(p string) {
 	fi, err := os.Stat(p)
 	if err != nil || fi.Size() < rotateAt {
 		return
 	}
 	cutoff := time.Now().UTC().Add(-keepWindow)
+	all := read(p)
 	var keep []Event
-	for _, e := range read(p) {
+	for _, e := range all {
 		if e.Time.After(cutoff) {
 			keep = append(keep, e)
 		}
+	}
+	if len(keep) == len(all) {
+		return
 	}
 	tmp := p + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return
 	}
+	w := bufio.NewWriter(f)
 	for _, e := range keep {
 		if b, err := json.Marshal(e); err == nil {
-			_, _ = f.Write(append(b, '\n'))
+			_, _ = w.Write(append(b, '\n'))
 		}
 	}
-	if f.Close() != nil {
+	flushed := w.Flush()
+	if f.Close() != nil || flushed != nil {
 		_ = os.Remove(tmp)
 		return
 	}
@@ -339,6 +369,13 @@ func Impact(indexDir string) ImpactReport {
 				worn[id]++
 			}
 		case KindHook:
+			// A session start with no project session to show still injects
+			// the environment block, and that event is logged empty. Counting
+			// it made "N session starts began with project memory" claim
+			// memory that was not there.
+			if e.Empty {
+				continue
+			}
 			r.Injections++
 			r.ServedBytes += e.Bytes
 			r.RawBytes += e.RawBytes

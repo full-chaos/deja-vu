@@ -66,13 +66,11 @@ type promptReport struct {
 }
 
 func runBenchPrompt(args []string) error {
-	jsonOut := false
-	for _, a := range args {
-		if a == "--json" {
-			jsonOut = true
-		}
+	jsonOut, seed, err := parseBenchArgs("prompt", args)
+	if err != nil {
+		return err
 	}
-	report, err := measurePrompt(bench.Seed)
+	report, err := measurePrompt(seed)
 	if err != nil {
 		return err
 	}
@@ -165,7 +163,7 @@ func measurePrompt(seed int64) (promptReport, error) {
 // would discard downstream is discarded here too, so the number reported is
 // what a user would actually see.
 func promptBenchProbe(dir, project, chainID string, terms []string) (fired, correct bool) {
-	if len(terms) < 2 {
+	if !promptTermsWorthAsking(terms) {
 		return false, false
 	}
 	ranked, matched, err := index.ProjectRelevant(dir, []string{project}, terms, 8)

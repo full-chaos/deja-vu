@@ -125,6 +125,36 @@ func UpToDate(dir string, harness string) (bool, int) {
 	return true, len(prior.Sessions)
 }
 
+// sweepStaleTmp deletes a build scratch dir left by a process that died
+// mid-rebuild. Holding the dir lock means no live builder owns it. Without
+// this only `index --rebuild` cleared it, so a crashed build left a full
+// index worth of bytes on disk indefinitely, and `doctor` reported only the
+// live index's size.
+func sweepStaleTmp(dir string) {
+	tmp := dir + ".tmp"
+	if _, err := os.Stat(tmp); err == nil {
+		_ = os.RemoveAll(tmp)
+	}
+}
+
+// SweepStaleTmp is sweepStaleTmp for callers that do not already hold the dir
+// lock — `deja index` decides the index is fresh and returns before Ensure
+// ever runs, which is exactly the run that used to walk past the leftover.
+func SweepStaleTmp(dir string) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	if _, err := os.Stat(dir + ".tmp"); err != nil {
+		return
+	}
+	unlock, err := lockDir(dir)
+	if err != nil {
+		return
+	}
+	defer unlock()
+	sweepStaleTmp(dir)
+}
+
 func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 	if dir == "" {
 		dir = DefaultDir()
@@ -134,6 +164,7 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 		return err
 	}
 	defer unlock()
+	sweepStaleTmp(dir)
 	// The manifest is read before the walk so unchanged files can carry
 	// their derived state forward instead of being re-read.
 	prior, priorErr := readManifest(dir)
@@ -147,6 +178,9 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 		scope = harness
 	}
 	m, err := prior, priorErr
+	if !force && err == nil && notesZoneDrifted(m) {
+		force = true
+	}
 	if !force && err == nil && manifestFresh(m, want, scope) && recordsIntact(dir, m) {
 		return nil
 	}
@@ -169,10 +203,14 @@ func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer
 		return err
 	}
 	defer unlock()
+	sweepStaleTmp(dir)
 	prior, priorErr := readManifest(dir)
 	want := currentFilesReusing("", priorFiles(prior, priorErr))
 	scope := ""
 	m, err := prior, priorErr
+	if !force && err == nil && notesZoneDrifted(m) {
+		force = true
+	}
 	if !force && err == nil && manifestFresh(m, want, scope) && recordsIntact(dir, m) {
 		return nil
 	}
@@ -226,6 +264,11 @@ func EnsureForSearchStale(dir string, o query.Options, progress io.Writer) (bool
 		// No usable index yet (or a rebuild-grade problem): the caller cannot
 		// serve anything sensible stale, so build synchronously.
 		return false, updateIndex(dir, o.Harness, "", want, false, progress)
+	}
+	if notesZoneDrifted(m) {
+		// Regrouping the day buckets is a full rebuild; hand it to the
+		// detached warmup and say the current answer is stale.
+		return true, nil
 	}
 	if manifestFresh(m, want, "") {
 		return false, nil
@@ -933,16 +976,23 @@ func metaForSession(s model.Session) SessionMeta {
 	title := s.Title
 	agentTitle := s.AgentTitle
 	if title == "" {
-		title = sessionTitle(s)
 		// A session with no user turn borrows the assistant's opening line
-		// (#692); the listing needs to say so rather than print it where the
-		// reader's own question goes (#1100).
-		agentTitle = title != "" && earliestTitle(s.Messages, "user") == ""
+		// (#692), and one that is only tool output is named after its first
+		// output; the listing needs to say so rather than print it where the
+		// reader's own question goes (#1100). sessionTitleFrom carries the
+		// right fromAgent bit — a computed one calls tool-only sessions
+		// agent-titled.
+		title, agentTitle = sessionTitleFrom(s)
+		// Redact before the cut: slicing a secret in half leaves a prefix no
+		// pattern matches, and it survives into sessions.gob (G/#…).
+		title, _ = redact.Text(title)
+		title = truncateTitle(title, 60)
+	} else {
+		// Titles come from unredacted places — an agent-generated summary, a
+		// composer name, the first user message — and are persisted in
+		// sessions.gob, so they need the same scrubbing as record text.
+		title, _ = redact.Text(title)
 	}
-	// Titles come from unredacted places — an agent-generated summary, a
-	// composer name, the first user message — and are persisted in
-	// sessions.gob, so they need the same scrubbing as record text.
-	title, _ = redact.Text(title)
 	// The import fields travel with the session, not with the transcript: a
 	// rebuild reloads imported sessions out of the index itself, and rebuilding
 	// the row from scratch dropped what only the import knew — the note's state
@@ -1184,15 +1234,50 @@ func pluralS(n int) string {
 	return "s"
 }
 
+// derivedTitle is the title read out of the transcript, redacted and then cut.
+// The order matters: cutting first slices a secret in half, and half a pattern
+// matches nothing, so the plaintext prefix survives into sessions.gob and onto
+// every page that prints a title. The import path already redacts first.
+func derivedTitle(s model.Session) string {
+	t, _ := redact.Text(sessionTitle(s))
+	return truncateTitle(t, 60)
+}
+
 func sessionTitle(s model.Session) string {
-	// A user turn always wins; the assistant's opening line fills in when
-	// there is none — a session the agent opened itself, or one whose prompts
-	// are all harness plumbing. The alternative was the blank line these
-	// printed in `deja last` and on the first screen (#692).
+	t, _ := sessionTitleFrom(s)
+	return t
+}
+
+// sessionTitleFrom derives a session's title and reports whether it is the
+// agent's own words rather than the reader's.
+//
+// A user turn always wins; the assistant's opening line fills in when there is
+// none — a session the agent opened itself, or one whose prompts are all
+// harness plumbing. The alternative was the blank line these printed in `deja
+// last` and on the first screen (#692). A session of nothing but tool output
+// has neither, and printed an empty bracket in `last` against a dash in
+// `stats`; it is named after its first output instead.
+func sessionTitleFrom(s model.Session) (title string, fromAgent bool) {
 	if t := earliestTitle(s.Messages, "user"); t != "" {
-		return t
+		return t, false
 	}
-	return earliestTitle(s.Messages, "assistant")
+	if t := earliestTitle(s.Messages, "assistant"); t != "" {
+		return t, true
+	}
+	if t := earliestTitle(s.Messages, roleToolOutput); t != "" {
+		return toolOutputTitle(t), false
+	}
+	return "", false
+}
+
+// toolOutputTitlePrefix marks a title borrowed from tool output. It rides in
+// the title text rather than in a flag beside it so that every surface —
+// `last`, `stats`, the MCP listing, a synced peer — says the same thing
+// without a second field having to travel with it.
+const toolOutputTitlePrefix = "tool output: "
+
+func toolOutputTitle(t string) string {
+	return toolOutputTitlePrefix + truncateTitle(t, 60-len([]rune(toolOutputTitlePrefix)))
 }
 
 // earliestTitle picks the first turn of a role by the clock, falling back to
@@ -1220,7 +1305,7 @@ func earliestTitle(ms []model.Message, role string) string {
 		case !msg.Time.Before(bestAt):
 			continue
 		}
-		best, bestAt = truncateTitle(t, 60), msg.Time
+		best, bestAt = t, msg.Time
 	}
 	return best
 }
@@ -1746,8 +1831,23 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 				meta.Path = s.Path
 			}
 			if meta.Title == "" {
-				meta.Title = sessionTitle(s)
-				meta.AgentTitle = meta.Title != "" && earliestTitle(s.Messages, "user") == ""
+				// The incremental fallback redacted nothing at all before; keep
+				// sessionTitleFrom's correct fromAgent bit and redact before the
+				// cut, as the full rebuild does.
+				meta.Title, meta.AgentTitle = sessionTitleFrom(s)
+				meta.Title, _ = redact.Text(meta.Title)
+				meta.Title = truncateTitle(meta.Title, 60)
+			} else if s.Title != "" {
+				// A title the source authored is a live value, not a one-time
+				// naming: a promoted note's carries its state, and the loader
+				// rewrites it on every correction. Only the full rebuild took
+				// the new one, so `promote --state rejected` left every
+				// one-line surface — `deja last`, the digest, the citation the
+				// hook hands the agent to say aloud — reading "[accepted]"
+				// until an unrelated rebuild happened to run (#R11).
+				if t, _ := redact.Text(s.Title); t != meta.Title {
+					meta.Title, meta.AgentTitle = t, s.AgentTitle
+				}
 			}
 			m.Sessions[key] = meta
 			for _, msg := range s.Messages {

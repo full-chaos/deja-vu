@@ -98,6 +98,12 @@ func runStats(dir string, args []string) error {
 	if (jsonOut && card) || (jsonOut && html) || (card && html) {
 		return fmt.Errorf("stats: choose one output")
 	}
+	if err := checkHarness(options.Harness); err != nil {
+		return fmt.Errorf("stats: %w", err)
+	}
+	if err := checkRole(options.Role); err != nil {
+		return fmt.Errorf("stats: %w", err)
+	}
 	if impact {
 		return runStatsImpact(os.Stdout, dir, jsonOut)
 	}
@@ -162,7 +168,7 @@ func runStats(dir string, args []string) error {
 			return err
 		}
 		base := filepath.Base(path)
-		fmt.Fprintf(os.Stdout, "saved %s\n\nshare it — paste into a README or post:\n  ![deja](%s)\n", path, base)
+		fmt.Fprintf(os.Stdout, "saved %s\n\nshare it — paste into a README or post:\n  ![deja](%s)\n", search.SafeLine(path), search.SafeLine(base))
 		return nil
 	}
 	if htmlPath != "" {
@@ -170,7 +176,7 @@ func runStats(dir string, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stdout, path)
+		fmt.Fprintln(os.Stdout, search.SafeLine(path))
 		return nil
 	}
 	if jsonOut {
@@ -361,6 +367,9 @@ func statColorOK(w io.Writer) bool {
 	return st.Mode()&os.ModeCharDevice != 0
 }
 
+// statHarnessTag closes every attribute it opens. It used to re-arm bold after
+// the reset, which no stats caller wants: the "By harness" counts and the whole
+// "Busiest day" line below it rendered bold because that escape had no closer.
 func statHarnessTag(h string, color bool) string {
 	tag := "[" + h + "]"
 	if !color {
@@ -368,19 +377,19 @@ func statHarnessTag(h string, color bool) string {
 	}
 	switch h {
 	case "claude":
-		return statOrange + tag + statReset + statBold
+		return statOrange + tag + statReset
 	case "codex":
-		return statGreen + tag + statReset + statBold
+		return statGreen + tag + statReset
 	case "opencode":
-		return statBlue + tag + statReset + statBold
+		return statBlue + tag + statReset
 	case "cursor":
-		return "\x1b[36m" + tag + statReset + statBold
+		return "\x1b[36m" + tag + statReset
 	case "gemini":
-		return "\x1b[35m" + tag + statReset + statBold
+		return "\x1b[35m" + tag + statReset
 	case "aider":
-		return "\x1b[33m" + tag + statReset + statBold
+		return "\x1b[33m" + tag + statReset
 	case "antigravity":
-		return "\x1b[94m" + tag + statReset + statBold
+		return "\x1b[94m" + tag + statReset
 	}
 	return tag
 }
