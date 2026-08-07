@@ -78,7 +78,9 @@ func mergeIngestDiag(m *Manifest) {
 		if h == "" {
 			continue
 		}
-		m.IngestHealth[h] = HarnessIngest{}
+		// The clip count for this pass is recorded during redaction, which
+		// runs before this fold; resetting the whole entry threw it away.
+		m.IngestHealth[h] = HarnessIngest{ClippedMessages: m.IngestHealth[h].ClippedMessages}
 	}
 	for p, n := range malformed {
 		h := harnessForPath(p)
@@ -174,10 +176,19 @@ func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer
 	if !force && err == nil && manifestFresh(m, want, scope) && recordsIntact(dir, m) {
 		return nil
 	}
+	damaged := !force && (priorErr != nil && !errors.Is(priorErr, fs.ErrNotExist) || priorErr == nil && !recordsIntact(dir, prior))
 	if force || err != nil || m.Version != version || m.Scope != scope || !recordsIntact(dir, m) {
 		if progress != nil {
 			if !hasProgressSink() {
-				fmt.Fprintf(progress, "deja: indexing sessions into %s ...\n", displayPath(dir))
+				if damaged {
+					// A half-written index rebuilds itself, and the line for it
+					// used to be the routine one — so a disk that keeps
+					// corrupting the store looked like ordinary reindexing
+					// every single time (#1110).
+					fmt.Fprintf(progress, "deja: the index in %s could not be read and is being rebuilt ...\n", displayPath(dir))
+				} else {
+					fmt.Fprintf(progress, "deja: indexing sessions into %s ...\n", displayPath(dir))
+				}
 			}
 		}
 		return rebuildForSearch(dir, o, scope, want, progress)
@@ -397,9 +408,33 @@ func importedSessions(dir string) importedState {
 		s.Messages = append(s.Messages, model.Message{Role: r.Role, Text: r.Text, Time: r.Time})
 	})
 	for _, sess := range by {
+		deriveImportedNoteState(sess)
 		out.sessions = append(out.sessions, *sess)
 	}
 	return out
+}
+
+// deriveImportedNoteState recovers the state of an imported promoted note from
+// the note text. #984 started recording that state on the manifest row without
+// bumping the index format, so a store that imported a batch before it holds a
+// row with no state at all and nothing re-derives it — the batch is deduped,
+// so re-importing adds 0 records and the decision the other machine retracted
+// reads as accepted here (#1049).
+func deriveImportedNoteState(s *model.Session) {
+	if s.Harness != "deja" || s.Lifecycle != "" {
+		return
+	}
+	for _, msg := range s.Messages {
+		st, note, ok := noteStateFromText(msg.Text)
+		if !ok {
+			continue
+		}
+		s.Lifecycle, s.LifecycleNote = st, note
+		if !msg.Time.IsZero() {
+			s.LifecycleAt = msg.Time.Format("2006-01-02")
+		}
+		return
+	}
 }
 
 func load(h string) []model.Session { return loadProgress(h, nil) }
@@ -896,14 +931,24 @@ func (m msgSeen) dup(key, role string, ts time.Time, text string) bool {
 
 func metaForSession(s model.Session) SessionMeta {
 	title := s.Title
+	agentTitle := s.AgentTitle
 	if title == "" {
 		title = sessionTitle(s)
+		// A session with no user turn borrows the assistant's opening line
+		// (#692); the listing needs to say so rather than print it where the
+		// reader's own question goes (#1100).
+		agentTitle = title != "" && earliestTitle(s.Messages, "user") == ""
 	}
 	// Titles come from unredacted places — an agent-generated summary, a
 	// composer name, the first user message — and are persisted in
 	// sessions.gob, so they need the same scrubbing as record text.
 	title, _ = redact.Text(title)
-	return SessionMeta{ID: s.ID, Harness: s.Harness, Project: s.Project, Path: s.Path, Title: title, Started: s.Started, Updated: s.Updated, Touched: topTouchedFiles(s.Messages), Asked: askedHashes(s.Messages), Hit: frictionHashes(s.Messages)}
+	// The import fields travel with the session, not with the transcript: a
+	// rebuild reloads imported sessions out of the index itself, and rebuilding
+	// the row from scratch dropped what only the import knew — the note's state
+	// and the id it had on the machine it came from (#1049).
+	return SessionMeta{ID: s.ID, Harness: s.Harness, Project: s.Project, Path: s.Path, Title: title, AgentTitle: agentTitle, Started: s.Started, Updated: s.Updated, Touched: topTouchedFiles(s.Messages), Asked: askedHashes(s.Messages), Hit: frictionHashes(s.Messages),
+		OrigID: s.OrigID, Lifecycle: s.Lifecycle, LifecycleNote: s.LifecycleNote, LifecycleAt: s.LifecycleAt}
 }
 
 // agentOwnedFile drops the agent's own working files. They are touched
@@ -1086,7 +1131,7 @@ func nextSessionOrd(sessions map[string]SessionMeta) uint32 {
 func sessionFromMeta(meta SessionMeta) model.Session {
 	return model.Session{
 		ID: meta.ID, Harness: meta.Harness, Project: meta.Project, Path: meta.Path,
-		Title: meta.Title, Started: meta.Started, Updated: meta.Updated, Touched: meta.Touched,
+		Title: meta.Title, AgentTitle: meta.AgentTitle, Started: meta.Started, Updated: meta.Updated, Touched: meta.Touched,
 		OrigID: meta.OrigID, Lifecycle: meta.Lifecycle, LifecycleNote: meta.LifecycleNote, LifecycleAt: meta.LifecycleAt,
 	}
 }
@@ -1226,6 +1271,7 @@ func redactForIngest(m *Manifest, sourcePath, text string) string {
 			cut--
 		}
 		redacted = redacted[:cut]
+		countClipped(m, sourcePath, 1)
 	}
 	n := counts.Total()
 	if n == 0 || m == nil {
@@ -1329,10 +1375,44 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 	// which every surface reads "no agent history was found on this machine".
 	// The files are still there, on a disk that is not, and reconnecting it
 	// restores them; that is what this says (#900).
+	//
+	// Saying it once was not enough: the eviction still happened, so from the
+	// next run on there was nothing left to compare against and the warning
+	// stopped too. Records that came off a mount point stay in the index while
+	// the volume is away, and the line repeats until it is back.
+	gone := missingTrees(removed)
+	for i := range gone {
+		gone[i].renamed = renamedMount(gone[i].dir)
+		if !gone[i].mount && gone[i].renamed == "" {
+			continue
+		}
+		for p := range removed {
+			if !strings.HasPrefix(p, gone[i].dir+string(filepath.Separator)) {
+				continue
+			}
+			if of, ok := old.Files[p]; ok {
+				files[p] = of
+				delete(removed, p)
+			}
+		}
+	}
 	if progress != nil {
-		for _, gone := range missingTrees(removed) {
-			fmt.Fprintf(progress, "deja: %s is gone, and %d indexed file%s with it — if that disk is simply not mounted, reconnect it and run `deja index`\n",
-				gone.dir, gone.files, pluralFiles(gone.files))
+		for _, g := range gone {
+			verb := "is"
+			if g.files != 1 {
+				verb = "are"
+			}
+			switch {
+			case g.renamed != "":
+				fmt.Fprintf(progress, "deja: %s is mounted as %s now — its %d indexed file%s %s still searchable; point deja at the new path\n",
+					g.dir, g.renamed, g.files, pluralFiles(g.files), verb)
+			case g.mount:
+				fmt.Fprintf(progress, "deja: %s is not mounted — its %d indexed file%s %s still searchable; reconnect the disk to pick up anything new\n",
+					g.dir, g.files, pluralFiles(g.files), verb)
+			default:
+				fmt.Fprintf(progress, "deja: %s is gone, and %d indexed file%s with it — if that disk is simply not mounted, reconnect it and run `deja index`\n",
+					g.dir, g.files, pluralFiles(g.files))
+			}
 		}
 	}
 	if len(changed) == 0 && len(removed) == 0 {
@@ -1504,6 +1584,15 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 			// The row may exist only in the manifest being replaced.
 			held = old.Sessions[key]
 		}
+		// A renamed transcript arrives as one removed path and one added path
+		// in the same pass, so the path deja holds is the one that went away.
+		// Comparing them called it a collision with a file that no longer
+		// exists: the row kept the dead path until a full rebuild, `--json`
+		// handed callers that path, and `forget` warned that dropping the
+		// session would take a second conversation with it (#1086).
+		if removed[held.Path] {
+			held.Path = ""
+		}
 		owns, collided := attributeSession(held, s)
 		if collided {
 			collisions.Add(1)
@@ -1658,6 +1747,7 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 			}
 			if meta.Title == "" {
 				meta.Title = sessionTitle(s)
+				meta.AgentTitle = meta.Title != "" && earliestTitle(s.Messages, "user") == ""
 			}
 			m.Sessions[key] = meta
 			for _, msg := range s.Messages {
@@ -1815,6 +1905,75 @@ func priorFiles(m Manifest, err error) map[string]FileState {
 type missingTree struct {
 	dir   string
 	files int
+	// mount is set when dir is a mount point rather than an ordinary
+	// directory: an unplugged disk, not a deletion.
+	mount bool
+	// renamed is where the same volume turned up under a numbered name.
+	renamed string
+}
+
+// renamedMount finds the path a missing one moved to when its volume came
+// back under a different name: macOS mounts a disk as "/Volumes/Disk 1"
+// when something already sits on "/Volumes/Disk", and every path naming the
+// old mount point starts failing while the files are right there. Telling
+// the user to reconnect a disk that is already connected helps nobody.
+func renamedMount(path string) string {
+	sep := string(filepath.Separator)
+	for _, m := range mountParents {
+		if !strings.HasPrefix(path, m+sep) {
+			continue
+		}
+		rest := strings.TrimPrefix(path, m+sep)
+		name, sub, _ := strings.Cut(rest, sep)
+		if name == "" {
+			continue
+		}
+		for n := 1; n <= 9; n++ {
+			cand := filepath.Join(m, fmt.Sprintf("%s %d", name, n), sub)
+			if _, err := os.Stat(cand); err == nil {
+				return cand
+			}
+		}
+	}
+	return ""
+}
+
+// mountParents are the directories whose direct children are mount points.
+// A test cannot create one for real — /Volumes is not writable — so it
+// points this at a temporary directory instead.
+var mountParents = defaultMountParents()
+
+func defaultMountParents() []string {
+	switch runtime.GOOS {
+	case "darwin":
+		return []string{"/Volumes"}
+	case "windows":
+		return nil
+	default:
+		return []string{"/mnt", "/media"}
+	}
+}
+
+// mountRoot reports whether dir is where a removable volume gets mounted.
+// A directory the user deleted is a deletion and its sessions leave the
+// index; a mount point that is empty means the disk is elsewhere, and the
+// sessions it holds are not gone.
+func mountRoot(dir string) bool {
+	dir = filepath.Clean(dir)
+	parent := filepath.Dir(dir)
+	if parent == dir {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return filepath.VolumeName(dir) == dir || parent == filepath.VolumeName(dir)+`\`
+	}
+	for _, m := range mountParents {
+		if parent == m {
+			return true
+		}
+	}
+	// /run/media/<user>/<volume> is what udisks2 uses.
+	return runtime.GOOS == "linux" && filepath.Dir(parent) == "/run/media"
 }
 
 // missingTrees groups files that disappeared by the outermost directory that
@@ -1841,7 +2000,7 @@ func missingTrees(removed map[string]bool) []missingTree {
 	}
 	out := make([]missingTree, 0, len(byDir))
 	for dir, n := range byDir {
-		out = append(out, missingTree{dir: dir, files: n})
+		out = append(out, missingTree{dir: dir, files: n, mount: mountRoot(dir)})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].dir < out[j].dir })
 	return out
@@ -1906,7 +2065,35 @@ func currentFilesWith(h string, old map[string]FileState) map[string]FileState {
 			out[p] = fs
 		}
 	}
+	injectHermesPG(out, old)
 	return out
+}
+
+// injectHermesPG adds the Postgres-backed Hermes store, which has no inode to
+// stat. Its fingerprint is a query: count(*) as the size, max(timestamp) as the
+// mtime, so the ordinary size/mtime change check drives a re-read (#1018). A
+// store deja cannot reach this instant, or a DSN turned off for one run, keeps
+// its old state — an unset env is an unmounted disk, not a deletion, and its
+// sessions must not be dropped as if forgotten.
+func injectHermesPG(out, old map[string]FileState) {
+	dsn := sources.HermesPGDSN()
+	if dsn == "" {
+		for p, of := range old {
+			if sources.IsHermesPGStore(p) {
+				out[p] = of
+			}
+		}
+		return
+	}
+	token := sources.HermesPGStorePath(dsn)
+	rows, newest, err := sources.HermesPGFingerprint(dsn)
+	if err != nil {
+		if of, ok := old[token]; ok {
+			out[token] = of
+		}
+		return
+	}
+	out[token] = FileState{Path: token, Size: rows, MTime: newest, LastUpdated: newest}
 }
 
 // lastCompleteLineOffset finds the offset just past the final newline, so an
@@ -1975,6 +2162,9 @@ func preRedactSessions(m *Manifest, ss []model.Session) {
 							cut--
 						}
 						redacted = redacted[:cut]
+						mu.Lock()
+						countClipped(m, s.Path, 1)
+						mu.Unlock()
 					}
 					s.Messages[mi].Text = redacted
 					if n := counts.Total(); n > 0 && m != nil {
@@ -2028,4 +2218,27 @@ func filePrefixHash(path string, n int64) uint64 {
 		return 0
 	}
 	return h.Sum64()
+}
+
+// countClipped records messages stored short of the transcript. The caller
+// holds the lock where one is needed; redactForIngest runs single-threaded.
+func countClipped(m *Manifest, sourcePath string, n int) {
+	if m == nil || n == 0 {
+		return
+	}
+	h := harnessForPath(sourcePath)
+	if h == "" {
+		if _, ok := m.Files[sources.OpencodeDB()]; ok {
+			h = "opencode"
+		}
+	}
+	if h == "" {
+		return
+	}
+	if m.IngestHealth == nil {
+		m.IngestHealth = map[string]HarnessIngest{}
+	}
+	e := m.IngestHealth[h]
+	e.ClippedMessages += n
+	m.IngestHealth[h] = e
 }

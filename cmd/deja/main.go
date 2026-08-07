@@ -17,6 +17,7 @@ import (
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/query"
+	"github.com/vshulcz/deja-vu/internal/redact"
 	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/sources"
 	"github.com/vshulcz/deja-vu/internal/usage"
@@ -178,6 +179,12 @@ func run(args []string) error {
 		return nil
 	}
 	sourceInstance := os.Getenv("DEJA_SOURCE_INSTANCE")
+	if wantsHelp(args[1:]) {
+		if h := helpForCommand(args[0]); h != "" {
+			fmt.Print(h)
+			return nil
+		}
+	}
 	switch args[0] {
 	case "show":
 		return cmdShow(dir, args[1:], sourceInstance)
@@ -228,7 +235,17 @@ func cmdIndex(dir string, rest []string) error {
 	// longest part of the whole command, and it ran before the progress sink
 	// existed (#1021).
 	stopProgress := publishBuildProgress(dir)
-	if fresh, n := index.UpToDate(dir, ""); fresh && !force {
+	fresh, n := index.UpToDate(dir, "")
+	// A note bucket's id names the local day of whichever process indexed the
+	// line, so a `remember` under TZ=UTC and one under the machine's own zone
+	// split the same moment into two buckets. `show` tells the reader this
+	// command regroups them, and it answered that the index was up to date
+	// (#1058).
+	if fresh && !force && index.NotesZoneDrift(dir) {
+		fmt.Fprintln(os.Stderr, "deja: some notes were grouped in another time zone — regrouping them")
+		fresh, force = false, true
+	}
+	if fresh && !force {
 		stopProgress()
 		// The warmup child runs this command, so returning before the sentinel
 		// is cleared leaves a build that is not running: the next request is
@@ -281,6 +298,14 @@ func cmdIndex(dir string, rest []string) error {
 	}
 	if n := index.ReportCollisions(); n > 0 {
 		fmt.Fprintf(os.Stderr, "deja: %d session%s %s an id with another transcript — each pair is filed under one project, the one whose file sorts first\n", n, pluralS(n), verbShare(n))
+		// The per-harness lines above count transcripts, so once any of them
+		// merged, those lines add up to more than the index holds — and the
+		// reconciling line below is TTY-only, which is not where anyone is
+		// counting. Say the real totals whenever the sums have parted (#1091).
+		if b := index.LastBuild; b.Messages > 0 {
+			fmt.Fprintf(os.Stderr, "deja: indexed %d session%s, %d message%s — the per-harness lines above count transcripts, not rows\n",
+				b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages))
+		}
 	}
 	maybeFirstIndexGreeting(dir)
 	// The live display erases itself on the way out, so a rebuild on a
@@ -302,13 +327,20 @@ func cmdHookContext(dir string, rest []string) error {
 func cmdShow(dir string, rest []string, sourceInstance string) error {
 	o, err := parseShow(rest)
 	if err != nil {
+		// The missing id is the one refusal that depends on the store: on a
+		// machine with nothing indexed the honest answer is that there is
+		// nothing to show, not that an argument is missing. parseShow has no
+		// dir to ask, so the store-aware phrasing is applied here (#1063).
+		if err.Error() == showNeedsID {
+			return idPrefixNeeded(dir, "show needs an id-prefix", showNeedsID)
+		}
 		return err
 	}
 	// An id arrives from a chat wrapped in quotes or backticks and with the
 	// harness deja itself printed in front of it (#921).
 	o.id = index.PastedSelector(o.id)
 	if o.id == "" {
-		return fmt.Errorf("show needs id-prefix")
+		return idPrefixNeeded(dir, "show needs an id-prefix", showNeedsID)
 	}
 	var s model.Session
 	var ok bool
@@ -332,7 +364,7 @@ func cmdShow(dir string, rest []string, sourceInstance string) error {
 		if n, cerr := index.SessionCount(dir); cerr == nil && n == 0 {
 			return errors.New(strings.TrimPrefix(emptyIndexHint(fmt.Sprintf("no session matches %q", o.id)), "deja: "))
 		}
-		return fmt.Errorf("no session matches %q", o.id)
+		return fmt.Errorf("no session matches %q%s", o.id, movedBucketHint(dir, o.id))
 	}
 	if o.json {
 		return printSessionJSON(os.Stdout, s, o.offset, o.limit, sourceInstance)
@@ -433,7 +465,7 @@ func parseShow(args []string) (showOptions, error) {
 	// The id first: it is what the command is for, and checking the flag ahead
 	// of it cost two runs to learn two missing things (#820).
 	if o.id == "" {
-		return o, fmt.Errorf("show needs id-prefix")
+		return o, errors.New(showNeedsID)
 	}
 	if o.json && o.harness == "" {
 		return o, fmt.Errorf("show --json requires --harness for exact identity")
@@ -446,7 +478,8 @@ func parseShow(args []string) (showOptions, error) {
 
 func cmdCtx(dir string, rest []string) error {
 	if len(rest) < 1 {
-		return fmt.Errorf("ctx needs query or id-prefix")
+		return idPrefixNeeded(dir, "ctx needs a query or an id-prefix",
+			"ctx needs query or id-prefix (see `deja last`)")
 	}
 	// ctx takes no flags, and --json/--harness/--project/--since all exist on
 	// neighbouring commands — so reaching for one here is the obvious mistake.
@@ -500,13 +533,20 @@ func cmdCtx(dir string, rest []string) error {
 		fmt.Fprint(os.Stderr, policyHiddenNote(policy.ActivationSearch, policyHidden))
 		return fmt.Errorf("no session matches %q", q)
 	}
+	// The same order the search screen shows: ctx took the top hit off its own
+	// ranking, so a session the reader had rejected was handed to the agent as
+	// the answer while search demoted it and said why (#1099, #974).
+	attachLifecycles(dir, hits)
+	demoteRejected(hits)
 	if len(hits) == 0 {
 		// Same as #834 in files and restore: an empty store is not a miss on
 		// the query.
 		if n, cerr := index.SessionCount(dir); cerr == nil && n == 0 {
 			return errors.New(strings.TrimPrefix(emptyIndexHint(fmt.Sprintf("no session matches %q", q)), "deja: "))
 		}
-		return fmt.Errorf("no session matches %q", q)
+		// The agent asking by a bucket id that moved got the dead end while
+		// the human on `show` got the way forward (#1043).
+		return fmt.Errorf("no session matches %q%s", q, movedBucketHint(dir, q))
 	}
 	// A short selector never reaches the id branch above, so a forgotten
 	// session's note arrives as an ordinary hit — and the answer still has to
@@ -586,6 +626,7 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 		// instead (#637).
 		if where := activeFilters(o, sinceRaw); where != "" {
 			fmt.Fprintf(os.Stderr, "deja: no sessions match %s\n", where)
+			fmt.Fprint(os.Stderr, olderThanWindow(dir, o.Since))
 			return nil
 		}
 		// "run `deja index`" cannot bring back what the reader forgot, and on a
@@ -614,21 +655,30 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 			// on the day before the other two screens did (#849).
 			when = s.Updated.Local().Format("2006-01-02")
 		}
-		// A day of notes is one session whose id *is* a date, minted in UTC.
-		// Converting its timestamp to the reader's zone put a different day on
-		// the line than the id it sits next to — and the id a reader rebuilt
-		// from what they saw matched nothing (#883).
-		if day, ok := search.NoteBucketDay(s); ok {
-			when = day
-		}
+		// The id's own day is not used here, unlike search: this line prints
+		// the id whole, so nothing has to be rebuilt from the date (#883),
+		// while borrowing the id's day made the column run 06, 07, 04 down
+		// the screen for a reader far enough east of the writer (#1038).
 
-		fmt.Printf("[%s · %s · %s · %s]", s.Harness, s.Project, when, s.ID)
+		// Project, id and title are text a harness wrote, and this is one
+		// line: an escape byte in any of them recolours the rest of the
+		// listing and a carriage return rewinds it (#1090).
+		fmt.Printf("[%s · %s · %s · %s]", s.Harness, redact.SafeForDisplay(s.Project), when, redact.SafeForDisplay(s.ID))
 		title := s.Title
 		if title == "" {
 			title = firstUserTitle(s)
 		}
-		if title != "" {
-			fmt.Printf(" %s", title)
+		// The title is transcript text going straight to a terminal: an escape
+		// in it repaints the screen and a carriage return rewinds the line.
+		if title = redact.SafeForDisplay(title); title != "" {
+			// A session with no user turn borrows the assistant's opening line
+			// (#692), and unmarked it read like the reader's own question
+			// (#1100).
+			if s.AgentTitle {
+				fmt.Printf(" agent: %s", title)
+			} else {
+				fmt.Printf(" %s", title)
+			}
 		}
 		fmt.Println()
 	}
@@ -660,6 +710,7 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	if err != nil {
 		return err
 	}
+	sinceRaw := sinceRawArg(filtered)
 	o.SourceInstance = sourceInstance
 	o.RecallWorn = usage.WornSessions(dir)
 	prepareFirstIndexGreeting(dir)
@@ -676,7 +727,11 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}
-	ss := result.Sessions
+	// Before ranking, not after: the cap is applied while ranking, so a rule
+	// that runs later still lets denied sessions occupy the result slots and
+	// the allowed ones never reach the page (#1060).
+	ss, policyHidden := policyFilterSessionsCounted(policy.ActivationSearch, result.Sessions)
+	o.PolicyWithheld = policyHidden
 	o.Tier = result.Tier
 	if result.Stemmed {
 		printStemmed(os.Stderr, result.Variants)
@@ -716,8 +771,6 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 		}
 		hits, o.Total, o.Capped = detailed.Hits, detailed.Total, detailed.Capped
 	}
-	hits, policyHidden := policyFilterHitsCounted(policy.ActivationSearch, hits)
-	o.PolicyWithheld = policyHidden
 	if !o.NoEmbed && os.Getenv("DEJA_EMBED") != "off" {
 		hits = maybeRerank(dir, hits, o, os.Stderr)
 	}
@@ -729,7 +782,7 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	// nothing was capped the honest total is simply what survived; when it was,
 	// there is no way to know how the filters would have treated the hidden
 	// ones, so the pre-cap figure stands and `capped` says to distrust it.
-	attachLifecycles(hits)
+	attachLifecycles(dir, hits)
 	demoted := demoteRejected(hits)
 	attachMoved(hits)
 	if !o.Capped {
@@ -746,8 +799,9 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 		switch note := policyHiddenNote(policy.ActivationSearch, policyHidden); {
 		case note != "":
 			fmt.Fprint(os.Stderr, note)
-		case activeFilters(o, "") != "":
-			fmt.Fprintf(os.Stderr, "deja: %q matched nothing under %s\n", o.Query, activeFilters(o, ""))
+		case activeFilters(o, sinceRaw) != "":
+			fmt.Fprintf(os.Stderr, "deja: %q matched nothing under %s\n", o.Query, activeFilters(o, sinceRaw))
+			fmt.Fprint(os.Stderr, olderThanWindow(dir, o.Since))
 		default:
 			printNoMatches(os.Stderr, dir, o.Query)
 		}
@@ -912,6 +966,12 @@ func commandHint(q string) string {
 	// The switch in run() handles these before the map is consulted, so the
 	// map alone would miss the commonest words of all — "serch" landed on
 	// "bench" while `search` was one letter away.
+	// The same shape for the other undo nobody can guess: removing a note is
+	// `forget` on the note's own id, and the reader who typed this has no way
+	// to know a note has an id at all (#1085).
+	if strings.EqualFold(first, "unpromote") || strings.EqualFold(first, "demote") {
+		return "deja: \"" + first + "\" is not a command — `deja promote <id> --state rejected` takes a decision back, and `deja forget --session deja-note-<harness>-<id>` removes the note itself\n"
+	}
 	names := []string{"search", "show", "last", "aider", "goose"}
 	for name := range commands {
 		// Hidden plumbing is not something anyone means to type.
@@ -932,6 +992,41 @@ func commandHint(q string) string {
 		return "deja: \"unforget\" is not a command — `deja forget --unforget <id>` is, and `deja forget --list` names the ids\n"
 	}
 	return fmt.Sprintf("deja: %q is not a command — did you mean `deja %s`?\n", first, near)
+}
+
+// sinceRawArg recovers the text the reader typed after --since. parseSearch
+// keeps only the parsed duration, and the search path had nothing else to hand
+// activeFilters, so it reported "since 720h0m0s" for `--since 30d` (#1059).
+// Last wins, as in parseSearch.
+func sinceRawArg(args []string) string {
+	args = splitEqualsForms(args)
+	raw := ""
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--since" {
+			raw = args[i+1]
+		}
+	}
+	return raw
+}
+
+// olderThanWindow names the store's own range when --since cut off everything
+// in it. Without it someone returning to a year-old store is told their query
+// matched nothing — advice about the query, when it was the window that
+// emptied the result and no query under it could have returned anything.
+// `deja stats` has said this since #854; search and `last` had not (#1059).
+func olderThanWindow(dir string, since time.Duration) string {
+	if since <= 0 {
+		return ""
+	}
+	ov, err := index.Overview(dir)
+	if err != nil || ov.Sessions == 0 || ov.Newest.IsZero() {
+		return ""
+	}
+	if !ov.Newest.Before(time.Now().Add(-since)) {
+		return ""
+	}
+	return fmt.Sprintf("deja: every one of the %d indexed sessions is older than that window — the newest is %s\n",
+		ov.Sessions, ov.Newest.Local().Format("2006-01-02"))
 }
 
 // activeFilters names the filters a caller set, so an empty result can say
@@ -1401,31 +1496,36 @@ func withFileTouchers(dir string, ss []model.Session, target search.BlameTarget)
 	// Identity breaks ties, or which sessions survive the cap depends on Go's
 	// map order and two runs disagree — the same failure as #668.
 	sort.Slice(metas, func(i, j int) bool { return newestFirst(metas[i], metas[j]) })
-	added := 0
+	// Pick the identities first and read them in one pass: per-identity reads
+	// stream the whole record log each time, so the cap alone did not bound
+	// the cost — 50 sessions meant 50 scans (#1069).
+	var want []index.Identity
 	for _, meta := range metas {
 		// A file like main.go is touched by everything, and each addition is a
 		// record read. Ten hits are printed; this is far more than enough to
 		// rank them.
-		if added >= blameToucherCap {
+		if len(want) >= blameToucherCap {
 			break
 		}
-		key := meta.Harness + ":" + meta.ID
 		for _, p := range meta.Touched {
 			if strings.ToLower(filepath.Base(filepath.FromSlash(p))) != base {
 				continue
 			}
-			full, ok, err := index.FindByIdentity(dir, meta.Harness, meta.ID)
-			if err == nil && ok {
-				// The manifest is keyed by identity, so each session reaches
-				// this once — there is no second visit to record a position for.
-				if i, present := at[key]; present {
-					ss[i] = full
-				} else {
-					ss = append(ss, full)
-				}
-				added++
-			}
+			want = append(want, index.Identity{Harness: meta.Harness, ID: meta.ID})
 			break
+		}
+	}
+	full, err := index.FindManyByIdentity(dir, want)
+	if err != nil {
+		return ss
+	}
+	for _, s := range full {
+		// The manifest is keyed by identity, so each session reaches this once
+		// — there is no second visit to record a position for.
+		if i, present := at[s.Harness+":"+s.ID]; present {
+			ss[i] = s
+		} else {
+			ss = append(ss, s)
 		}
 	}
 	return ss
@@ -1581,7 +1681,7 @@ func runForget(dir string, args []string) error {
 	var o index.ForgetOptions
 	list := false
 	allMatches := false
-	unforget := ""
+	unforget, unforgetGiven := "", false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--list":
@@ -1592,7 +1692,7 @@ func runForget(dir string, args []string) error {
 			allMatches = true
 		case "--session", "--project", "--before", "--unforget":
 			if i+1 >= len(args) {
-				return fmt.Errorf("forget: %s needs value", args[i])
+				return fmt.Errorf("forget: %s needs a value", args[i])
 			}
 			i++
 			switch args[i-1] {
@@ -1601,7 +1701,7 @@ func runForget(dir string, args []string) error {
 			case "--project":
 				o.Project = args[i]
 			case "--unforget":
-				unforget = index.PastedSelector(args[i])
+				unforget, unforgetGiven = index.PastedSelector(args[i]), true
 			case "--before":
 				if d, err := parseDur(args[i]); err == nil {
 					// "older than 0 days" is the whole store, and the typo that
@@ -1625,6 +1725,12 @@ func runForget(dir string, args []string) error {
 			return fmt.Errorf("forget: unknown flag %q", args[i])
 		}
 	}
+	// An empty `--unforget` was answered with the selectors for forgetting:
+	// the reader asked to bring something back and was told how to drop more
+	// (#1041).
+	if unforgetGiven && unforget == "" {
+		return fmt.Errorf("forget: --unforget needs an id — `deja forget --list` names the ids")
+	}
 	if !list && unforget == "" && o.Session == "" && o.Project == "" && o.Before.IsZero() {
 		// Naming the selectors here is what separates one call from hundreds:
 		// forgetting 100 sessions one id at a time took 10.5s against 0.2s for
@@ -1641,6 +1747,13 @@ func runForget(dir string, args []string) error {
 		// and it named no way back: `--unforget` lived in `deja help` only, and
 		// the hint for a guessed `deja unforget` pointed at this same list
 		// (#919).
+		if len(keys) == 0 {
+			// Silence here is the one answer a reader cannot act on: it looks
+			// the same as a command that did not run, and every other empty
+			// result says so out loud (#1040). On stderr, so a pipe still
+			// counts only ids.
+			fmt.Fprintln(os.Stderr, "deja: nothing is forgotten on this machine")
+		}
 		if len(keys) > 0 {
 			fmt.Fprintf(os.Stderr, "deja: `deja forget --unforget %s` brings one back and rebuilds the index\n", keys[0])
 		}
@@ -1658,6 +1771,10 @@ func runForget(dir string, args []string) error {
 				unforget, n, joinCapped(index.TombstonesMatching(unforget), 5))
 		}
 		var lifted int
+		// The ids to name afterwards are the tombstones this call lifts, read
+		// before it lifts them — after the rebuild the manifest holds every
+		// session the selector matches, restored or never forgotten (#1095).
+		lifting := index.TombstonesMatching(unforget)
 		if err := withBuildProgress(func() error {
 			var err error
 			lifted, err = index.Unforget(dir, unforget, os.Stderr)
@@ -1673,10 +1790,13 @@ func runForget(dir string, args []string) error {
 		// still on this machine. An imported one lives only in the index, so
 		// forget took the last copy — and the undo reported a restore that did
 		// not happen (#967).
-		back, gone := restoredSessions(dir, unforget, lifted)
+		back, gone, names := restoredSessions(dir, unforget, lifted, lifting)
 		restorePromotedTitles(dir, unforget)
 		if back > 0 {
-			fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index\n", back, pluralS(back))
+			// The ids, not just the count: this is the moment someone checks
+			// that they got back exactly what they lost, and both the list and
+			// the ambiguity refusal name them a step earlier (#1095, #1014).
+			fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index — %s\n", back, pluralS(back), joinCapped(names, 5))
 		}
 		if gone > 0 {
 			fmt.Fprintf(os.Stdout, "%d of them came from another machine and deja held the only copy — the tombstone is lifted, but the records are gone; `deja sync import` brings them back\n", gone)
@@ -1829,7 +1949,7 @@ func runForget(dir string, args []string) error {
 				return nil
 			}
 		}
-		fmt.Fprintf(os.Stdout, "nothing matched %s — no session was dropped\n", forgetSelector(o))
+		fmt.Fprintf(os.Stdout, "nothing matched %s — no session was dropped%s\n", forgetSelector(o), movedBucketHint(dir, o.Session))
 		return nil
 	}
 	fmt.Fprintf(os.Stdout, "sessions dropped: %d\nmessages dropped: %d\ntombstones added: %d\n", result.Sessions, result.Messages, result.Tombstones)
@@ -1937,8 +2057,39 @@ func humanBytes(n int64) string {
 	}
 	return fmt.Sprintf("%.1f %s", f, units[i])
 }
+
+// wrapTargets lays install target names out over as many indented lines as they
+// need. Naming them inline in the usage text is what let help drift: eleven of
+// the thirty-one were listed, so `deja install aider` and `deja install
+// openclaw-auto` — both of them in the README — read as invalid (#1106).
+func wrapTargets(names []string, indent string, width int) string {
+	var b strings.Builder
+	line := indent
+	for i, n := range names {
+		piece := n
+		if i < len(names)-1 {
+			piece += ","
+		}
+		if len(line) > len(indent) && len(line)+1+len(piece) > width {
+			b.WriteString(line + "\n")
+			line = indent
+		}
+		if len(line) > len(indent) {
+			line += " "
+		}
+		line += piece
+	}
+	return b.String() + line
+}
+
 func printUsage() {
-	fmt.Println(`deja - persistent memory for coding agents
+	fmt.Print(usageText())
+}
+
+// usageText renders the usage block so `--help` on a single command can quote
+// the lines that belong to it instead of the whole page.
+func usageText() string {
+	return fmt.Sprintf(`deja - persistent memory for coding agents
 
 Usage:
   deja [flags] <query>
@@ -1958,7 +2109,7 @@ Usage:
   deja sync export <dir> [--full]
   deja sync import <dir>
   deja sync ssh <host> [--pull] [--full]
-  deja last [n] [--json] [--project name] [--harness name] [--since duration] [--role user|assistant|tool]
+  deja last [n] [--json] [--project name] [--harness name] [--since duration] [--role user|assistant|tool|files|command|edit]
   deja sources
   deja completion <bash|zsh|fish>
   deja forget --session <id-prefix> [--project <substring>] [--before <duration|date>] [--dry-run] [--all-matches]
@@ -1971,19 +2122,23 @@ Usage:
   deja log [n] [--last] [--json]
   deja statusline
   deja stats [--json] [--impact] [--redaction] [--card [path]] [--html [path]]
-	deja remember "text" [--project name] [--tag name]
+  deja remember "text" [--project name] [--tag name]
   deja promote <id-prefix> [--state accepted|rejected|superseded|stale] [--note "text"] [--tag name] [--to path]
   deja mcp
   deja version
+  deja <command> --help
   deja update [--force]
-  deja install <claude-code|codex|opencode|cursor|gemini|antigravity|grok|qwen|kimi|cline|statusline|--all|--auto>
-  deja uninstall <claude-code|codex|opencode|cursor|gemini|antigravity|grok|qwen|kimi|statusline|--all|--auto>
+  deja install <target> | --all | --auto
+  deja uninstall <target> | --all | --auto
+    targets:
+%s
 
 Search flags (the bare "deja [flags] <query>" form above):
   --harness <name>              only sessions from one harness (claude, codex, ...)
   --project <name>              only sessions from one project
   --since <duration>            only sessions newer than e.g. 30d, 12h
-  --role <user|assistant|tool>  only match turns from one role
+  --role <name>                 only match turns from one role: user, assistant,
+                                tool (tool output), files, command, edit
   --limit <1-100>               max sessions to return (default 15)
   --all                         return every match, no cap
   --re                          treat the query as a regular expression
@@ -2003,8 +2158,105 @@ Examples:
   deja ctx "schema migration rollback" > deja-context.md
   deja install --all
 
-See README.md for the full CLI reference.`)
+See README.md for the full CLI reference.
+`, wrapTargets(installTargetNames(), "      ", 76))
 }
+
+// helpForCommand answers `deja <cmd> --help`. Every command rejected it as an
+// unknown flag, and a couple did worse: `deja statusline --help` printed a
+// statusline and `deja mcp --help` started the server and hung the terminal
+// (#1111).
+func helpForCommand(name string) string {
+	var out []string
+	usage := usageText()
+	if i := strings.Index(usage, "\nUsage:\n"); i >= 0 {
+		usage = usage[i+len("\nUsage:\n"):]
+	}
+	if i := strings.Index(usage, "\nExamples:\n"); i >= 0 {
+		usage = usage[:i]
+	}
+	// A usage line can carry indented continuations under it — the install
+	// target list sits under the install/uninstall pair — so a match keeps
+	// collecting until the next "deja …" line that does not match.
+	matched := false
+	for _, line := range strings.Split(usage, "\n") {
+		t := strings.TrimSpace(line)
+		switch {
+		case t == "deja "+name || strings.HasPrefix(t, "deja "+name+" "):
+			out = append(out, line)
+			matched = true
+		case matched && t != "" && strings.HasPrefix(line, "    ") && !strings.HasPrefix(t, "deja "):
+			out = append(out, line)
+		case matched && strings.HasPrefix(t, "deja "):
+			// install and uninstall share one target list, printed under the
+			// second of the pair; every other command's help ends at the next
+			// command line.
+			pair := name == "install" || name == "uninstall"
+			matched = pair && (strings.HasPrefix(t, "deja install ") || strings.HasPrefix(t, "deja uninstall "))
+		default:
+			matched = false
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, "\n") + "\nSee `deja help` for every command and flag.\n"
+}
+
+// wantsHelp reports whether a command line asks for help rather than work.
+func wantsHelp(rest []string) bool {
+	for _, a := range rest {
+		if a == "--help" || a == "-h" {
+			return true
+		}
+		if a == "--" {
+			return false
+		}
+	}
+	return false
+}
+
+// movedBucketHint explains a note-bucket id that stopped resolving. The id
+// carries the day it was minted in, so a machine that changed zone renames its
+// buckets on the next build — and every id refusal then read as "that note is
+// gone" while the note sat under the neighbouring day (#1039).
+func movedBucketHint(dir, id string) string {
+	if !strings.HasPrefix(id, "deja-") || len(id) < 15 {
+		return ""
+	}
+	day, rest := id[5:15], id[15:]
+	when, err := time.Parse("2006-01-02", day)
+	if err != nil {
+		return ""
+	}
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return ""
+	}
+	pol := policy.Load()
+	for _, shift := range []int{-1, 1} {
+		want := "deja-" + when.AddDate(0, 0, shift).Format("2006-01-02") + rest
+		for _, m := range metas {
+			if m.ID != want {
+				continue
+			}
+			// Naming it is recalling it: a rule that hides the session hides
+			// the fact that it moved too, or the hint becomes the way around
+			// the rule (#1043).
+			if !pol.Allows(policy.ActivationSearch, m.Project) {
+				return ""
+			}
+			return fmt.Sprintf(" — the days regrouped when this machine's zone changed; it is `%s` now", want)
+		}
+	}
+	return ""
+}
+
+// showNeedsID is the refusal show gives with no argument. "id-prefix" names a
+// thing the reader has no way to produce on their own; promote has pointed at
+// `deja last` all along, and show, share and resume are the three commands
+// reached for right after a search result (#1063).
+const showNeedsID = "show needs id-prefix (see `deja last`)"
 
 // idPrefixNeeded is the refusal for a command that needs a session named on the
 // command line. "see `deja last`" is a step the reader can take and learn
@@ -2137,6 +2389,22 @@ func deniedPath(err error) string {
 	return ""
 }
 
+// existingNonDirAncestor names the first ancestor of p that exists and is not
+// a directory. Such a path can never hold an index, and the errno differs by
+// platform, so the shape is worth naming rather than the syscall.
+func existingNonDirAncestor(p string) string {
+	for cur := filepath.Clean(p); ; {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return ""
+		}
+		if fi, err := os.Stat(parent); err == nil && !fi.IsDir() {
+			return parent
+		}
+		cur = parent
+	}
+}
+
 // ensureError turns a failed build into something the reader can act on.
 // A denied write surfaced as `ensure: open /…/index.db.lock: permission
 // denied` — the path of an internal lock file and a syscall error, which says
@@ -2176,6 +2444,23 @@ func ensureError(dir string, err error) error {
 	}
 	if errors.Is(err, syscall.ENOSPC) {
 		return fmt.Errorf("no space left where the index is built (%s) — free some room there, or point DEJA_INDEX_DIR at a disk that has it", filepath.Dir(dir))
+	}
+	// A volume ejected cleanly mid-build leaves its mount point behind as an
+	// empty directory, so the write fails with ENOENT rather than the EIO of a
+	// disk yanked out (#899) — an internal `idx.tmp/buckets/…` path and a
+	// syscall for what is simply a disconnected disk. The index that was
+	// already there is untouched, since the build writes beside it and
+	// renames, and saying so is the part that decides whether the reader goes
+	// looking for damage (#1068).
+	// An index path that points inside a file is not a disconnected disk: on
+	// unix the write fails with ENOTDIR and fell through to the raw syscall,
+	// on windows it fails with ENOENT and read as an unmounted volume (found
+	// by CI on windows after #1068).
+	if p := existingNonDirAncestor(dir); p != "" {
+		return fmt.Errorf("the index path runs through %s, which is a file — point DEJA_INDEX_DIR at a directory", p)
+	}
+	if errors.Is(err, fs.ErrNotExist) && !dirExists(dir) {
+		return fmt.Errorf("the index directory went away mid-build (%s) — the disk it lives on may have been unmounted; the index already there is unharmed, so reconnect it and run `deja index` again, or point DEJA_INDEX_DIR somewhere local", dir)
 	}
 	// Already worded where it was raised — the leftover-swap case names the
 	// directory to remove and the command to rerun, and "ensure:" in front of
@@ -2241,20 +2526,39 @@ func dayWord(n int) string {
 // restoredSessions splits what a lifted tombstone actually returned from what
 // it could not: a session whose transcript is on this machine is re-read by the
 // rebuild, while an imported one existed only in the index that forget rewrote.
-func restoredSessions(dir, selector string, lifted int) (back, gone int) {
+func restoredSessions(dir, selector string, lifted int, lifting []string) (back, gone int, names []string) {
 	metas, err := index.AllMeta(dir)
 	if err != nil {
-		return lifted, 0
+		return lifted, 0, lifting
 	}
+	// A session counts as back only if its row is in the manifest again: an
+	// imported one lives only in the index, so forget took the last copy and
+	// lifting its tombstone restores nothing (#967).
+	here := map[string]bool{}
 	for _, m := range metas {
-		if index.SelectorMatches(m, selector) {
+		here[m.Harness+":"+m.ID] = true
+	}
+	for _, key := range lifting {
+		if here[key] {
 			back++
+			names = append(names, key)
 		}
 	}
-	if back > lifted {
-		back = lifted
+	if back == 0 && lifted > 0 {
+		// Selectors that are not whole keys (a bare id, a prefix) still count
+		// through the manifest, as before.
+		for _, m := range metas {
+			if index.SelectorMatches(m, selector) {
+				back++
+				names = append(names, m.Harness+":"+m.ID)
+			}
+		}
+		if back > lifted {
+			back, names = lifted, names[:lifted]
+		}
 	}
-	return back, lifted - back
+	sort.Strings(names)
+	return back, lifted - back, names
 }
 
 // restorePromotedTitles gives a promoted note back the title it borrowed from a

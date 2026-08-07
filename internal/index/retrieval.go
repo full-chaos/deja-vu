@@ -1089,6 +1089,50 @@ func FindByIdentity(dir, harness, id string) (model.Session, bool, error) {
 	return loadSessionMeta(dir, m, meta)
 }
 
+// Identity names one session the way machine output does.
+type Identity struct {
+	Harness string
+	ID      string
+}
+
+// FindManyByIdentity is FindByIdentity for a list. Records live in one
+// append-only log with no per-session offsets, so resolving a single identity
+// streams the whole of records.bin; calling it in a loop streams it once per
+// session. `deja files` did that 250 times over a 59 MB log and spent 1.6 s of
+// its 1.9 s there (#1069). One pass, all keys.
+//
+// Sessions come back in the order asked for, with identities the manifest does
+// not know dropped.
+func FindManyByIdentity(dir string, ids []Identity) ([]model.Session, error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	unlock, ok, err := tryLockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		defer unlock()
+	}
+	m, err := readManifestCached(dir)
+	if err != nil {
+		return nil, err
+	}
+	metas := make([]SessionMeta, 0, len(ids))
+	for _, want := range ids {
+		if meta, found := m.Sessions[want.Harness+":"+want.ID]; found {
+			metas = append(metas, meta)
+		}
+	}
+	if len(metas) == 0 {
+		return nil, nil
+	}
+	return sessionsForMetas(dir, metas)
+}
+
 // FindByID looks a session up when only its id is known. Hook payloads carry
 // one without naming the harness, and the id is unique in practice: the
 // harnesses that generate them use uuids or their own prefixed ids.
@@ -1980,6 +2024,15 @@ func oneSuffixStep(word string) []string {
 		base := strings.TrimSuffix(word, "ing")
 		add(base)
 		add(base + "e")
+	case strings.HasSuffix(word, "ies"):
+		// retries -> retry. Ahead of the "es" and "s" cases, which reduce it
+		// to "retri" and stop there: neither a consonant+y word nor its
+		// plural could reach the other, so "retry" found nothing in a store
+		// full of "retries" (#1079).
+		add(strings.TrimSuffix(word, "ies") + "y")
+		add(strings.TrimSuffix(word, "es"))
+	case strings.HasSuffix(word, "ied"):
+		add(strings.TrimSuffix(word, "ied") + "y")
 	case strings.HasSuffix(word, "ed"):
 		base := strings.TrimSuffix(word, "ed")
 		add(base)
@@ -2001,6 +2054,12 @@ func oneSuffixStep(word string) []string {
 	}
 	// expansions: fail->fails, fail->failing/failed. The catalog filter keeps
 	// nonsense forms from ever reaching a lookup.
+	if base, ok := consonantY(word); ok {
+		// retry -> retries, retried. The plain +s below gives "retrys", which
+		// no transcript contains (#1079).
+		add(base + "ies")
+		add(base + "ied")
+	}
 	if !strings.HasSuffix(word, "s") {
 		add(word + "s")
 	}
@@ -2507,4 +2566,17 @@ func askedTextFor(dir string, m Manifest, metas []SessionMeta, want uint64) stri
 		}
 	}
 	return ""
+}
+
+// consonantY splits a word ending in consonant+y, the form whose plural is
+// -ies rather than -s. "key" and "day" end in vowel+y and keep their -s.
+func consonantY(word string) (string, bool) {
+	if !strings.HasSuffix(word, "y") || len(word) < 3 {
+		return "", false
+	}
+	switch word[len(word)-2] {
+	case 'a', 'e', 'i', 'o', 'u':
+		return "", false
+	}
+	return strings.TrimSuffix(word, "y"), true
 }

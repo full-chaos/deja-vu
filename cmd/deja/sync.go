@@ -25,6 +25,17 @@ func importedSessionTotal(dir string) int {
 	return total
 }
 
+// ownCopyLine says how much of a folder is this machine's own export coming
+// back. It counted one record with a plural verb — "1 record were already
+// here" — the slip #1052 fixed on the neighbouring lines.
+func ownCopyLine(own int) string {
+	was := "were"
+	if own == 1 {
+		was = "was"
+	}
+	return fmt.Sprintf("deja: %d record%s %s already here word for word — this folder holds a copy of what this machine has\n", own, pluralS(own), was)
+}
+
 func runSync(dir string, args []string) error {
 	if len(args) < 2 {
 		return fmt.Errorf("sync needs export <dir>, import <dir>, or ssh <host>")
@@ -54,7 +65,11 @@ func runSync(dir string, args []string) error {
 			return fmt.Errorf("sync export needs a target dir")
 		}
 		if err := index.EnsureForSearch(dir, search.Options{All: true}, false, os.Stderr); err != nil {
-			return err
+			// An index that cannot be written stops the export before a record
+			// is read, and handed back `update: mkdir /…/index.db.tmp:
+			// permission denied` — an internal path, on the same store where
+			// search names the directory to fix (#1046).
+			return ensureError(dir, err)
 		}
 		var n int
 		var err error
@@ -69,6 +84,17 @@ func runSync(dir string, args []string) error {
 			// name nobody chose. The directory is what has to change, the same
 			// as for the index (#798) and the notes file (#869) — this was the
 			// last write path still handing back the syscall (#893).
+			// The watermark for what just left is saved into the index, so an
+			// unwritable index fails here too — and arrived as "check that
+			// directory's permissions" for a destination that was writable and
+			// already held the batch (#1046, the shape of #1031).
+			if p := deniedPath(err); p != "" && !strings.HasPrefix(p, out) &&
+				(errors.Is(err, fs.ErrPermission) || writeFailureReason(err) != err.Error()) {
+				if n > 0 {
+					return fmt.Errorf("%d records are written into %s, but deja could not record that they went: %w; the next export sends them again", n, out, ensureError(dir, err))
+				}
+				return ensureError(dir, err)
+			}
 			if parent := filepath.Dir(out); !dirExists(out) && !dirExists(parent) {
 				return fmt.Errorf("cannot write the export into %s — %s is not there; the disk it lives on may have been unmounted", out, parent)
 			}
@@ -83,7 +109,7 @@ func runSync(dir string, args []string) error {
 			}
 			return err
 		}
-		fmt.Fprintf(os.Stdout, "deja: exported %d records\n", n)
+		fmt.Fprintf(os.Stdout, "deja: exported %d record%s\n", n, pluralS(n))
 		// A watermark is per machine, not per destination: the second peer you
 		// hand memory to gets an empty folder and the same "exported 0
 		// records" that means "you are up to date" at the first one (#982).
@@ -113,9 +139,9 @@ func runSync(dir string, args []string) error {
 		if n > 0 {
 			// Sessions, not only records: "records" is deja's unit, and what
 			// arrived is what doctor and every other surface counts (#929).
-			line := fmt.Sprintf("deja: imported %d records", n)
+			line := fmt.Sprintf("deja: imported %d record%s", n, pluralS(n))
 			if before, after := sessionsBefore, importedSessionTotal(dir); after > before {
-				line += fmt.Sprintf(" — %d sessions from another machine", after-before)
+				line += fmt.Sprintf(" — %d session%s from another machine", after-before, pluralS(after-before))
 			}
 			fmt.Fprintln(os.Stdout, line)
 		}
@@ -128,7 +154,7 @@ func runSync(dir string, args []string) error {
 		// checked — the same session, instant and text — not who wrote it: a
 		// batch carries no machine id (#955).
 		if own := index.ImportSkippedOwn(); own > 0 {
-			fmt.Fprintf(os.Stdout, "deja: %d record%s were already here word for word — this folder holds a copy of what this machine has\n", own, pluralS(own))
+			fmt.Fprint(os.Stdout, ownCopyLine(own))
 		}
 		// The count is a fact about this machine's memory, not about one
 		// terminal moment: a peer who keeps sending sessions you forgot drops

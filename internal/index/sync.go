@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/vshulcz/deja-vu/internal/redact"
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -100,6 +101,11 @@ func exportRecordsDeferred(dir, outDir, peer string, full bool) (int, func() err
 		return 0, nil, err
 	}
 	if err := os.MkdirAll(outDir, 0o700); err != nil {
+		// The import side of the same mistake is worded; this one handed back
+		// `mkdir /…/file: not a directory` (#1112).
+		if fi, statErr := os.Stat(outDir); statErr == nil && !fi.IsDir() {
+			return 0, nil, fmt.Errorf("%s is a file; sync export wants a directory to write the batch into", outDir)
+		}
 		return 0, nil, err
 	}
 	if m.ExportWatermarks == nil {
@@ -289,6 +295,17 @@ func Import(dir, inDir string) (int, error) {
 	}
 	if !fi.IsDir() {
 		return 0, fmt.Errorf("%s is a file; sync import wants the directory a `sync export` wrote", inDir)
+	}
+	// Glob swallows a directory it cannot open, so a locked source imported
+	// "0 records" — the same words an already-imported batch prints, and the
+	// records were there the whole time (#1042).
+	if f, oerr := os.Open(inDir); oerr != nil {
+		if os.IsPermission(oerr) {
+			return 0, fmt.Errorf("cannot read %s — permission denied; check that directory's permissions (on macOS, also Full Disk Access for your terminal)", inDir)
+		}
+		return 0, oerr
+	} else {
+		_ = f.Close()
 	}
 	unlock, err := lockDir(dir)
 	if err != nil {
@@ -482,6 +499,10 @@ func Import(dir, inDir string) (int, error) {
 				sameRank := rank == titleRankOf[key] && !sr.Time.IsZero() && sr.Time.Before(titleAt[key])
 				if _, seen := titleAt[key]; !seen || better || sameRank {
 					meta.Title = truncateTitle(strings.TrimSpace(text), 60)
+					// The listing marks a title that is the agent's own words
+					// rather than the reader's question (#1100); the import
+					// path derived the title the same way and lost the mark.
+					meta.AgentTitle = titleRank("user") != rank
 					titleAt[key] = sr.Time
 					titleRankOf[key] = rank
 				}
@@ -624,6 +645,14 @@ func readSyncFile(path string, fn func(SyncRecord) error) error {
 			// than one the reader can retry (#891).
 			return fmt.Errorf("%s line %d is not a record deja wrote: %w", filepath.Base(path), line, err)
 		}
+		// Metadata from a batch is another machine's text: it lands in the
+		// project label and the harness tag, which are rendered into result
+		// lines a human and a model both read. A newline there forged a whole
+		// extra entry — one with no "imported:" prefix, so it read as local
+		// work (#1080). Message text is redacted further down; these fields
+		// were never touched.
+		rec.Project = sanitizeSyncField(rec.Project, syncFieldMax)
+		rec.Harness = sanitizeSyncField(rec.Harness, syncFieldMax)
 		if err := fn(rec); err != nil {
 			return err
 		}
@@ -734,4 +763,30 @@ func ImportSkippedOwn() int { return lastImportSkippedOwn }
 
 func ImportedSessionID(harness, sessionID string) string {
 	return "imported-" + shortHash(harness+":"+sessionID)
+}
+
+// syncFieldMax bounds one metadata field from a batch. Project names are short
+// by construction; anything longer is not a name.
+const syncFieldMax = 120
+
+// sanitizeSyncField flattens a metadata field to a single printable line.
+//
+// Control characters (Cc) cover the newline that forged the extra result entry
+// and the escape byte that recolours a terminal; format characters (Cf) cover
+// U+202E, which reverses everything rendered after it, and the zero-width
+// spaces that pad a label invisibly. Both become spaces rather than vanishing,
+// so words on either side do not run together.
+func sanitizeSyncField(s string, max int) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, s)
+	s = strings.Join(strings.Fields(s), " ")
+	r := []rune(s)
+	if len(r) > max {
+		return strings.TrimSpace(string(r[:max])) + "…"
+	}
+	return s
 }

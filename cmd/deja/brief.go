@@ -4,13 +4,43 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"unicode"
 
 	"github.com/vshulcz/deja-vu/internal/index"
+	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/usage"
 )
+
+// briefWithholdingReach says what the rule actually keeps memory out of. The
+// auto rule stops injection, the search rule empties the reader's own queries,
+// and the mcp rule stops the agent asking — one sentence for all three read
+// wrong for two of them (#1103).
+func briefWithholdingReach(activation string) string {
+	switch activation {
+	case policy.ActivationSearch:
+		return "search rule keeps them out of your own searches"
+	case policy.ActivationMCP:
+		return "mcp rule keeps them out of every agent that asks"
+	default:
+		return "auto rule keeps them out of every agent"
+	}
+}
+
+// briefWithholdingRule names the activation whose rule withholds the whole
+// store, preferring auto because that is the path the reader never sees fail.
+// Returns auto when nothing withholds everything, so the caller's comparison
+// simply fails and the line stays off.
+func briefWithholdingRule(withheld map[string]int, total int) string {
+	for _, a := range []string{policy.ActivationAuto, policy.ActivationSearch, policy.ActivationMCP} {
+		if withheld[a] == total {
+			return a
+		}
+	}
+	return policy.ActivationAuto
+}
 
 // runBrief is what a bare `deja` on a terminal shows: the memory, alive.
 // Manifest metadata and the usage sidecar only — it must feel instant.
@@ -98,6 +128,22 @@ func runBrief(dir string, w io.Writer) error {
 		fmt.Fprintf(w, "ahead      %d session%s stamped later than this machine's clock\n", ov.Future, pluralS(ov.Future))
 	}
 
+	// The top line counts what is indexed; the auto rule decides what an agent
+	// actually gets. When it withholds every session the two disagree
+	// completely — the screen says the memory is there and no agent will ever
+	// see any of it — and the reader who set the rule has no reason to suspect
+	// it, because search and the listing below still answer. doctor has the
+	// number (#978); it is the fifth screen someone reaches for, not the first
+	// (#1067). Partial withholding stays quiet: the counters are still broadly
+	// true, and a caveat on every line is wallpaper.
+	// Every activation, not just auto: a rule on `search` withholds the
+	// reader's own queries, search says so on its own screen, and this one
+	// stayed silent (#1103, the shape #1102 fixed on the status line).
+	if withheld, total := policyWithheldCounts(dir); total > 0 && withheld[briefWithholdingRule(withheld, total)] == total {
+		fmt.Fprintf(w, "withheld   %sall %d session%s%s — your trust policy's "+briefWithholdingReach(briefWithholdingRule(withheld, total))+" (`deja doctor`)\n",
+			bold, total, pluralS(total), reset)
+	}
+
 	// Read the index as-is: the brief must never trigger a rebuild or let
 	// indexing narration tear through its layout.
 	if recent, err := index.RecentMatching(dir, 3, search.Options{}); err == nil && len(recent) > 0 {
@@ -107,7 +153,15 @@ func runBrief(dir string, w io.Writer) error {
 			if title == "" {
 				title = firstUserTitle(s)
 			}
-			title = trimBriefTitle(title)
+			// Budgeted against what is already on the line, not against a
+			// constant. Every other line on this screen has a fixed 11-column
+			// prefix; this one carries the harness, the project and a date,
+			// and a fixed 44-rune title on top of that overflowed 80 columns
+			// in every store state — worst on an old store, where "Jun 27
+			// 2025" is six columns longer than "today" and the three lines
+			// came out three different lengths (#1073).
+			head := fmt.Sprintf("%s [%s] %s · %s · ", label, s.Harness, s.Project, search.RelativeDate(s.Updated))
+			title = trimBriefTitleTo(title, briefTitleBudget(visibleLen(head)))
 			fmt.Fprintf(w, "%s %s[%s]%s %s · %s%s%s", label, dim, s.Harness, reset, s.Project, dim, search.RelativeDate(s.Updated), reset)
 			if title != "" {
 				fmt.Fprintf(w, " · %s", title)
@@ -214,7 +268,14 @@ func pluralS(n int) string {
 // screen, a bell rings on every refresh. The `recent` lines have printed them
 // raw since they existed; this is one place for all of them (#634 set the same
 // rule for the status bar).
-func trimBriefTitle(t string) string {
+func trimBriefTitle(t string) string { return trimBriefTitleTo(t, briefTitleMax) }
+
+// briefTitleMax is the width the fixed-prefix lines (`asked`, `reused`, `hit`)
+// are laid out to: an 11-column label plus 44 plus the ellipsis is 56, which
+// fits the narrowest terminal anyone opens.
+const briefTitleMax = 44
+
+func trimBriefTitleTo(t string, max int) string {
 	t = strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return ' '
@@ -223,10 +284,36 @@ func trimBriefTitle(t string) string {
 	}, t)
 	t = strings.Join(strings.Fields(t), " ")
 	r := []rune(t)
-	if len(r) > 44 {
-		return string(r[:44]) + "…"
+	if len(r) > max {
+		return string(r[:max]) + "…"
 	}
 	return t
+}
+
+// briefTitleBudget is how much title fits after a prefix of prefixLen columns.
+//
+// briefWidth is the target, not a measurement: reading the real terminal size
+// means a per-OS TIOCGWINSZ, and this module has no dependencies and builds for
+// Windows. 80 is the width that is wrong least often, COLUMNS is honoured for
+// the readers who export it, and the 44 cap keeps a wide terminal looking as it
+// always has. The floor stops a deep project path from cutting titles to
+// nothing — a line that overflows by a little beats one that says nothing.
+func briefTitleBudget(prefixLen int) int {
+	room := briefWidth() - prefixLen - 1 // the ellipsis
+	if room > briefTitleMax {
+		return briefTitleMax
+	}
+	if room < 12 {
+		return 12
+	}
+	return room
+}
+
+func briefWidth() int {
+	if n, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && n >= 20 && n <= 400 {
+		return n
+	}
+	return 80
 }
 
 // sameBriefWork reports whether the reused memory and the repeated question

@@ -17,6 +17,7 @@ import (
 	"github.com/vshulcz/deja-vu/internal/jsonout"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/query"
+	"github.com/vshulcz/deja-vu/internal/redact"
 )
 
 const (
@@ -469,7 +470,48 @@ func scoreBM25(documents []bm25Document, df []int, corpusDocuments int, avgLengt
 		hits = append(hits, doc.hit)
 	}
 	sortHits(hits)
+	liftNotesAboveTheirSource(hits)
 	return hits
+}
+
+// liftNotesAboveTheirSource keeps a promoted note in front of the transcript it
+// was distilled from. The two say the same thing, so nothing is buried by the
+// swap — but the note says it in one line with a state attached, and that is
+// what `promote` promises. Score alone cannot deliver it: the transcript
+// carries the query words in its title and the note does not, and once a note
+// is dated by its evidence rather than by the day it was filed (V4) the two are
+// equally fresh, so the transcript won its own distillation.
+func liftNotesAboveTheirSource(hits []Hit) {
+	notes := make(map[string]int, len(hits))
+	for i, h := range hits {
+		if h.Session.Harness == notesHarness && strings.HasPrefix(h.Session.ID, "deja-note-") {
+			notes[h.Session.ID] = i
+		}
+	}
+	if len(notes) == 0 {
+		return
+	}
+	for i := 0; i < len(hits); i++ {
+		h := hits[i]
+		if h.Session.Harness == notesHarness {
+			continue
+		}
+		// Mirrors sources.PromotedNoteID: building the id rather than parsing
+		// one keeps a harness name with a dash in it from splitting wrong.
+		id := "deja-note-" + h.Session.Harness + "-" + h.Session.ID
+		j, ok := notes[id]
+		if !ok || j < i {
+			continue
+		}
+		note := hits[j]
+		copy(hits[i+1:j+1], hits[i:j])
+		hits[i] = note
+		for k := i; k <= j; k++ {
+			if hits[k].Session.Harness == notesHarness && strings.HasPrefix(hits[k].Session.ID, "deja-note-") {
+				notes[hits[k].Session.ID] = k
+			}
+		}
+	}
 }
 
 // sortHits orders a ranked result set.
@@ -803,7 +845,7 @@ func Print(w io.Writer, hits []Hit, o Options) {
 			fmt.Fprintln(w, note)
 		}
 		for _, sn := range h.Snippets {
-			fmt.Fprintf(w, "  %s\n", highlight(sn, o.Query, o.Regex, color))
+			fmt.Fprintf(w, "  %s\n", highlight(SafeText(sn), o.Query, o.Regex, color))
 		}
 	}
 }
@@ -847,7 +889,7 @@ func FindByPrefix(ss []model.Session, p string) (model.Session, bool) {
 func PrintSession(w io.Writer, s model.Session) {
 	fmt.Fprintf(w, "# %s · %s · %s\n", s.Harness, s.Project, s.ID)
 	for _, m := range s.Messages {
-		txt := collapseTool(m.Text)
+		txt := redact.SafeForDisplay(collapseTool(m.Text))
 		if strings.TrimSpace(txt) == "" {
 			continue
 		}
@@ -855,7 +897,7 @@ func PrintSession(w io.Writer, s model.Session) {
 		if !m.Time.IsZero() {
 			t = m.Time.Format("2006-01-02 15:04") + " "
 		}
-		fmt.Fprintf(w, "\n%s%s:\n%s\n", t, m.Role, txt)
+		fmt.Fprintf(w, "\n%s%s:\n%s\n", t, m.Role, SafeText(txt))
 	}
 }
 
@@ -923,7 +965,7 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		if !ok {
 			continue
 		}
-		text := contextText(m.Text, matched)
+		text := SafeText(contextText(m.Text, matched))
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
@@ -1137,13 +1179,12 @@ func collapseTool(s string) string {
 }
 
 var (
-	ansiRE       = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 	lineNumberRE = regexp.MustCompile(`^\s*\d{1,5}[:|]\s+`)
 	toolDumpRE   = regexp.MustCompile(`(?i)(tool_use|tool_result|<local-command|netcat|npm ERR!|panic:|goroutine \d+)`)
 )
 
 func proseForSnippet(s string) string {
-	s = ansiRE.ReplaceAllString(s, "")
+	s = redact.SafeForDisplay(s)
 	var keep []string
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
@@ -1155,13 +1196,13 @@ func proseForSnippet(s string) string {
 	out := strings.Join(keep, " ")
 	out = strings.Join(strings.Fields(out), " ")
 	if out == "" {
-		out = strings.Join(strings.Fields(ansiRE.ReplaceAllString(s, "")), " ")
+		out = strings.Join(strings.Fields(redact.SafeForDisplay(s)), " ")
 	}
 	return out
 }
 
 func contextText(s string, matched bool) string {
-	s = ansiRE.ReplaceAllString(s, "")
+	s = redact.SafeForDisplay(s)
 	if strings.Contains(s, "```") {
 		return strings.TrimSpace(s)
 	}
@@ -1217,4 +1258,48 @@ func RelevanceHits(ss []model.Session, terms []string) []Hit {
 		hits = append(hits, hit)
 	}
 	return hits
+}
+
+// SafeText neutralises what a terminal acts on rather than prints. Transcript
+// text arrives verbatim from a harness, and after `deja sync import` from
+// another machine — the boundary the trust policy exists for. An escape byte
+// recolours the rest of the screen, erases the line above or sets the window
+// title; a bell rings on every redraw. The status bar (#634) and the brief
+// titles have stripped these since they were written; the reading surfaces
+// printed them raw (#1090).
+//
+// Newlines and tabs stay: unlike a one-line bar, these renderers are the
+// session's own layout. Format characters (Cf) are left alone here too — a
+// zero-width joiner holds an emoji sequence together, and the line-layout
+// attacks it also enables belong to the surfaces that own a single line.
+func SafeText(s string) string {
+	if !strings.ContainsFunc(s, unsafeForTerminal) {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if unsafeForTerminal(r) {
+			return ' '
+		}
+		return r
+	}, s)
+}
+
+func unsafeForTerminal(r rune) bool {
+	if r == '\n' || r == '\t' {
+		return false
+	}
+	if unicode.IsControl(r) {
+		return true
+	}
+	// The bidi overrides and isolates are the same attack without an escape
+	// byte: U+202E reverses the rendering of everything after it, so a line
+	// can read as the opposite of the bytes stored. Nothing recalled from a
+	// transcript needs to reorder the reader's screen. The other format
+	// characters stay — a zero-width joiner holds an emoji sequence together.
+	switch r {
+	case '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+		'\u2066', '\u2067', '\u2068', '\u2069':
+		return true
+	}
+	return false
 }

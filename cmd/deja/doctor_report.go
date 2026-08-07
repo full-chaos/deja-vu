@@ -24,6 +24,12 @@ type doctorStore struct {
 	State string   `json:"state"`
 	Paths []string `json:"paths"`
 	Files int      `json:"files"`
+	// IndexedSessions is the other half of the pair the human line has printed
+	// since #861: files against sessions is how collapsing shows, and a reader
+	// of --json could see only the files (#1088). Imported is counted apart for
+	// the same reason the printed line separates it (#894).
+	IndexedSessions int `json:"indexed_sessions"`
+	Imported        int `json:"indexed_from_elsewhere,omitempty"`
 	// Denied names the path that refused to be read, so the warning can point
 	// at the directory to fix rather than at the harness (#802). Partial says
 	// the rest of the store was readable: sessions are missing from recall
@@ -125,8 +131,12 @@ func collectDoctorReport(lookup doctorVersionLookup, dir string) doctorReport {
 	stores := doctorStoreChecks()
 	report := doctorReport{SchemaVersion: jsonout.Version, Stores: make([]doctorStore, 0, len(stores))}
 	storeMods := make([]time.Time, 0, len(stores))
+	indexed := index.HarnessSessionCounts(dir)
+	fromElsewhere := index.ImportedSessionCounts(dir)
 	for _, check := range stores {
 		store, mod := inspectDoctorStore(check)
+		store.IndexedSessions = indexed[check.name]
+		store.Imported = fromElsewhere[check.name]
 		report.Stores = append(report.Stores, store)
 		storeMods = append(storeMods, mod)
 	}
@@ -233,7 +243,7 @@ func doctorStoreChecks() []doctorStoreCheck {
 		{"cursor", []string{sources.CursorUserRoot(), sources.CursorCLIRoot()}, cursorFiles, parseDoctorCursor},
 		{"antigravity", sources.AntigravityRoots(), sources.AntigravityTranscripts(), sources.ParseAntigravityFile},
 		{"grok", []string{sources.GrokRoot()}, sources.GrokSessionFiles(), sources.ParseGrokFile},
-		{"hermes", []string{sources.HermesHome(), sources.HermesProfilesRoot()}, sources.HermesSessionFiles(), sources.ParseHermesDB},
+		{"hermes", []string{sources.HermesHome(), sources.HermesProfilesRoot()}, sources.HermesSessionFiles(), parseDoctorHermes},
 		{"qwen", []string{filepath.Join(sources.QwenRoot(), "projects")}, sources.QwenSessionFiles(), sources.ParseQwenFile},
 		{"kimi", []string{filepath.Join(sources.KimiRoot(), "sessions")}, sources.KimiSessionFiles(), sources.ParseKimiFile},
 		{"goose", []string{filepath.Join(sources.GooseRoot(), "sessions")}, sources.GooseSessionFiles(), parseDoctorGoose},
@@ -279,6 +289,16 @@ func parseDoctorGoose(path string) ([]model.Session, error) {
 		return sources.ParseGooseDB(path)
 	}
 	return sources.ParseGooseFile(path)
+}
+
+// parseDoctorHermes probes the SQLite stores by file and the Postgres store by
+// DSN, so a PG-backed Hermes reports its real health instead of the frozen
+// pre-cutover state.db (#1018).
+func parseDoctorHermes(path string) ([]model.Session, error) {
+	if sources.IsHermesPGStore(path) {
+		return sources.ParseHermesPG(sources.HermesPGDSN(), 0)
+	}
+	return sources.ParseHermesDB(path)
 }
 
 func inspectDoctorStore(check doctorStoreCheck) (doctorStore, time.Time) {

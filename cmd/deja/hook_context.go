@@ -65,6 +65,14 @@ func readHookStdin() []byte {
 // on every user message, which is the cost the decoder this replaced did not
 // have (#846).
 func readHookPayload(r io.Reader, wait time.Duration) []byte {
+	return readBounded(r, wait, true)
+}
+
+// readBounded is readHookPayload with a say in when to stop. stopAtValue=false
+// keeps reading to EOF or the deadline: the status line drains what the host
+// wrote rather than leaving the rest of it in the pipe, and only the waiting
+// needed a bound (#1074).
+func readBounded(r io.Reader, wait time.Duration, stopAtValue bool) []byte {
 	var mu sync.Mutex
 	var buf []byte
 	done := make(chan struct{})
@@ -77,7 +85,7 @@ func readHookPayload(r io.Reader, wait time.Duration) []byte {
 			if n > 0 {
 				mu.Lock()
 				buf = append(buf, chunk[:n]...)
-				whole := endsAValue(buf) && json.Valid(buf)
+				whole := stopAtValue && endsAValue(buf) && json.Valid(buf)
 				mu.Unlock()
 				if whole {
 					return
@@ -169,13 +177,34 @@ func buildNotice(dir string) string {
 	if st := readWarmupStatus(dir); st != nil {
 		return st.line()
 	}
+	// A rebuild is pending either because one was asked for or because the
+	// index on disk cannot answer as it stands. The second half matters
+	// because the sentinel requestWarmup writes lives inside the index
+	// directory: on a read-only one it is never created, warmupJustRequested
+	// stays false, and this line — written for exactly that state — was
+	// reachable only when the directory was writable. Every session went out
+	// silent, in the one state that never repairs itself (#1048).
+	if (warmupJustRequested(dir) || indexNeedsRebuild(dir)) && !indexDirWritable(dir) {
+		// A disk that went away is not a permission problem, and telling
+		// someone to check the permissions of a directory that is not there
+		// sends them nowhere. `deja index` and doctor already separate the
+		// two; session start is where the state is first noticed (#1054).
+		if parent := filepath.Dir(dir); !dirExists(dir) && !dirExists(parent) {
+			return fmt.Sprintf("deja: the index is not there (%s) — the disk it lives on may have been unmounted; reconnect it, or point DEJA_INDEX_DIR somewhere local", parent)
+		}
+		return fmt.Sprintf("deja: the index needs rebuilding and %s is not writable — `deja index` says what to change", filepath.Dir(dir))
+	}
 	if !warmupJustRequested(dir) {
 		return ""
 	}
-	if !indexDirWritable(dir) {
-		return fmt.Sprintf("deja: the index needs rebuilding and %s is not writable — `deja index` says what to change", filepath.Dir(dir))
-	}
 	return "deja: indexing your history — recall comes online in a few seconds"
+}
+
+// indexNeedsRebuild reports that the index on disk cannot answer as it stands:
+// absent, written by another format, or damaged. It is the condition every
+// caller of requestWarmup already tested separately.
+func indexNeedsRebuild(dir string) bool {
+	return !index.HasManifest(dir) || !index.IsCurrentVersion(dir) || index.Damaged(dir)
 }
 
 // runHookContext prints session-start context. plain=false emits the Claude
@@ -238,32 +267,20 @@ func runHookContext(dir string, plain bool) error {
 		// whereas the plain path is injected into the model's context, where
 		// a progress line is noise.
 		if !plain {
-			line := ""
-			if st := readWarmupStatus(dir); st != nil {
-				line = st.line()
-			} else if warmupJustRequested(dir) {
-				// The session that asks for the build is the one that hears
-				// nothing about it: the child has not written its first
-				// progress line yet. That session is the first one after an
-				// upgrade or a damaged store — the moment deja most looks
-				// broken (#878).
-				//
-				// Including the very first build. Requiring a manifest here
-				// left the one moment deja most looks broken in silence: a
-				// machine with ten thousand transcripts and no index yet said
-				// nothing at all, twice over, while the build ran (#909).
-				//
-				// A machine with no history also asks for a build; it sees
-				// this line once, truthfully, and never again — the next
-				// session has a manifest and takes the branch above.
-				line = "deja: indexing your history — recall comes online in a few seconds"
-				// …unless it cannot: a read-only cache directory lets the
-				// request be made and the build fail, so this promised recall
-				// "in a few seconds" on every session forever (#887).
-				if !indexDirWritable(dir) {
-					line = fmt.Sprintf("deja: the index needs rebuilding and %s is not writable — `deja index` says what to change", filepath.Dir(dir))
-				}
-			}
+			// The session that asks for the build is the one that hears
+			// nothing about it: the child has not written its first progress
+			// line yet. That session is the first one after an upgrade or a
+			// damaged store — the moment deja most looks broken (#878).
+			//
+			// Including the very first build. Requiring a manifest left the
+			// one moment deja most looks broken in silence: a machine with
+			// ten thousand transcripts and no index yet said nothing at all,
+			// twice over, while the build ran (#909).
+			//
+			// A machine with no history also asks for a build; it sees this
+			// line once, truthfully, and never again — the next session has a
+			// manifest and reads the published progress instead.
+			line := buildNotice(dir)
 			if note := unreadableStoreNote(dir); storeNoteIsNews(dir, note) {
 				line = joinNotes(note, line)
 			}
@@ -281,7 +298,7 @@ func runHookContext(dir string, plain bool) error {
 	}
 	// One actionable line so injected memory leads somewhere: models that see
 	// bare data tend to ignore it.
-	lead := "The sessions below are from this project's recent history. If any is relevant to what the user asks next, call recall_context with a term from it to pull the full details before acting. If recalled history genuinely helps the task, tell the user in one digest.Short line what deja-vu recalled and how you reused it; otherwise do not mention it.\n"
+	lead := sessionStartLead
 	if input.Source == "compact" {
 		lead = "Context was just compacted. The project memory below is from deja's index and survived the compaction; call recall_context with a term from it to restore any details you lost.\n"
 		// The generic digest is about the project. What a compacted session
@@ -341,7 +358,7 @@ func runHookContext(dir string, plain bool) error {
 		if r, ok := findReusedMemory(dir); ok {
 			earned = fmt.Sprintf(" · most re-used recently: %q, %d×", trimBriefTitle(r.Title), r.Times)
 		}
-		resp.SystemMessage = joinNotes(rewireNote(rewired), fmt.Sprintf("deja: recalled %d prior session%s %s (%s) — the agent starts already knowing them%s%s%s", sessions, plural, why, humanBytes(int64(len(digest))), serviceReceipt(dir), polNote, earned))
+		resp.SystemMessage = joinNotes(rewireNote(rewired), fmt.Sprintf("deja: recalled %d prior session%s %s (%s of context) — the agent starts already knowing them%s%s%s", sessions, plural, why, humanBytes(int64(len(digest))), serviceReceipt(dir), polNote, earned))
 	}
 	// Nothing to recall yet because the index is still being built: say so
 	// rather than starting in silence. The build runs detached, so the agent
@@ -769,6 +786,17 @@ func requestWarmup(dir string) {
 		}
 		b, readErr := os.ReadFile(sentinel)
 		stamp, parseErr := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+		// The claim is the O_EXCL create; the stamp lands a moment later. A
+		// sentinel read inside that window is empty, and treating empty as
+		// unreadable made the second hook delete another hook's claim and
+		// spawn a build of its own — two rebuilds over one directory whenever
+		// two projects started together (#1065). The file's own mtime says
+		// when the claim was made.
+		if readErr == nil && parseErr != nil {
+			if fi, statErr := os.Stat(sentinel); statErr == nil {
+				stamp, parseErr = fi.ModTime().UnixNano(), nil
+			}
+		}
 		if readErr == nil && parseErr == nil && now.Sub(time.Unix(0, stamp)) < warmupRetryAfter && !warmupLooksDead(dir, now, stamp) {
 			return
 		}
@@ -899,3 +927,5 @@ func indexCanCatchUp(dir string) bool {
 	fresh, _ := index.UpToDate(dir, "")
 	return fresh
 }
+
+const sessionStartLead = "The sessions below are from this project's recent history. If any is relevant to what the user asks next, call recall_context with a term from it to pull the full details before acting. If recalled history genuinely helps the task, tell the user in one short line what deja-vu recalled and how you reused it; otherwise do not mention it.\n"

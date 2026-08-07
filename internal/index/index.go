@@ -29,7 +29,12 @@ import (
 // shipped without a bump, so indexes built under the old rules kept the titles
 // they derived then — incremental ingest reuses SessionMeta for a file it has
 // already read, and no ordinary `deja index` re-derives it (#784).
-const version = 22
+// 23: the same shape again — #984 began recording an imported note's state on
+// its manifest row without a bump, so a store that imported a batch before it
+// kept a row with no state, and re-importing the batch adds nothing because it
+// is deduped. The bump is what makes the one rebuild that re-derives it happen
+// (#1049).
+const version = 23
 const maxIndexedText = 64 * 1024
 
 // maxRecordSize bounds a single serialized record. A record is one message
@@ -118,6 +123,12 @@ type SessionMeta struct {
 	// took two conversations from two projects (#970). Additive: a manifest
 	// written before this decodes with it false.
 	Shared bool `json:",omitempty"`
+	// AgentTitle marks a title that came from the assistant's opening line
+	// because the session holds no user turn (#692). The listing printed it in
+	// the place of the reader's own question, so an assertion nobody made read
+	// like something they said (#1100). Additive: an older manifest decodes
+	// with it false, and the line then reads as it did before.
+	AgentTitle bool `json:",omitempty"`
 	// OrigID is the id a session had on the machine it came from. Import
 	// renames every session to imported-<hash>, so a promoted note stopped
 	// looking like one the moment it crossed a machine boundary and every rule
@@ -173,6 +184,14 @@ type Manifest struct {
 	// A live index whose records.bin is shorter than this lost its tail to a
 	// torn write and must be treated as corrupt.
 	RecordsSize int64 `json:"records_size,omitempty"`
+	// BucketFiles is how many postings files buckets/ held when the manifest
+	// was committed. Losing the whole directory was already caught (#946), but
+	// a partial copy or an interrupted sync leaves some files behind rather
+	// than none, and each one that goes missing takes every result for the
+	// tokens it held — silently, with `doctor --deep` still reporting the
+	// index healthy (#1088). Additive: a manifest written before this decodes
+	// with it zero, and the check is skipped.
+	BucketFiles int `json:"bucket_files,omitempty"`
 	// IngestHealth records, per harness, what ingestion skipped on the pass
 	// that last touched it: malformed JSONL lines and files that failed to
 	// parse. Silent loss must be diagnosable (`deja doctor --json`).
@@ -181,9 +200,14 @@ type Manifest struct {
 
 // HarnessIngest is one harness's ingestion health from its last indexing pass.
 type HarnessIngest struct {
-	MalformedLines int    `json:"malformed_lines,omitempty"`
-	FailedFiles    int    `json:"failed_files,omitempty"`
-	LastError      string `json:"last_error,omitempty"`
+	MalformedLines int `json:"malformed_lines,omitempty"`
+	// ClippedMessages counts messages stored short of what the transcript
+	// holds, because a single message ran past maxIndexedText. The text is
+	// there and the tail is not, so a search over the tail answers "no
+	// matches" — the same silent loss as an unparseable line (#1093).
+	ClippedMessages int    `json:"clipped_messages,omitempty"`
+	FailedFiles     int    `json:"failed_files,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
 }
 
 type manifestCore struct {
@@ -199,6 +223,7 @@ type manifestCore struct {
 	ImportedRecords  map[string]bool
 	RecordStrings    []string
 	RecordsSize      int64
+	BucketFiles      int
 	IngestHealth     map[string]HarnessIngest
 }
 

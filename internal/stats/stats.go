@@ -10,6 +10,7 @@ import (
 
 	"github.com/vshulcz/deja-vu/internal/jsonout"
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/redact"
 	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/usage"
 )
@@ -227,20 +228,8 @@ func Build(ss []model.Session, now time.Time) Report {
 		out.DateRange.End = maxT.In(now.Location()).Format("2006-01-02")
 	}
 	out.RepeatQuestions = RepeatQuestions(ss)
-	weekCut := now.Add(-7 * 24 * time.Hour)
+	out.AgentCredits, out.WeekCredits = AgentCredits(ss, now)
 	for _, s := range ss {
-		for _, msg := range s.Messages {
-			// The attribution loop: agents saying "deja-vu recalled" end up in
-			// the very transcripts deja indexes, so the next pass can count how
-			// often memory was credited out loud — a measured magic metric with
-			// zero telemetry.
-			if msg.Role == "assistant" && strings.Contains(msg.Text, "deja-vu recalled") {
-				out.AgentCredits++
-				if !msg.Time.IsZero() && msg.Time.After(weekCut) {
-					out.WeekCredits++
-				}
-			}
-		}
 		for _, msg := range s.Messages {
 			if msg.Role != "user" {
 				continue
@@ -288,13 +277,16 @@ func buildHeatmap(byDay map[string]int, now time.Time) HeatmapStats {
 	return hm
 }
 
+// Title is the one-line name of a session. It reaches a terminal, a shared
+// HTML page and a stats card, and it is transcript text, so it is stripped of
+// what a terminal acts on rather than prints.
 func Title(s model.Session) string {
 	if s.Title != "" && !Noise(s.Title) {
-		return s.Title
+		return redact.SafeForDisplay(s.Title)
 	}
 	for _, m := range s.Messages {
 		if m.Role == "user" && !Noise(m.Text) {
-			return TrimRunes(strings.Join(strings.Fields(m.Text), " "), 60)
+			return TrimRunes(strings.Join(strings.Fields(redact.SafeForDisplay(m.Text)), " "), 60)
 		}
 	}
 	return ""
@@ -451,4 +443,28 @@ func questionStemFor(text string) string {
 		}
 	}
 	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// AgentCredits counts, over the whole corpus and over the last week, the
+// assistant turns that named deja out loud.
+//
+// The attribution loop: agents saying "deja-vu recalled" end up in the very
+// transcripts deja indexes, so the next pass can count how often memory was
+// credited out loud — a measured magic metric with zero telemetry. It is the
+// only signal that separates memory that was used from memory that was merely
+// served, so the impact panel reads it too (#1062).
+func AgentCredits(ss []model.Session, now time.Time) (total, week int) {
+	weekCut := now.Add(-7 * 24 * time.Hour)
+	for _, s := range ss {
+		for _, msg := range s.Messages {
+			if msg.Role != "assistant" || !strings.Contains(msg.Text, "deja-vu recalled") {
+				continue
+			}
+			total++
+			if !msg.Time.IsZero() && msg.Time.After(weekCut) {
+				week++
+			}
+		}
+	}
+	return total, week
 }

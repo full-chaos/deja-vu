@@ -104,13 +104,13 @@ func handleMCP(dir string, req rpcRequest) (any, int, string) {
 		return map[string]any{"tools": []map[string]any{
 			{
 				"name":        "recall",
-				"description": "Search the user's own past coding sessions across every AI tool they've used (Claude Code, Codex, Cursor, opencode, aider, gemini, and others) and return the best matches as dense text under ~4KB. Call this the moment the user implies work already happened — 'didn't we fix this before?', 'what was that error again', 'we already set this up', 'how did we solve X last time', 'what did we decide about Y' — and always before debugging an error or re-implementing something that might already exist. Query with the most specific token available: an exact error string, function name, file path, or flag (multiple words are ANDed). Do NOT use this for general knowledge or library/API docs — only this user's prior sessions. A result may carry a bracketed marker before its snippets — [this was tried and rejected], [a later decision replaced this], [marked stale — may no longer hold] — with the reason and the date. That is the user's own later judgement on that session: do not repeat a rejected approach, prefer the replacement over what it replaced, and treat stale results as needing confirmation before you act on them. An unmarked result carries no such judgement either way. Follow up with recall_context when one session looks right and you need its full story. Optionally filter by harness. When a result genuinely helps the task at hand — you reuse a fix, skip re-debugging, or confirm a prior decision — tell the user in one digest.Short line what deja-vu recalled and how you used it (e.g. \"deja-vu recalled: we hit this JWT skew in March — reusing that fix\"). Even a partial hint counts if it changed your approach. Say nothing about recalls that did not help.",
+				"description": "Search the user's own past coding sessions across every AI tool they've used (Claude Code, Codex, Cursor, opencode, aider, gemini, and others) and return the best matches as dense text under ~4KB. Call this the moment the user implies work already happened — 'didn't we fix this before?', 'what was that error again', 'we already set this up', 'how did we solve X last time', 'what did we decide about Y' — and always before debugging an error or re-implementing something that might already exist. Query with the most specific token available: an exact error string, function name, file path, or flag (multiple words are ANDed). Do NOT use this for general knowledge or library/API docs — only this user's prior sessions. A result may carry a bracketed marker before its snippets — [this was tried and rejected], [a later decision replaced this], [marked stale — may no longer hold] — with the reason and the date. That is the user's own later judgement on that session: do not repeat a rejected approach, prefer the replacement over what it replaced, and treat stale results as needing confirmation before you act on them. An unmarked result carries no such judgement either way. Follow up with recall_context when one session looks right and you need its full story. Optionally filter by harness. When a result genuinely helps the task at hand — you reuse a fix, skip re-debugging, or confirm a prior decision — tell the user in one short line what deja-vu recalled and how you used it (e.g. \"deja-vu recalled: we hit this JWT skew in March — reusing that fix\"). Even a partial hint counts if it changed your approach. Say nothing about recalls that did not help.",
 				"annotations": map[string]any{"title": "Search past sessions", "readOnlyHint": true, "openWorldHint": false},
 				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string", "description": "Search terms; specific tokens (error strings, function names, flags) match best. Multiple words are ANDed."}, "harness": map[string]any{"type": "string", "description": "Optional filter: claude, codex, opencode, aider, gemini, cursor, antigravity, grok or qwen."}, "limit": map[string]any{"type": "number", "description": "Max sessions to return (default 5)."}, "offset": map[string]any{"type": "number", "description": "Skip this many ranked matches — page through results without re-ranking."}}, "required": []string{"query"}},
 			},
 			{
 				"name":        "recall_context",
-				"description": "Return a full markdown digest (~8KB) of the single best-matching prior session — problem, decisions, outcome — when a bare recall hit is not enough and you need the reasoning behind it. Use after recall, or directly when the user asks 'remind me how we handled X' or 'what was the whole story with Y'. Query terms are matched against transcript text, so use tokens likely to appear verbatim: an error string, function name, or flag. Not for browsing many sessions — use recall for that; this returns one deep digest. When a result genuinely helps the task at hand — you reuse a fix, skip re-debugging, or confirm a prior decision — tell the user in one digest.Short line what deja-vu recalled and how you used it (e.g. \"deja-vu recalled: we hit this JWT skew in March — reusing that fix\"). Even a partial hint counts if it changed your approach. Say nothing about recalls that did not help.",
+				"description": "Return a full markdown digest (~8KB) of the single best-matching prior session — problem, decisions, outcome — when a bare recall hit is not enough and you need the reasoning behind it. Use after recall, or directly when the user asks 'remind me how we handled X' or 'what was the whole story with Y'. Query terms are matched against transcript text, so use tokens likely to appear verbatim: an error string, function name, or flag. Not for browsing many sessions — use recall for that; this returns one deep digest. When a result genuinely helps the task at hand — you reuse a fix, skip re-debugging, or confirm a prior decision — tell the user in one short line what deja-vu recalled and how you used it (e.g. \"deja-vu recalled: we hit this JWT skew in March — reusing that fix\"). Even a partial hint counts if it changed your approach. Say nothing about recalls that did not help.",
 				"annotations": map[string]any{"title": "Digest one past session", "readOnlyHint": true, "openWorldHint": false},
 				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string", "description": "Search terms identifying the session to digest."}, "harness": map[string]any{"type": "string", "description": "Optional harness filter."}}, "required": []string{"query"}},
 			},
@@ -281,6 +281,7 @@ func blameTextResult(dir string, o search.BlameOptions, path string, limit int) 
 	if limit <= 0 {
 		limit = 10
 	}
+	found := len(hits)
 	if !o.All && len(hits) > limit {
 		hits = hits[:limit]
 	}
@@ -289,8 +290,29 @@ func blameTextResult(dir string, o search.BlameOptions, path string, limit int) 
 	// against the ~4 KB the other tools answer in. The snippets that sit beside
 	// it are the part an agent reads; the full session is one recall_context
 	// away when it genuinely needs it.
-	return string(mustMarshalBlame(hits)), len(hits), nil
+	//
+	// The byte budget below is the same cap for every path into here. `all`
+	// used to skip the truncation above and hand back 162 KB from a store where
+	// 300 sessions touched one file (#1071); a cap that an argument can turn
+	// off is not a cap.
+	body := mustMarshalBlame(hits, 0)
+	for len(body) > blameMCPBudget && len(hits) > 1 {
+		hits = hits[:max(len(hits)*3/4, 1)]
+		body = mustMarshalBlame(hits, 0)
+	}
+	if omitted := found - len(hits); omitted > 0 {
+		// Silently returning the top slice let an agent conclude it had seen
+		// every session that touched the file. Say what was left out and what
+		// to do about it.
+		body = mustMarshalBlame(hits, omitted)
+	}
+	return string(body), len(hits), nil
 }
+
+// blameMCPBudget bounds one blame answer. Higher than recall's ~4 KB because a
+// hit is a whole session rather than a snippet, and well under what an agent
+// can absorb from one tool call.
+const blameMCPBudget = 8192
 
 // blameHitJSON is what the MCP blame tool returns: the same shape as the CLI's
 // --json minus the session's message list.
@@ -314,8 +336,8 @@ type blameSessionJSON struct {
 	Touched []string  `json:"touched,omitempty"`
 }
 
-func mustMarshalBlame(hits []search.BlameHit) []byte {
-	out := make([]blameHitJSON, 0, len(hits))
+func mustMarshalBlame(hits []search.BlameHit, omitted int) []byte {
+	out := make([]any, 0, len(hits)+1)
 	for _, h := range hits {
 		out = append(out, blameHitJSON{
 			Session: blameSessionJSON{
@@ -326,6 +348,11 @@ func mustMarshalBlame(hits []search.BlameHit) []byte {
 			Title: h.Session.Title, Count: h.Count, Score: h.Score,
 			Tier: h.Tier, Snippets: h.Snippets,
 		})
+	}
+	if omitted > 0 {
+		out = append(out, map[string]any{"note": fmt.Sprintf(
+			"%d more session%s touch this path and were left out to stay within one answer — narrow with project, harness or since, or call recall_context on one of the above.",
+			omitted, pluralS(omitted))})
 	}
 	b, err := json.Marshal(out)
 	if err != nil {
@@ -427,7 +454,7 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 	total := len(hits)
 	if offset > 0 {
 		if offset >= total {
-			return fmt.Sprintf("No more matches for %q: %d total, offset %d.", q, total, offset), 0, 0, nil, nil
+			return fmt.Sprintf("No more matches for %q: %d total, offset %d.", clampEcho(q), total, offset), 0, 0, nil, nil
 		}
 		hits = hits[offset:]
 	}
@@ -437,7 +464,7 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 		hits = hits[:limit]
 	}
 	attachAnswers(dir, hits)
-	attachLifecycles(hits)
+	attachLifecycles(dir, hits)
 	demoted := demoteRejected(hits)
 	var b strings.Builder
 	served := 0
@@ -461,6 +488,12 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 	}
 	for i, h := range hits {
 		fmt.Fprintf(&b, "\n%d. [%s] %s · %s · %d matches", i+1, h.Session.Harness, h.Session.Project, h.Session.ID, h.Count)
+		// A session with no user turn is the agent's own words, and the lines
+		// below carry no role — so an assertion a model made arrived as a fact
+		// from the store (#1107, the shape #1100 fixed for the listing).
+		if h.Session.AgentTitle {
+			fmt.Fprint(&b, " · agent-opened, no human turn")
+		}
 		if !h.Session.Updated.IsZero() {
 			fmt.Fprintf(&b, " · updated %s (%s)", h.Session.Updated.Local().Format("2006-01-02"), search.RelativeDate(h.Session.Updated))
 		}
@@ -558,6 +591,10 @@ func recallContextResult(dir, q, harness string) (string, int, int64, []string, 
 	if len(hits) == 0 {
 		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil
 	}
+	// The same order the search screen shows: this handed the agent a session
+	// the reader had rejected, while search demoted it and said why (#1099).
+	attachLifecycles(dir, hits)
+	demoteRejected(hits)
 	var b bytes.Buffer
 	search.PrintContext(&b, hits[0].Session, q)
 	text := b.String()

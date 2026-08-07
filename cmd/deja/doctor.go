@@ -20,7 +20,7 @@ import (
 )
 
 // doctorVersionLookup fetches the latest released version. It is injected so
-// tests can stub it — the real lookup talks to GitHub with a digest.Short budget.
+// tests can stub it — the real lookup talks to GitHub with a short budget.
 type doctorVersionLookup func() (latest string, ok bool)
 
 // doctorLookup is the dispatcher's lookup; overridable in tests so they never
@@ -84,6 +84,13 @@ func runDoctor(w io.Writer, args []string, lookup doctorVersionLookup, dir strin
 	}
 	doctorHarnesses(w, dir)
 	printDoctorStoreWarnings(w, report.Stores)
+	// The third cause of a files-to-sessions gap, after a parse failure (#861)
+	// and an id collision (#1101): the reader forgot them. `last` and `stats`
+	// have said so all along; the screen someone opens to check that a forget
+	// took did not (#1108).
+	if n := len(index.Tombstones()); n > 0 {
+		fmt.Fprintf(w, "  %-12s %s forgotten here and kept out of the index (`deja forget --list`)\n", "forgotten", doctorCount(n, "session"))
+	}
 	fmt.Fprintln(w)
 	doctorTools(w)
 	fmt.Fprintln(w)
@@ -324,7 +331,38 @@ func printDoctorStoreWarnings(w io.Writer, stores []doctorStore) {
 // the way there is missing. `~/.kimi-code/sessions` on a machine without kimi
 // loses one level and its home is right there; a store on an ejected volume
 // loses the whole chain (#933).
-func storeDiskGone(path string) bool {
+// Cursor and aider hand doctor their roots joined for display, and a joined
+// string is no path to walk up from: it lost the whole chain by construction
+// and cursor's row said `unplugged` on every machine.
+func storeDiskGone(location string) bool {
+	roots := doctorLocationRoots(location)
+	for _, root := range roots {
+		if !oneStoreDiskGone(root) {
+			return false
+		}
+	}
+	return len(roots) > 0
+}
+
+func doctorLocationRoots(location string) []string {
+	var roots []string
+	for _, part := range strings.Split(location, string(os.PathListSeparator)) {
+		for _, root := range strings.Split(part, ", ") {
+			if root = strings.TrimSpace(root); root != "" {
+				roots = append(roots, root)
+			}
+		}
+	}
+	return roots
+}
+
+func oneStoreDiskGone(path string) bool {
+	// Two levels is not enough for every store: `~/.local/share/goose/sessions`
+	// and `~/.cline/data/sessions` lose three on a machine that never installed
+	// them. A home directory that is there means the disk is there.
+	if home := sources.Home(); home != "" && strings.HasPrefix(path, home+string(os.PathSeparator)) && dirExists(home) {
+		return false
+	}
 	dir := filepath.Dir(path)
 	for i := 0; i < 2; i++ {
 		if dirExists(dir) {
@@ -388,6 +426,7 @@ func doctorHarnesses(w io.Writer, dir string) {
 	// counts files (#861).
 	indexed := index.HarnessSessionCounts(dir)
 	fromElsewhere := index.ImportedSessionCounts(dir)
+	sharedRows := index.HarnessSharedCounts(dir)
 
 	// The same inspection the JSON form reports, so one command does not give
 	// two answers about one store: `found` here and `unreadable` there (#999).
@@ -458,6 +497,12 @@ func doctorHarnesses(w io.Writer, dir string) {
 			switch imported {
 			case 0:
 				detail += doctorCount(n, "indexed session")
+				// The gap between files and sessions has two causes, and they
+				// read the same: a file that failed to parse, or two files
+				// sharing an id. The manifest knows which (#1101).
+				if sh := sharedRows[name]; sh > 0 {
+					detail += fmt.Sprintf(", %d of them shared by two transcripts", sh)
+				}
 			case n:
 				detail += doctorCount(n, "indexed session") + " from elsewhere"
 			default:
@@ -1011,7 +1056,7 @@ func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 	health := index.IngestHealth(dir)
 	names := make([]string, 0, len(health))
 	for h, e := range health {
-		if e.MalformedLines > 0 || e.FailedFiles > 0 {
+		if e.MalformedLines > 0 || e.FailedFiles > 0 || e.ClippedMessages > 0 {
 			names = append(names, h)
 		}
 	}
@@ -1021,14 +1066,51 @@ func doctorIndex(w io.Writer, idx doctorComponent, dir string) {
 		// "malformed" covered only unparseable lines; valid JSON deja cannot
 		// use is skipped just as invisibly, and the reader needs the same
 		// warning either way (#814).
-		fmt.Fprintf(w, "  ingest   %s: %d unusable line%s skipped, %d path%s unreadable — see `deja doctor --json`\n",
-			h, e.MalformedLines, pluralS(e.MalformedLines), e.FailedFiles, pluralS(e.FailedFiles))
+		clipped := ""
+		if e.ClippedMessages > 0 {
+			// Named separately from the skipped lines: the session is here and
+			// searchable, it is the tail of one message that is not, and a
+			// search over that tail answers "no matches" (#1093).
+			clipped = fmt.Sprintf(", %d message%s stored short of the transcript (over 64 KB)",
+				e.ClippedMessages, pluralS(e.ClippedMessages))
+		}
+		fmt.Fprintf(w, "  ingest   %s: %d unusable line%s skipped, %d path%s unreadable%s — see `deja doctor --json`\n",
+			h, e.MalformedLines, pluralS(e.MalformedLines), e.FailedFiles, pluralS(e.FailedFiles), clipped)
 	}
+}
+
+// strandedUpdateStagings counts the staging files an interrupted update left
+// beside this binary. The name is deja's own (`.deja-update-*`), so this
+// recognises only its own litter (#1109).
+func strandedUpdateStagings() (int, string) {
+	exe, err := os.Executable()
+	if err != nil {
+		return 0, ""
+	}
+	dir := filepath.Dir(exe)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, ""
+	}
+	n := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), ".deja-update-") {
+			n++
+		}
+	}
+	return n, dir
 }
 
 func doctorVersion(w io.Writer, lookup doctorVersionLookup) {
 	fmt.Fprintln(w, "Version:")
 	fmt.Fprintf(w, "  current  %s\n", version)
+	// An update killed between staging and rename strands a whole binary's
+	// worth of bytes beside the real one, under a prefix deja itself wrote —
+	// and every later run walked past it (#1109).
+	if n, dir := strandedUpdateStagings(); n > 0 {
+		fmt.Fprintf(w, "  %-8s %s left in %s by an interrupted update — safe to delete\n",
+			"leftover", doctorCount(n, "staged file"), dir)
+	}
 	latest, ok := lookup()
 	if !ok {
 		fmt.Fprintln(w, "  latest   unable to check")

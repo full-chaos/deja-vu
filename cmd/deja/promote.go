@@ -67,7 +67,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		// Taking a mark back is the state nobody guesses: users reach for
 		// --state none, --state clear or --unpromote, get this line, and read
 		// four states none of which sounds like an undo (#845).
-		return fmt.Errorf("promote: state must be accepted, rejected, superseded or stale — `--state accepted` takes an earlier mark back")
+		return fmt.Errorf("promote: state must be accepted, rejected, superseded or stale — `--state accepted` takes an earlier mark back, and `deja forget --session deja-note-<harness>-<id>` removes the note itself")
 	}
 	s, ok, err := findByPrefix(dir, prefix)
 	noteAmbiguousPrefix(dir, prefix, "promoting")
@@ -75,7 +75,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("no session matches %q", prefix)
+		return fmt.Errorf("no session matches %q%s", prefix, movedBucketHint(dir, prefix))
 	}
 	src := s.Harness + ":" + s.ID
 	if s.Harness == "deja" {
@@ -110,7 +110,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	if title == "" {
 		title = firstLine(text)
 	}
-	if err := sources.AppendPromotedTagged(s.Project, title, text, src, state, tags, time.Now()); err != nil {
+	if err := sources.AppendPromotedSourced(s.Project, title, text, src, state, tags, s.Updated, time.Now()); err != nil {
 		return notesWriteError(err)
 	}
 	// The note has to reach the index before the line below claims it outranks
