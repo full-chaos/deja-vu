@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/nfcfold"
 	"github.com/vshulcz/deja-vu/internal/query"
 	"github.com/vshulcz/deja-vu/internal/redact"
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -1015,6 +1016,22 @@ func agentOwnedFile(p string) bool {
 	return strings.HasSuffix(p, ".log") || strings.HasSuffix(p, ".output")
 }
 
+// askedHashOf returns the stem hash for one user turn, or false when the text
+// is not a question worth tracking. Shared by the message and record paths so
+// they agree on what counts as an asking.
+func askedHashOf(text string) (uint64, bool) {
+	if notAsked(text) || !looksLikeQuestion(text) {
+		return 0, false
+	}
+	stem := questionStem(text)
+	if stem == "" {
+		return 0, false
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(stem))
+	return h.Sum64(), true
+}
+
 // askedHashes fingerprints the substantial things a person asked in a session.
 // Short turns are excluded the way stats excludes them: "ok" and "continue"
 // repeat in every session and mean nothing.
@@ -1025,17 +1042,33 @@ func askedHashes(ms []model.Message) []uint64 {
 		if m.Role != "user" {
 			continue
 		}
-		if notAsked(m.Text) || !looksLikeQuestion(m.Text) {
+		v, ok := askedHashOf(m.Text)
+		if !ok || seen[v] {
 			continue
 		}
-		stem := questionStem(m.Text)
-		if stem == "" {
+		seen[v] = true
+		out = append(out, v)
+		if len(out) >= askedQuestionCap {
+			break
+		}
+	}
+	return out
+}
+
+// askedFromRecords is askedHashes for the import path, which holds a session as
+// records rather than messages. Imported sessions used to carry no Asked, so
+// the brief's asked-twice line — which reads meta.Asked — never saw a repeat
+// that crossed a sync boundary, while stats' RepeatQuestions (from records)
+// counted it. The two disagreed on the same store.
+func askedFromRecords(recs []Record) []uint64 {
+	var out []uint64
+	seen := map[uint64]bool{}
+	for _, r := range recs {
+		if r.Role != "user" {
 			continue
 		}
-		h := fnv.New64a()
-		_, _ = h.Write([]byte(stem))
-		v := h.Sum64()
-		if seen[v] {
+		v, ok := askedHashOf(r.Text)
+		if !ok || seen[v] {
 			continue
 		}
 		seen[v] = true
@@ -1129,12 +1162,39 @@ func topTouchedFiles(ms []model.Message) []string {
 		if m.Role != roleFiles {
 			continue
 		}
-		for _, p := range strings.Split(m.Text, "\n") {
-			if p = strings.TrimSpace(p); p != "" && !agentOwnedFile(p) {
-				count[p]++
-			}
+		countTouchedPaths(count, m.Text)
+	}
+	return rankTouched(count)
+}
+
+// touchedFromRecords is topTouchedFiles for the import path, which holds a
+// session as records rather than messages. Imported sessions used to carry no
+// Touched, so `deja blame` — which reads it — could not attribute a peer's
+// edits even though `search --role files` surfaced the same records.
+func touchedFromRecords(recs []Record) []string {
+	count := map[string]int{}
+	for _, r := range recs {
+		if r.Role != roleFiles {
+			continue
+		}
+		countTouchedPaths(count, r.Text)
+	}
+	return rankTouched(count)
+}
+
+// countTouchedPaths tallies the file paths in one `files` record's text, one
+// per line, skipping deja's own injected artifacts.
+func countTouchedPaths(count map[string]int, text string) {
+	for _, p := range strings.Split(text, "\n") {
+		if p = strings.TrimSpace(p); p != "" && !agentOwnedFile(p) {
+			count[p]++
 		}
 	}
+}
+
+// rankTouched orders touched paths by recurrence and caps the list, the shape
+// SessionMeta.Touched holds.
+func rankTouched(count map[string]int) []string {
 	if len(count) == 0 {
 		return nil
 	}
@@ -1345,6 +1405,13 @@ func redactForIngest(m *Manifest, sourcePath, text string) string {
 	// Drop deja's own injected recall before anything else looks at the text,
 	// so it is never counted, tokenized or stored.
 	text = stripSelfRecall(text)
+	// Canonicalise accented text to NFC so an "é" stored decomposed (base + a
+	// combining mark, as some editors and macOS filesystems emit) matches a
+	// query typed precomposed and the reverse. NFC is lossless — it names the
+	// same characters — so unlike a fold it is safe to store, and it makes every
+	// downstream surface (postings, snippet, digest) compare like against like
+	// (#1098).
+	text = nfcfold.Compose(text)
 	// Redact the full text before capping: a secret straddling the cap
 	// boundary would otherwise lose its closing marker and store raw.
 	redacted, counts := redact.Text(text)
@@ -2255,7 +2322,9 @@ func preRedactSessions(m *Manifest, ss []model.Session) {
 			for si := range jobs {
 				s := &ss[si]
 				for mi := range s.Messages {
-					redacted, counts := redact.Text(stripSelfRecall(s.Messages[mi].Text))
+					// NFC-canonicalise here too: this is the bulk write path and
+					// does not go through redactForIngest (#1098).
+					redacted, counts := redact.Text(nfcfold.Compose(stripSelfRecall(s.Messages[mi].Text)))
 					if len(redacted) > maxIndexedText {
 						cut := maxIndexedText
 						for cut > 0 && !utf8.RuneStart(redacted[cut]) {

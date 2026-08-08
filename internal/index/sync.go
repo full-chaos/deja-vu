@@ -403,6 +403,11 @@ func Import(dir, inDir string) (int, error) {
 			added:  added,
 		}
 		fileDedupe := &before.dedupe
+		// Redactions this file contributed, applied to the manifest only once
+		// the file has been read whole: a truncated file is rolled back below,
+		// and its redaction count must not survive the records it counted.
+		fileRedacted := 0
+		fileRules := map[string]int{}
 		for k, v := range recsByKey {
 			before.counts[k] = len(v)
 		}
@@ -482,8 +487,19 @@ func Import(dir, inDir string) (int, error) {
 				}
 				dedupe = bucket
 			}
+			// The ledger is an optimisation over the manifest, not authority
+			// over it: it says a record already arrived, so re-importing the
+			// same batch is a no-op. But forgetting an imported session drops
+			// it from the manifest while leaving its rows in the ledger, and a
+			// tombstone (checked above) only holds until unforget lifts it —
+			// after which the stale ledger silently ate the very re-import
+			// unforget tells the user to run, and the "only copy" was
+			// unrecoverable. Skip only while the session it belongs to still
+			// lives; a ledger row whose session is gone is stale, not a dupe.
 			if m.ImportedRecords[dedupe] || m.ImportedRecords[legacy] {
-				return nil
+				if _, live := m.Sessions[sr.Harness+":"+importID]; live {
+					return nil
+				}
 			}
 			// The exclude list keeps a project out of this machine's memory;
 			// a sync from another machine must not put it back.
@@ -491,7 +507,17 @@ func Import(dir, inDir string) (int, error) {
 				return nil
 			}
 			key := sr.Harness + ":" + importID
-			text, _ := redact.Text(sr.Text)
+			text, cnt := redact.Text(sr.Text)
+			// Count what redaction removed, the way local ingest does — the
+			// import path redacted the text but threw the count away, so
+			// `stats --redaction` under-reported protection on an imported
+			// store (measured: two secrets redacted, total said one).
+			if n := cnt.Total(); n > 0 {
+				fileRedacted += n
+				for rule, c := range cnt {
+					fileRules[sr.Harness+":"+rule] += c
+				}
+			}
 			recsByKey[key] = append(recsByKey[key], Record{Key: key, Role: sr.Role, Text: text, Time: sr.Time, SourcePath: syncImportPath})
 			meta := metas[key]
 			if meta.ID == "" {
@@ -566,6 +592,16 @@ func Import(dir, inDir string) (int, error) {
 			restoreMap(titleRankOf, before.rank)
 			added = before.added
 			continue
+		}
+		// The file was read whole: its redactions are real and stay counted.
+		if fileRedacted > 0 {
+			m.Redacted += fileRedacted
+			if m.RedactionRules == nil {
+				m.RedactionRules = map[string]int{}
+			}
+			for rule, c := range fileRules {
+				m.RedactionRules[rule] += c
+			}
 		}
 	}
 	if added == 0 {
@@ -754,6 +790,25 @@ func appendImportedRecords(dir string, m *Manifest, recsByKey map[string][]Recor
 	nextOrd := nextSessionOrd(m.Sessions)
 	for _, key := range keys {
 		meta := metas[key]
+		// Derive the file-touch list the way local ingest does. Without it an
+		// imported session carried no Touched, so `deja blame` — which reads
+		// Touched to find who edited a file — could not attribute a peer's edits
+		// even though `search --role files` surfaced the same records.
+		if t := touchedFromRecords(recsByKey[key]); len(t) > 0 {
+			meta.Touched = t
+		}
+		// Same reason for the asked-twice signal: without meta.Asked an imported
+		// session can never contribute a repeat to the brief, so a question a
+		// peer asked and you asked again crossed a sync boundary unseen.
+		if a := askedFromRecords(recsByKey[key]); len(a) > 0 {
+			meta.Asked = a
+		}
+		// And the friction signal, for the same reason: without meta.Hit the
+		// brief's one wall line never counted an error a peer kept hitting,
+		// though `deja friction` and stats both did.
+		if hh := hitFromRecords(recsByKey[key]); len(hh) > 0 {
+			meta.Hit = hh
+		}
 		old := m.Sessions[key]
 		if old.ID != "" {
 			meta.Ord = old.Ord

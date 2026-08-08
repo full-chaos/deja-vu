@@ -16,6 +16,7 @@ import (
 
 	"github.com/vshulcz/deja-vu/internal/cjkfold"
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/nfcfold"
 	"github.com/vshulcz/deja-vu/internal/query"
 	"github.com/vshulcz/deja-vu/internal/search"
 )
@@ -2265,6 +2266,13 @@ func intersectPostingMaps(sets []map[int64]posting) []posting {
 }
 
 func tokens(s string) []string {
+	// Fold NFD to NFC so an accented word keys the same whether it was typed or
+	// stored decomposed. A combining mark is category Mn, not a letter, so the
+	// tokenizer below would otherwise split "café" (NFD) into "cafe" and drop
+	// the accent, keying it apart from the precomposed "café" (#1098). Both the
+	// stored text (indexKeys) and the query (queryKeys) pass through here, so
+	// the fold is symmetric and the two sides always meet on one key.
+	s = nfcfold.Compose(s)
 	seen := map[string]bool{}
 	var out []string
 	var b strings.Builder
@@ -2422,6 +2430,16 @@ func recordMatchesQueryVariants(r Record, o query.Options, variants map[string][
 	if query.MatchesParts(r.Text, terms, phrases, variants) {
 		return true
 	}
+	// The postings that pointed here folded NFD to NFC (tokens); this surface
+	// check runs on the raw bytes, where the same accented word in the other
+	// normalization would not substring-match. Retry both composed, mirroring
+	// the CJK retry below (#1098).
+	if nfcfold.Compose(r.Text) != r.Text || nfcfold.Compose(o.Query) != o.Query {
+		nterms, nphrases := query.QueryParts(nfcfold.Compose(o.Query))
+		if query.MatchesParts(nfcfold.Compose(r.Text), nterms, nphrases, variants) {
+			return true
+		}
+	}
 	// Postings are keyed on Traditional-folded bigrams, so a Simplified query
 	// can legitimately reach a Traditional record (and the reverse). This
 	// verification step compares surface text, which would then reject the
@@ -2529,7 +2547,12 @@ type AskedTwice struct {
 //
 // The search runs entirely over the manifest. Only the matching sessions are
 // read back, and only to recover the text the hashes stand for.
-func FindAskedTwice(dir string) (AskedTwice, bool) {
+// allow is the trust gate: it reports whether a session's project may reach the
+// caller's activation. Imported sessions now carry asked hashes, so an
+// asked-twice repeat can be all imported — without this gate the brief would
+// print it on a machine whose auto rule withholds imported memory. A nil allow
+// counts every session (the manifest-level view the tests read).
+func FindAskedTwice(dir string, allow func(project string) bool) (AskedTwice, bool) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
@@ -2539,6 +2562,9 @@ func FindAskedTwice(dir string) (AskedTwice, bool) {
 	}
 	byHash := map[uint64][]SessionMeta{}
 	for _, meta := range m.Sessions {
+		if allow != nil && !allow(meta.Project) {
+			continue
+		}
 		for _, h := range meta.Asked {
 			byHash[h] = append(byHash[h], meta)
 		}

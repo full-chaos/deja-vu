@@ -174,7 +174,10 @@ func runBrief(dir string, w io.Writer) error {
 	// The one line on this screen that says something a person could not have
 	// noticed themselves: a question they asked in more than one session. A
 	// count of sessions is reporting; this is the thing the tool is for.
-	asked, haveAsked := index.FindAskedTwice(dir)
+	briefPol := policy.Load()
+	asked, haveAsked := index.FindAskedTwice(dir, func(project string) bool {
+		return briefPol.Allows(policy.ActivationAuto, project)
+	})
 	askedText := ""
 	if haveAsked {
 		askedText = trimBriefTitle(asked.Text)
@@ -220,7 +223,9 @@ func runBrief(dir string, w io.Writer) error {
 	// counter: a wall this machine keeps running into. Manifest-only, like the
 	// asked line above it — the command that reports the full list reads the
 	// record log, which is a hundred times this screen's budget.
-	if f, ok := index.FindFriction(dir); ok {
+	if f, ok := index.FindFriction(dir, func(project string) bool {
+		return briefPol.Allows(policy.ActivationAuto, project)
+	}); ok {
 		fmt.Fprintf(w, "hit        %s%s%s\n", bold, trimBriefTitle(f.Text), reset)
 		fmt.Fprintf(w, "again      %s%d sessions · last %s · deja friction%s\n",
 			dim, len(f.Sessions), search.RelativeDate(f.Last), reset)

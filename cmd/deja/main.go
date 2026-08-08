@@ -15,6 +15,7 @@ import (
 
 	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/nfcfold"
 	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/query"
 	"github.com/vshulcz/deja-vu/internal/redact"
@@ -379,6 +380,9 @@ func cmdShow(dir string, rest []string, sourceInstance string) error {
 		}
 		return fmt.Errorf("no session matches %q%s", o.id, movedBucketHint(dir, o.id))
 	}
+	if err := denyPolicyHidden(o.id, s, os.Stderr); err != nil {
+		return err
+	}
 	if o.json {
 		return printSessionJSON(os.Stdout, s, o.offset, o.limit, sourceInstance)
 	}
@@ -526,7 +530,7 @@ func cmdCtx(dir string, rest []string) error {
 			return nil
 		}
 	}
-	o := search.Options{Query: q, All: true}
+	o := search.Options{Query: nfcfold.Compose(q), All: true}
 	if err := index.EnsureForSearch(dir, o, false, os.Stderr); err != nil {
 		if !staleUnwritableIndex(dir, err) {
 			return err
@@ -1536,7 +1540,9 @@ func parseSearch(args []string) (search.Options, error) {
 			q = append(q, a)
 		}
 	}
-	o.Query = strings.Join(q, " ")
+	// Match the NFC canonicalisation ingest applies to stored text, so a query
+	// typed in either normalisation reaches the same records (#1098).
+	o.Query = nfcfold.Compose(strings.Join(q, " "))
 	if o.Query == "" {
 		return o, fmt.Errorf("query required")
 	}

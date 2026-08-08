@@ -442,13 +442,15 @@ func IndexCommands() bool { return os.Getenv("DEJA_INDEX_COMMANDS") != "0" }
 // ecosystem: `git status` and `git log` missed it 2,270 times, and a person
 // working in LaTeX, Python or the JVM saw nothing at all. Widening it takes the
 // same store from 6,770 commands to 12,661, and 1.03 MB to 1.41 MB.
-var meaningfulCommand = regexp.MustCompile(`\b(go (test|build|vet|run)|golangci-lint|gofmt|pytest|python3? -m|uv (run|pip)|pip install|ruff|mypy|npm|npx|pnpm|yarn|bun |cargo |make\b|cmake|gh (pr|run|release|issue|workflow|api)|git [a-z-]+|docker|kubectl|helm|terraform|psql|mysql|latexmk|mvn|gradle|dotnet|swift (build|test)|bundle exec|rails|deja )`)
+var meaningfulCommand = regexp.MustCompile(`\b(go (test|build|vet|run)|golangci-lint|gofmt|pytest|python3? -m|uv (run|pip)|pip install|ruff|mypy|npm|npx|pnpm|yarn|bun |cargo |make\b|cmake|ctest|ninja|meson|bazel|buck2|gh (pr|run|release|issue|workflow|api)|git [a-z-]+|docker|kubectl|helm|terraform|psql|mysql|latexmk|mvn|gradle|dotnet|swift (build|test)|bundle exec|rails|rake|rspec|phpunit|composer (install|update|require)|tox|nox|jest|vitest|playwright|cypress|deno|tsc|sbt|stack (build|test|run|exec)|cabal|ghc|dune|zig|nix|rustc|clang\+\+|clang|g\+\+|gcc|pdm run|poetry run|deja )`)
 
 var trivialCommand = regexp.MustCompile(`^\s*(ls|cd|pwd|cat|head|tail|echo|grep|rg|find|which|wc|sed|awk|sleep|mkdir|rm|cp|mv|chmod|export|source|touch|open|printf)\b`)
 
 // worthIndexing keeps the commands that say what happened — a test run, a build,
-// a deploy, a git or gh operation — and drops navigation. Measured on a real
-// corpus: 5,051 of 23,774 commands, 3.5 MB of 13.1 MB.
+// a deploy, a git or gh operation — and drops navigation. On the corpus that set
+// the first allowlist, roughly a fifth of command text was worth keeping (5k of
+// 24k); the list has since grown to cover more build and test toolchains
+// (bazel, jest, deno, sbt, cabal, zig, compilers) that were being dropped.
 //
 // The dropped ones are not merely cheap to store, they are actively bad to keep:
 // `cat internal/index/index.go` matches a query about the index and answers
@@ -459,8 +461,22 @@ func worthIndexing(cmd string) bool {
 	if strings.Contains(cmd, "\n") {
 		return false
 	}
-	return meaningfulCommand.MatchString(cmd) && !trivialCommand.MatchString(cmd)
+	// Judge each chained segment, not the whole string. `cd repo && go test` is
+	// a test run, not navigation — the leading `cd` must not sink it. Splitting
+	// on the shell operators also keeps `grep "go test" log` correctly dropped:
+	// its `go test` is an argument, not a segment of its own.
+	for _, seg := range commandChain.Split(cmd, -1) {
+		if meaningfulCommand.MatchString(seg) && !trivialCommand.MatchString(seg) {
+			return true
+		}
+	}
+	return false
 }
+
+// commandChain splits a shell line on the operators that separate commands, so
+// each side is judged on its own. Quoted operators are rare in real command
+// logs and splitting on them at worst keeps one more command than it should.
+var commandChain = regexp.MustCompile(`&&|\|\||;|\|`)
 
 // claudeCommands pulls the shell commands worth keeping out of a message.
 func claudeCommands(raw json.RawMessage) []string {
