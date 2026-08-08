@@ -832,6 +832,14 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 	}
 	var semantic bool
 	hits, semantic = maybeSemantic(dir, hits, o, os.Stderr)
+	if semantic {
+		// The lexical hits were scoped by the trust policy above, but the
+		// semantic tier reaches the whole sidecar and brings back sessions of
+		// its own — an imported peer's content the policy withholds from every
+		// other read path leaked straight through the embedding fallback. Scope
+		// the semantic hits the same way before they are shown.
+		hits, _ = policyFilterHitsCounted(policy.ActivationSearch, hits)
+	}
 	o.Semantic = semantic
 	// Policy scoping, reranking and the semantic tier all run after the cap, so
 	// the pre-cap count can no longer describe what is being returned. When
@@ -864,6 +872,13 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 		default:
 			printNoMatches(os.Stderr, dir, o.Query)
 		}
+	}
+	if o.Capped && len(hits) > 0 {
+		// The cap is silent everywhere else: 15 results look like the whole
+		// answer, and nothing says another N are waiting behind --all. deja
+		// narrates every other place the ladder hides a session, so it says
+		// this one too.
+		fmt.Fprintf(os.Stderr, "deja: showing %d of %d — add --all to see the rest\n", len(hits), o.Total)
 	}
 	search.Print(os.Stdout, hits, o)
 	return nil
@@ -1311,11 +1326,18 @@ func noteAmbiguousPrefix(dir, id, action string) {
 		return
 	}
 	// When the matches are the same id in different harnesses there is no
-	// longer prefix to reach for, and --harness is the only thing that
-	// separates them (#719).
+	// longer prefix to reach for, and naming the harness is the only thing
+	// that separates them (#719). The `harness:id` form is the one every
+	// command that resolves a selector accepts — show/last also take
+	// --harness, but promote/handoff/resume/share do not, so advising the
+	// flag sent those readers into "unknown flag --harness".
 	if hs := index.PrefixHarnesses(dir, id); len(hs) > 1 {
-		fmt.Fprintf(os.Stderr, "deja: %d sessions share the id %q — %s the most recent; use --harness %s\n",
-			len(hs), id, action, strings.Join(hs, "|"))
+		forms := make([]string, len(hs))
+		for i, h := range hs {
+			forms[i] = h + ":" + id
+		}
+		fmt.Fprintf(os.Stderr, "deja: %d sessions share the id %q — %s the most recent; name one as %s\n",
+			len(hs), id, action, strings.Join(forms, " or "))
 		return
 	}
 	// "A longer prefix" is not available when the reader copied an elided id
@@ -1494,6 +1516,14 @@ func parseSearch(args []string) (search.Options, error) {
 	args = splitEqualsForms(args)
 	for i := 0; i < len(args); i++ {
 		a := args[i]
+		if a == "--" {
+			// End of options: the rest is the query verbatim, even a word that
+			// spells a flag. Without this there is no way to search for the
+			// literal text of a flag name — `deja -- --json` kept parsing
+			// --json as the flag and left "--" stranded in the query.
+			q = append(q, args[i+1:]...)
+			break
+		}
 		switch a {
 		case "--json":
 			o.JSON = true

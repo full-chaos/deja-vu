@@ -125,7 +125,7 @@ func handleMCP(dir string, req rpcRequest) (any, int, string) {
 				"name":        "remember",
 				"description": "Store one durable decision or conclusion so a future session can recall it. Call right after a decision is settled, a tricky bug is resolved, or the user says 'remember this', 'note that for next time', 'don't forget we chose X'. Write a single self-contained fact (e.g. 'We use Postgres advisory locks for the job queue because Redis lost messages under load'). Do NOT store transcripts, routine conversation, or anything already obvious from the code. text is required; project defaults to notes.",
 				"annotations": map[string]any{"title": "Remember a decision", "readOnlyHint": false},
-				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string", "description": "A durable fact, decision, or conclusion to remember."}, "project": map[string]any{"type": "string", "description": "Optional project name; defaults to notes."}}, "required": []string{"text"}},
+				"inputSchema": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string", "description": "A durable fact, decision, or conclusion to remember."}, "project": map[string]any{"type": "string", "description": "Optional project name; defaults to notes."}, "tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Optional navigation tags, searchable as #tag."}}, "required": []string{"text"}},
 			},
 		}}, 0, ""
 	case "resources/list":
@@ -254,8 +254,9 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		return text, err
 	case "remember":
 		var a struct {
-			Text    string `json:"text"`
-			Project string `json:"project"`
+			Text    string   `json:"text"`
+			Project string   `json:"project"`
+			Tags    []string `json:"tags"`
 		}
 		if err := json.Unmarshal(raw, &a); err != nil {
 			return "", err
@@ -266,7 +267,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		if strings.TrimSpace(a.Project) == "" {
 			a.Project = "notes"
 		}
-		if err := notesWriteError(sources.AppendNote(a.Project, a.Text, time.Now())); err != nil {
+		if err := notesWriteError(sources.AppendNoteTagged(a.Project, a.Text, a.Tags, time.Now())); err != nil {
 			return "", err
 		}
 		if err := index.EnsureForSearch(dir, search.Options{All: true}, false, mcpProgress()); err != nil {
@@ -474,6 +475,12 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 	}
 	var semantic bool
 	hits, semantic = maybeSemantic(dir, hits, o, os.Stderr)
+	if semantic {
+		// The semantic tier reaches the whole sidecar, past the policy scoping
+		// the lexical hits already had; scope its hits too or an imported peer's
+		// content the policy withholds reaches the agent through recall.
+		hits, _ = policyFilterHitsCounted(policy.ActivationMCP, hits)
+	}
 	o.Semantic = semantic
 	if len(hits) == 0 {
 		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil
@@ -620,6 +627,9 @@ func recallContextResult(dir, q, harness string) (string, int, int64, []string, 
 	hits, semantic = maybeSemantic(dir, hits, o, os.Stderr)
 	if semantic {
 		o.Tier = search.TierSemantic
+		// Semantic hits skip the policy scoping the lexical ones got; apply it
+		// here too, or recall_context leaks a withheld imported session.
+		hits, _ = policyFilterHitsCounted(policy.ActivationMCP, hits)
 	}
 	if len(hits) == 0 {
 		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,14 +31,40 @@ func EnvPath(k, def string) string {
 func parseTimeAny(v any) time.Time {
 	switch x := v.(type) {
 	case string:
-		if t, err := time.Parse(time.RFC3339Nano, x); err == nil {
-			return t
+		// The field is always a timestamp, so try the layouts a store might
+		// have written it in before giving up. RFC3339 is the common one; the
+		// rest drop a piece it treats as optional — a missing zone, missing
+		// seconds, a space where the T should be — each of which used to lose
+		// the whole date to the zero time.
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			"2006-01-02T15:04:05",
+			"2006-01-02T15:04Z07:00",
+			"2006-01-02T15:04",
+			"2006-01-02 15:04:05Z07:00",
+			"2006-01-02 15:04:05",
+		} {
+			if t, err := time.Parse(layout, x); err == nil {
+				return t
+			}
+		}
+		// Some stores stringify the epoch ("1777629600", fractional or not),
+		// a bare number in a field that is always a timestamp.
+		if f, err := strconv.ParseFloat(x, 64); err == nil {
+			return unixGuess(int64(f))
 		}
 	case float64:
 		return unixGuess(int64(x))
 	case json.Number:
-		n, _ := x.Int64()
-		return unixGuess(n)
+		if n, err := x.Int64(); err == nil {
+			return unixGuess(n)
+		}
+		// A fractional epoch — Python's time.time() writes one — is a valid
+		// Number that Int64 rejects; without the Float64 fallback the whole
+		// turn lost its date to the zero time, and the session sorted as "-".
+		if f, err := x.Float64(); err == nil {
+			return unixGuess(int64(f))
+		}
 	}
 	return time.Time{}
 }
@@ -194,6 +221,19 @@ func scanJSONLFromOffset(path string, offset int64, fn func(map[string]any)) err
 	}
 }
 
+// keepRegular drops any path that is not a regular file. Discovery paths that
+// glob or list names (rather than walking DirEntries) use it so a FIFO or
+// socket matching the pattern cannot reach a parser's Open and block it.
+func keepRegular(paths []string) []string {
+	out := paths[:0]
+	for _, p := range paths {
+		if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func walkFiles(root string, pred func(string) bool) []string {
 	var out []string
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
@@ -207,7 +247,12 @@ func walkFiles(root string, pred func(string) bool) []string {
 			}
 			return nil
 		}
-		if d.Type()&os.ModeSymlink == 0 && !d.IsDir() && pred(p) {
+		// Only regular files. A FIFO or socket that matched the session glob
+		// hung the whole index: the parser's Open blocks on a named pipe with
+		// no writer and never returns, so one such file in a scanned store
+		// froze indexing for good. IsRegular already excludes symlinks and
+		// directories, so it subsumes the checks it replaces.
+		if d.Type().IsRegular() && pred(p) {
 			out = append(out, p)
 		}
 		return nil
