@@ -2,13 +2,15 @@ package main
 
 import (
 	"bytes"
-
+	"encoding/json"
 	"fmt"
-	"github.com/vshulcz/deja-vu/internal/index"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/vshulcz/deja-vu/internal/index"
 )
 
 // writeFilesFixture lays down a claude session that discusses one subject and
@@ -136,5 +138,101 @@ func TestFilesDistinguishesFilteredFromAbsent(t *testing.T) {
 	if !strings.Contains(out.String(), "none of them recorded a file") &&
 		!strings.Contains(out.String(), "no sessions mention") {
 		t.Fatalf("the empty case lost its wording:\n%s", out.String())
+	}
+}
+
+// `files` lists the paths a session opened, so a trust rule that withholds a
+// peer's content must hold here too — it read imported file paths aloud while
+// search, blame and restore all refused (#1026).
+func TestFilesCommandHonoursTrustPolicy(t *testing.T) {
+	repo := writeFilesFixture(t) // a local session touching retry.go under repo
+	cfg := filepath.Join(filepath.Dir(filepath.Dir(repo)), "config")
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	if _, err := captureRun(t, "index"); err != nil {
+		t.Fatal(err)
+	}
+	// A peer's session opened a file under the same repo, arriving by sync.
+	tmp := filepath.Dir(repo)
+	exp := filepath.Join(tmp, "transfer")
+	if err := os.MkdirAll(exp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Build the records with json.Marshal so the file path — which carries
+	// backslashes on Windows — is escaped, not hand-spliced into a raw string.
+	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	var peer []byte
+	for _, r := range []index.SyncRecord{
+		{Harness: "claude", SessionID: "peer", Project: "svc", Role: "user", Text: "the frobnicator retry loop, peer take", Time: at},
+		{Harness: "claude", SessionID: "peer", Project: "svc", Role: "files", Text: filepath.Join(repo, "peer_secret.go"), Time: at.Add(30 * time.Second)},
+	} {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		peer = append(peer, append(b, '\n')...)
+	}
+	if err := os.WriteFile(filepath.Join(exp, "deja-sync.jsonl"), peer, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureRun(t, "sync", "import", exp); err != nil {
+		t.Fatal(err)
+	}
+
+	writePolicy(t, `{"activations":{"search":{"imported":true}}}`)
+	if out, _ := captureRun(t, "files", "frobnicator", "retry"); !strings.Contains(out, "peer_secret.go") {
+		t.Fatalf("imported file did not surface under an allowing rule:\n%s", out)
+	}
+	writePolicy(t, `{"activations":{"search":{"imported":false}}}`)
+	out, _ := captureRun(t, "files", "frobnicator", "retry")
+	if strings.Contains(out, "peer_secret.go") {
+		t.Errorf("files leaked a peer's file path under deny-imported:\n%s", out)
+	}
+	if !strings.Contains(out, "retry.go") {
+		t.Errorf("files over-blocked the local session under deny-imported:\n%s", out)
+	}
+}
+
+// When the only session that mentions the topic is one a rule withholds,
+// `files` used to say "no sessions mention it" — looked-and-absent, when the
+// truth is the rule hid it. search and last already name the rule (#686, #680).
+func TestFilesCommandNamesTheTrustPolicyOnAnEmptyResult(t *testing.T) {
+	tmp := hermeticEnv(t)
+	cfg := filepath.Join(tmp, "config")
+	t.Setenv("XDG_CONFIG_HOME", cfg)
+	repo := filepath.Join(tmp, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The only match is an imported session; no local session mentions it.
+	exp := filepath.Join(tmp, "transfer")
+	if err := os.MkdirAll(exp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
+	var batch []byte
+	for _, r := range []index.SyncRecord{
+		{Harness: "claude", SessionID: "peer", Project: "svc", Role: "user", Text: "the frobnicator retry loop", Time: at},
+		{Harness: "claude", SessionID: "peer", Project: "svc", Role: "files", Text: filepath.Join(repo, "retry.go"), Time: at.Add(30 * time.Second)},
+	} {
+		b, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch = append(batch, append(b, '\n')...)
+	}
+	if err := os.WriteFile(filepath.Join(exp, "deja-sync.jsonl"), batch, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := captureRun(t, "sync", "import", exp); err != nil {
+		t.Fatal(err)
+	}
+
+	writePolicy(t, `{"activations":{"search":{"imported":false}}}`)
+	out, _ := captureRun(t, "files", "frobnicator", "retry")
+	if !strings.Contains(out, "trust policy") {
+		t.Errorf("files did not name the rule that emptied the result:\n%s", out)
+	}
+	if strings.Contains(out, "no sessions mention") {
+		t.Errorf("files still reads as looked-and-absent when a rule hid the match:\n%s", out)
 	}
 }
