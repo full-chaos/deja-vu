@@ -50,6 +50,8 @@ func main() {
 	skipAbs := flag.Bool("skip-abs", false, "skip abstention (_abs) questions, matching cleaned-dataset runs")
 	verbose := flag.Bool("v", false, "log per-question results")
 	dumpMisses := flag.String("dump-misses", "", "write a JSONL miss report (rank!=1) to this path")
+	precision := flag.Bool("precision", false, "measure false-positive recalls: pair each question's prompt with another question's haystack (no answer present) and report how often anything surfaces")
+	agentCases := flag.Int("agent-cases", 0, "dump N cases where the answer is in top-5 but not rank-1, for an agent-choice A/B")
 	flag.Parse()
 	evSum := map[int]float64{}
 	evN := 0
@@ -78,6 +80,14 @@ func main() {
 			}
 		}
 		questions = kept
+	}
+	if *precision {
+		runPrecision(questions)
+		return
+	}
+	if *agentCases > 0 {
+		runAgentCases(questions, *agentCases)
+		return
 	}
 	if *limit > 0 && len(questions) > *limit {
 		questions = questions[:*limit]
@@ -176,8 +186,10 @@ func main() {
 }
 
 type questionDetail struct {
-	tier  string
-	top10 []string
+	tier     string
+	top10    []string
+	topCount int
+	cands    []map[string]any
 	// evidence recall: how many of the question's answer sessions appear in
 	// the top-k, divided by how many exist — LongMemEval's official metric,
 	// stricter than any-hit on multi-evidence questions.
@@ -270,6 +282,9 @@ func runQuestion(q lmeQuestion) (int, questionDetail, time.Duration, error) {
 	elapsed := time.Since(t0)
 	hitCounts = append(hitCounts, len(ranked))
 	detail := questionDetail{tier: string(result.Tier)}
+	if len(hits) > 0 {
+		detail.topCount = hits[0].Count
+	}
 	if len(ranked) > 10 {
 		detail.top10 = ranked[:10]
 	} else {
@@ -278,6 +293,13 @@ func runQuestion(q lmeQuestion) (int, questionDetail, time.Duration, error) {
 	want := map[string]bool{}
 	for _, id := range q.AnswerSessionIDs {
 		want[id] = true
+	}
+	for i := 0; i < len(hits) && i < 5; i++ {
+		snip := ""
+		if len(hits[i].Snippets) > 0 {
+			snip = hits[i].Snippets[0]
+		}
+		detail.cands = append(detail.cands, map[string]any{"n": i + 1, "id": hits[i].Session.ID, "is_answer": want[hits[i].Session.ID], "snippet": snip})
 	}
 	detail.evRecall = map[int]float64{}
 	for _, k := range []int{1, 5, 10, 20} {
@@ -322,4 +344,107 @@ func pct(a, n int) float64 {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "longmemeval:", err)
 	os.Exit(1)
+}
+
+// runPrecision measures false-positive recalls. It pairs each question's prompt
+// with a DIFFERENT question's haystack, so the answer session is never present:
+// a well-behaved retrieval either returns nothing or only a low-confidence
+// (relevance-tier) guess. It reports how often anything surfaces at all, and how
+// often an exact/close tier fired — the recalls a reader is most likely to trust
+// and be misled by. Lower is better; this is the precision side the recall
+// numbers cannot see.
+func runPrecision(questions []lmeQuestion) {
+	n := len(questions)
+	if n < 2 {
+		fatal(fmt.Errorf("need at least 2 questions for precision pairing"))
+	}
+	var surfaced, exactish int
+	byTier := map[string]int{}
+	strengthHist := map[string]int{}
+	start := time.Now()
+	for i := range questions {
+		j := (i + 1) % n
+		hybrid := lmeQuestion{
+			QuestionID:        questions[i].QuestionID + "|hay:" + questions[j].QuestionID,
+			QuestionType:      questions[i].QuestionType,
+			Question:          questions[i].Question,
+			QuestionDate:      questions[i].QuestionDate,
+			HaystackDates:     questions[j].HaystackDates,
+			HaystackSessionID: questions[j].HaystackSessionID,
+			HaystackSessions:  questions[j].HaystackSessions,
+			AnswerSessionIDs:  nil,
+		}
+		_, detail, _, err := runQuestion(hybrid)
+		if err != nil {
+			fatal(fmt.Errorf("precision pair %d: %w", i, err))
+		}
+		if len(detail.top10) > 0 {
+			surfaced++
+			byTier[detail.tier]++
+			if detail.tier != "relevance" {
+				exactish++
+			}
+			switch {
+			case detail.topCount <= 1:
+				strengthHist["count<=1"]++
+			case detail.topCount <= 3:
+				strengthHist["count 2-3"]++
+			case detail.topCount <= 6:
+				strengthHist["count 4-6"]++
+			default:
+				strengthHist["count 7+"]++
+			}
+		}
+	}
+	fmt.Printf("LongMemEval-S · PRECISION (prompt_i × haystack_{i+1}, answer never present)\n")
+	fmt.Printf("pairs: %d · wall: %s\n\n", n, time.Since(start).Round(time.Second))
+	fmt.Printf("surfaced anything     %5d / %d = %.1f%%   (ideal: low)\n", surfaced, n, 100*float64(surfaced)/float64(n))
+	fmt.Printf("of those, exact/close %5d / %d = %.1f%%   (most misleading)\n", exactish, n, 100*float64(exactish)/float64(n))
+	fmt.Printf("\nby tier of the surfaced recall:\n")
+	for t, c := range byTier {
+		fmt.Printf("  %-12s %d\n", t, c)
+	}
+	fmt.Printf("\nstrength (match count) of the surfaced top hit:\n")
+	for _, k := range []string{"count<=1", "count 2-3", "count 4-6", "count 7+"} {
+		if strengthHist[k] > 0 {
+			fmt.Printf("  %-10s %d\n", k, strengthHist[k])
+		}
+	}
+}
+
+// runAgentCases dumps cases where deja found the answer session in the top 5 but
+// ranked it below #1 — exactly the cases a human/agent could rescue by choosing
+// among the excerpts. Each case prints the question and the five candidate
+// snippets (unlabelled), plus the 1-based position of the true answer for
+// scoring. This is the raw material for the "let the agent pick" A/B.
+func runAgentCases(questions []lmeQuestion, n int) {
+	dumped := 0
+	for _, q := range questions {
+		rank, detail, _, err := runQuestion(q)
+		if err != nil || rank < 2 || rank > 5 {
+			continue
+		}
+		answerN := 0
+		for _, c := range detail.cands {
+			if c["is_answer"] == true {
+				answerN = c["n"].(int)
+			}
+		}
+		if answerN == 0 {
+			continue
+		}
+		rec := map[string]any{
+			"question":   q.Question,
+			"type":       q.QuestionType,
+			"deja_rank":  rank,
+			"answer_pos": answerN,
+			"candidates": detail.cands,
+		}
+		b, _ := json.Marshal(rec)
+		fmt.Println(string(b))
+		dumped++
+		if dumped >= n {
+			return
+		}
+	}
 }
