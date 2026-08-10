@@ -117,7 +117,7 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 	// (IDF-weighted), rather than reconstructing an AND query — natural
 	// prompts are full of filler that poisons an AND. n=8 to leave room after
 	// excluding the current/too-fresh sessions.
-	ranked, matched, err := index.ProjectRelevant(dir, digest.ProjectNameCandidates(cwd), terms, 8)
+	ranked, matched, strong, err := index.ProjectRelevant(dir, digest.ProjectNameCandidates(cwd), terms, 8)
 	if err != nil || len(ranked) == 0 {
 		return nil
 	}
@@ -132,11 +132,15 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 		if !pol.Allows(policy.ActivationAuto, s.Project) {
 			continue
 		}
-		// matched counts only informative terms — ones rare enough in this
-		// corpus to identify something. One of those is a weak claim but a
-		// fair answer to a question that was actually asked, so it is served
-		// without the déjà vu line; two or more earn the announcement.
-		if matched[i] < 1 || (matched[i] < 2 && !hasIdentifierTerm(terms)) {
+		// matched counts informative terms; strong counts the rare ones — a
+		// term that identifies something on its own rather than merely beating
+		// the corpus average. Two informative terms earn the announcement. A
+		// single term is a weak claim, so it only injects when that term is
+		// strong: "pgbouncer" answers a question, "problem" does not, and this
+		// hook pays its cost on every message the user sends. Measured on
+		// cross-paired prompts whose answer is absent, the old bar injected on
+		// 94% of them; half of those rested on one ordinary word.
+		if matched[i] < 1 || (matched[i] < 2 && strong[i] < 1) {
 			continue
 		}
 		if matched[i] >= 2 {
@@ -180,12 +184,22 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 	// "You have been here" on the strength of one word teaches the user to
 	// ignore the line. The recall itself still goes in.
 	showLine := confident && dejaVuLineDue(dir)
-	digest := search.AutoRecallDigest(ss, promptHookBudget-recallFrameOverhead)
-	if strings.TrimSpace(digest) == "" {
-		return nil
+	// The payload is sized to the claim. Two informative terms is a real match
+	// and earns the digest; a single rare term is a hint, and a hint that costs
+	// a full digest on every message is most of what deja spends. The pointer
+	// keeps it discoverable — the agent learns there is history here and can
+	// ask for it — for 134 bytes against the 0.5-1.3 KB a real digest measures.
+	var body string
+	if confident {
+		body = search.AutoRecallDigest(ss, promptHookBudget-recallFrameOverhead)
+		if strings.TrimSpace(body) == "" {
+			return nil
+		}
+		body = promptHookLead + rejectedWarning + body + citationLine(ss[0])
+	} else {
+		body = weakRecallPointer(ss, terms) + rejectedWarning
 	}
-	lead := promptHookLead + rejectedWarning
-	out := frameRecall(lead + digest + citationLine(ss[0]))
+	out := frameRecall(body)
 	usage.RecordDigestTerms(dir, usage.KindDejaVu, out, len(ss), rawSize(ss), terms, sessionIDs(ss)...)
 	if plain {
 		fmt.Fprintln(stdout, out)
@@ -688,3 +702,29 @@ func sessionIDs(ss []model.Session) []string {
 }
 
 const promptHookLead = "deja found prior sessions matching this request. If one genuinely helps, use it and tell the user in one short line what deja-vu recalled; otherwise ignore silently.\n"
+
+// weakRecallPointer is what an unconfident match injects instead of a digest:
+// one line saying history exists and how to reach it. A single rare term is a
+// hint, not an answer, and this hook runs on every message — spending a full
+// digest on a hint is where most of deja's unprompted context cost went.
+// Naming the topic and the date is what makes the pointer worth following.
+func weakRecallPointer(ss []model.Session, terms []string) string {
+	if len(ss) == 0 {
+		return ""
+	}
+	s := ss[0]
+	topic := dejaVuTopic(s)
+	if topic == "" {
+		topic = strings.Join(terms, " ")
+	}
+	when := "earlier"
+	if !s.Updated.IsZero() {
+		when = search.RelativeDate(s.Updated)
+	}
+	more := ""
+	if len(ss) > 1 {
+		more = fmt.Sprintf(" (+%d more)", len(ss)-1)
+	}
+	return fmt.Sprintf("deja: this project has history on %q from %s%s — call recall with a specific token if it matters here.\n",
+		search.SafeLine(topic), when, more)
+}
