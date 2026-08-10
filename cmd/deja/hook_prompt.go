@@ -15,6 +15,7 @@ import (
 	"github.com/vshulcz/deja-vu/internal/digest"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/policy"
+	"github.com/vshulcz/deja-vu/internal/redact"
 
 	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/search"
@@ -411,7 +412,13 @@ func citationLine(s model.Session) string {
 	if title == "" {
 		title = s.Title
 	}
-	title = strings.TrimSpace(title)
+	// The digest body is display-safe (contextText strips it), but this title
+	// is pulled straight from a message or the stored title and appended to the
+	// same agent-facing block. An escape sequence or an invisible tag-block
+	// character in a hostile session's title would otherwise ride into the
+	// context unaltered — the injection the frame warns about, one layer down.
+	// Collapse whitespace too so a newline cannot split the one-line citation.
+	title = strings.Join(strings.Fields(redact.SafeForDisplay(title)), " ")
 	if len([]rune(title)) > 60 {
 		title = string([]rune(title)[:60]) + "…"
 	}
@@ -461,17 +468,54 @@ func rememberInjected(dir, sid string, ss []model.Session) {
 	if sid == "" {
 		return
 	}
-	f, err := os.OpenFile(dir+".hookseen", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	p := dir + ".hookseen"
+	// Past 1MB the dedup file used to stop writing entirely, which permanently
+	// broke dedup — the per-prompt hook then re-injected the same sessions turn
+	// after turn. Rotate instead: keep this session's own lines (so its dedup
+	// survives) plus the recent tail, then append. Rare (once per 1MB) and
+	// atomic, so concurrent hooks lose a few advisory entries at worst.
+	if fi, err := os.Stat(p); err == nil && fi.Size() > 1<<20 {
+		rotateHookseen(p, sid)
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	if fi, err := f.Stat(); err == nil && fi.Size() > 1<<20 {
-		return // advisory state; stop growing rather than rotate under a hook
-	}
 	for _, s := range ss {
 		fmt.Fprintf(f, "%s %s\n", sid, s.ID)
 	}
+}
+
+// rotateHookseen shrinks the dedup file to this session's lines plus the most
+// recent tail, written atomically so a concurrent hook never sees a torn file.
+func rotateHookseen(p, sid string) {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	lines := strings.Split(string(b), "\n")
+	// The tail budget is well under the 1MB cap so rotation is infrequent.
+	const tailLines = 4000
+	start := 0
+	if len(lines) > tailLines {
+		start = len(lines) - tailLines
+	}
+	var keep []string
+	prefix := sid + " "
+	for i, ln := range lines {
+		if ln == "" {
+			continue
+		}
+		if i >= start || strings.HasPrefix(ln, prefix) {
+			keep = append(keep, ln)
+		}
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.Join(keep, "\n")+"\n"), 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, p)
 }
 
 // dejaVuLineDue rate-limits the visible line: a déjà vu that fires every

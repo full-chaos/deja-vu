@@ -42,7 +42,7 @@ func LoadOpencode() []model.Session {
 }
 
 func LoadOpencodeMatching(q string) []model.Session {
-	where := fmt.Sprintf(" and lower(p.data) like '%%%s%%'", sqlEscape(strings.ToLower(q)))
+	where := fmt.Sprintf(" and lower(p.data) like '%%%s%%' escape '\\'", sqlEscape(sqlLikeEscape(strings.ToLower(q))))
 	ss, _ := ParseOpencodeDBWhere(OpencodeDB(), where, 5000)
 	return ss
 }
@@ -58,7 +58,7 @@ func LoadOpencodeSince(t time.Time) []model.Session {
 }
 
 func LoadOpencodePrefix(p string) []model.Session {
-	where := fmt.Sprintf(" and s.id like '%s%%'", sqlEscape(p))
+	where := fmt.Sprintf(" and s.id like '%s%%' escape '\\'", sqlEscape(sqlLikeEscape(p)))
 	ss, _ := ParseOpencodeDBWhere(OpencodeDB(), where, 0)
 	return ss
 }
@@ -130,7 +130,7 @@ func ParseOpencodeDBWhere(db, where string, limit int) ([]model.Session, error) 
 		`and json_extract(p.data,'$.tool')='bash')` +
 		` or (instr(substr(p.data,1,200),'"tool":"apply_patch"')>0 ` +
 		`and json_extract(p.data,'$.tool')='apply_patch'))` + where + ` order by s.id,m.time_created,p.id` + lim
-	cmd := exec.Command("sqlite3", "-json", db, q)
+	cmd := exec.Command("sqlite3", "-readonly", "-json", db, ".timeout 5000", q)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -223,9 +223,7 @@ func ParseOpencodeDBWhere(db, where string, limit int) ([]model.Session, error) 
 		if txt == "" {
 			continue
 		}
-		if len(txt) > 64*1024 {
-			txt = txt[:64*1024]
-		}
+		txt = capParsedMessage(txt)
 		t := parseTimeAny(r["pt"])
 		if t.IsZero() {
 			t = parseTimeAny(r["mt"])
@@ -251,7 +249,7 @@ func OpencodeCounts() (sessions, messages int, err error) {
 	if fi, e := os.Stat(OpencodeDB()); e != nil || fi.Size() == 0 {
 		return 0, 0, nil
 	}
-	cmd := exec.Command("sqlite3", OpencodeDB(), "select (select count(*) from session),(select count(*) from part where json_extract(data,'$.type')='text')")
+	cmd := exec.Command("sqlite3", "-readonly", OpencodeDB(), ".timeout 5000", "select (select count(*) from session),(select count(*) from part where json_extract(data,'$.type')='text')")
 	b, err := cmd.Output()
 	if err != nil {
 		return 0, 0, err
@@ -271,6 +269,18 @@ func OpencodeCounts() (sessions, messages int, err error) {
 // rejected the query, which the parsers then reported as an empty store.
 func sqlEscape(s string) string { return strings.ReplaceAll(s, "'", "''") }
 
+// sqlLikeEscape neutralises the LIKE wildcards % and _ (and the escape
+// character itself) so a search term is matched literally. The pattern must be
+// built with `escape '\'`; without this an id like `a_b` matched `axb` and a
+// query with a `%` degenerated into a full-table scan. The caller still runs
+// the result through sqlEscape for the surrounding quotes.
+func sqlLikeEscape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "%", `\%`)
+	s = strings.ReplaceAll(s, "_", `\_`)
+	return s
+}
+
 func str(v any) string { s, _ := v.(string); return s }
 func parseNestedTime(m map[string]any, k, sub string) time.Time {
 	if x, ok := m[k].(map[string]any); ok {
@@ -286,7 +296,7 @@ func ParseOpencodeNewest(db string) ([]model.Session, error) {
 	if fi, err := os.Stat(db); err != nil || fi.Size() == 0 {
 		return nil, nil
 	}
-	out, err := exec.Command("sqlite3", db, "select id from session order by time_created desc limit 1").Output()
+	out, err := exec.Command("sqlite3", "-readonly", db, ".timeout 5000", "select id from session order by time_created desc limit 1").Output()
 	if err != nil {
 		return nil, err
 	}

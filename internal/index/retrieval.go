@@ -72,7 +72,7 @@ func searchDetailedOnce(dir string, o query.Options) (SearchResult, error) {
 	if err != nil {
 		return SearchResult{}, fmt.Errorf("manifest: %w", err)
 	}
-	if !recordsIntact(dir, m) {
+	if !recordsReadable(dir, m) {
 		return SearchResult{}, fmt.Errorf("%w: records.bin size does not match the manifest (crash-truncated or uncommitted tail)", errCorruptIndex)
 	}
 	var posts []posting
@@ -285,9 +285,14 @@ func relevanceSearch(dir string, m Manifest, o query.Options) (SearchResult, err
 	if len(terms) < 2 {
 		return SearchResult{}, nil
 	}
-	metas, _, anyMatched, termsKnown, matched := relevantMetasCounts(dir, m, nil, terms, relevanceWindow, func(meta SessionMeta) bool {
+	metas, _, anyMatched, termsKnown, matched, rerr := relevantMetasCounts(dir, m, nil, terms, relevanceWindow, func(meta SessionMeta) bool {
 		return sessionMetaMatches(meta, o)
 	})
+	if rerr != nil {
+		// A corrupt or unreadable bucket: surface it so the recovery path
+		// rebuilds, rather than serving a silently short-ranked answer.
+		return SearchResult{}, rerr
+	}
 	if len(metas) == 0 {
 		return SearchResult{}, nil
 	}
@@ -382,7 +387,13 @@ func ProjectRelevant(dir string, projects, terms []string, n int) ([]model.Sessi
 	if err != nil {
 		return nil, nil, err
 	}
-	metas, matched := relevantMetasMatched(dir, m, projects, terms, n)
+	metas, matched, rerr := relevantMetasMatched(dir, m, projects, terms, n)
+	if rerr != nil {
+		// A corrupt or unreadable bucket. The hook never rebuilds, so surface
+		// it rather than inject a silently short-ranked déjà vu; the caller
+		// stays quiet on an error.
+		return nil, nil, rerr
+	}
 	if len(metas) == 0 {
 		return nil, nil, nil
 	}
@@ -393,9 +404,9 @@ func ProjectRelevant(dir string, projects, terms []string, n int) ([]model.Sessi
 	return out, matched, nil
 }
 
-func relevantMetasMatched(dir string, m Manifest, projects, terms []string, n int) ([]SessionMeta, []int) {
-	metas, informative, _, _, _ := relevantMetasCounts(dir, m, projects, terms, n, nil)
-	return metas, informative
+func relevantMetasMatched(dir string, m Manifest, projects, terms []string, n int) ([]SessionMeta, []int, error) {
+	metas, informative, _, _, _, err := relevantMetasCounts(dir, m, projects, terms, n, nil)
+	return metas, informative, err
 }
 
 // relevantMetasCounts additionally reports how many terms of ANY frequency
@@ -413,7 +424,12 @@ func relevantMetasMatched(dir string, m Manifest, projects, terms []string, n in
 // Returns, in order: the ranked metas, their informative-term counts, their
 // any-frequency term counts, how many query terms the corpus knows at all,
 // and that pre-truncation total.
-func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int, keep func(SessionMeta) bool) ([]SessionMeta, []int, []int, int, int) {
+func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int, keep func(SessionMeta) bool) ([]SessionMeta, []int, []int, int, int, error) {
+	// A real bucket read error (a corrupt or unreadable postings file) must not
+	// pass as "the term is absent": that silently drops the term from the
+	// ranking. Remember the first one and hand it back so the caller triggers
+	// the same self-heal the exact tier already does.
+	var readErr error
 	inProject := map[uint32]SessionMeta{}
 	for _, meta := range m.Sessions {
 		if keep != nil && !keep(meta) {
@@ -433,7 +449,7 @@ func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int
 		}
 	}
 	if len(inProject) == 0 {
-		return nil, nil, nil, 0, 0
+		return nil, nil, nil, 0, 0, nil
 	}
 	br := newBucketReader(dir)
 	defer br.close()
@@ -501,6 +517,9 @@ func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int
 			offs = map[uint32]map[int64]bool{}
 			for _, key := range orKeys {
 				posts, err := br.postings(key)
+				if err != nil && readErr == nil {
+					readErr = err
+				}
 				if err != nil || len(posts) == 0 {
 					continue
 				}
@@ -527,6 +546,9 @@ func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int
 		} else {
 			for _, key := range keys {
 				posts, err := br.postings(key)
+				if err != nil && readErr == nil {
+					readErr = err
+				}
 				if err != nil || len(posts) == 0 {
 					missed = true
 					break
@@ -658,7 +680,7 @@ func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int
 		ranked = append(ranked, scored{inProject[ord], sc, matchedTerms[ord], anyTerms[ord]})
 	}
 	if len(ranked) == 0 {
-		return nil, nil, nil, termsKnown, 0
+		return nil, nil, nil, termsKnown, 0, readErr
 	}
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].score != ranked[j].score {
@@ -685,7 +707,7 @@ func relevantMetasCounts(dir string, m Manifest, projects, terms []string, n int
 		matched = append(matched, r.matched)
 		anyMatched = append(anyMatched, r.any)
 	}
-	return metas, matched, anyMatched, termsKnown, matchedTotal
+	return metas, matched, anyMatched, termsKnown, matchedTotal, readErr
 }
 
 // loadSessionRecords materializes one session's transcript from the index.
@@ -722,7 +744,7 @@ func FirstMatch(dir string, queries []string, limit int) ([]model.Session, strin
 	if err != nil {
 		return nil, "", fmt.Errorf("manifest: %w", err)
 	}
-	if !recordsIntact(dir, m) {
+	if !recordsReadable(dir, m) {
 		return nil, "", fmt.Errorf("%w: records.bin size does not match the manifest (crash-truncated or uncommitted tail)", errCorruptIndex)
 	}
 	for _, q := range queries {
@@ -740,7 +762,10 @@ func FirstMatch(dir string, queries []string, limit int) ([]model.Session, strin
 			continue
 		}
 		ss, err := scanRecords(dir, m, o, postingOffsets(posts))
-		if err != nil || len(ss) == 0 {
+		if err != nil {
+			return nil, "", fmt.Errorf("records: %w", err)
+		}
+		if len(ss) == 0 {
 			continue
 		}
 		if len(ss) > limit {
@@ -1326,11 +1351,13 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 		}
 		defer func() { _ = f.Close() }()
 		offsets = sortedUniqueOffsets(offsets)
-		eachRecordAt(f, offsets, tablesFromManifest(m), func(r Record) {
+		if err := eachRecordAt(f, offsets, tablesFromManifest(m), func(r Record) {
 			if recordMatchesQueryVariants(r, o, variants) {
 				add(r)
 			}
-		})
+		}); err != nil {
+			return nil, err
+		}
 	} else {
 		if err := eachRecord(filepath.Join(dir, "records.bin"), tablesFromManifest(m), func(r Record) {
 			if recordMatchesQueryVariants(r, o, variants) {
@@ -1540,6 +1567,11 @@ func TermSessionCounts(dir string, terms []string) map[string]int {
 		key := "t" + t
 		posts, err := postingsFor(dir, key)
 		if err != nil {
+			// Best effort by design: this only decorates the "try fewer words"
+			// hint after a search that already returned. A term whose bucket
+			// will not read drops out of the advice rather than failing the
+			// command — a real corruption already surfaced on the search path
+			// that ran first.
 			continue
 		}
 		seen := map[uint32]bool{}
@@ -1625,7 +1657,14 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 		path := filepath.Join(dir, "buckets", de.Name())
 		entries, f, err := openBucketDir(path)
 		if err != nil {
-			continue
+			// The directory listing named this bucket, so a miss now means a
+			// concurrent rebuild swapped it out — tolerate that. Anything else
+			// (a corrupt header, a denied read) is real and is surfaced so the
+			// fuzzy tier does not silently under-match a damaged store.
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, nil, err
 		}
 		for _, e := range entries {
 			tok := strings.TrimPrefix(e.tok, "t")
@@ -1636,7 +1675,10 @@ func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, m
 				variants[b] = append(variants[b], tok)
 				buf := make([]byte, e.n)
 				if _, err := f.ReadAt(buf, int64(e.off)); err != nil {
-					continue
+					// The bucket directory validated but the block it points to
+					// will not read: corruption, not a missing token. Surface it.
+					f.Close()
+					return nil, nil, fmt.Errorf("%w: %v", errCorruptIndex, err)
 				}
 				for _, p := range decodePostings(buf) {
 					perTok[i][p.Off] = p

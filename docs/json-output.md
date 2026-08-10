@@ -233,7 +233,9 @@ the end returns an empty `messages` array and a `returned` count of zero.
     "injected_sessions": 3,
     "bytes": 40960,
     "injected_bytes": 12288,
-    "empty_result_rate": 0.1
+    "raw_bytes": 524288,
+    "empty_result_rate": 0.1,
+    "since": "2026-06-20T09:00:00Z"
   },
   "week_recalls": 2,
   "week_bytes": 4096,
@@ -247,6 +249,10 @@ the end returns an empty `messages` array and a `returned` count of zero.
 
 `spans` and `span_files` count the replaced spans `deja restore` can hand back
 and the files they belong to. Both are omitted when the index holds none.
+
+Inside `recall`, `raw_bytes` is the size of the source transcripts the served
+digests distilled and `since` is the oldest event still in the usage log; both
+are omitted when zero, so a store with no recall history yet shows neither.
 
 
 Optional fields are omitted when zero or empty — `sidecar_size`, for one,
@@ -263,7 +269,8 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
       "name": "claude",
       "state": "ok",
       "paths": ["/home/user/.claude/projects"],
-      "files": 12
+      "files": 12,
+      "indexed_sessions": 240
     }
   ],
   "index": {
@@ -290,18 +297,36 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
     "dim": 1536,
     "coverage": 87.5
   },
+  "policy": {
+    "state": "active",
+    "path": "/home/user/.config/deja/policy.toml",
+    "indexed_sessions": 240,
+    "activations": {
+      "search": {"rule": "allow all", "withheld": 0},
+      "mcp": {"rule": "allow all", "withheld": 0},
+      "auto": {"rule": "deny imported", "withheld": 3}
+    }
+  },
   "ingest_health": {
     "claude": {"malformed_lines": 0, "failed_files": 0}
   }
 }
 ```
 
-`embed` and `ingest_health` are omitted when unavailable. `index.path` points at
-the index directory; `index.db` is that directory's name, not a file. Store
-`state` values are `ok`, `missing`, `unreadable`, `parsed-zero`, `denied` (which
-adds a `denied` field naming the unreadable path), and `needs-sqlite3`; an
-existing but empty store directory reports `missing`. Version `state` is `ok`,
-`update-available`, `ahead`, `dev`, `offline` (under `--offline`), or `unknown`.
+`embed`, `ingest_health` and `deep` (present only under `--deep`) are omitted
+when unavailable; `policy` is always present. `index.path` points at the index
+directory; `index.db` is that directory's name, not a file. Store `state`
+values are `ok`, `missing`, `unreadable`, `parsed-zero`, `denied` (which adds a
+`denied` field naming the unreadable path), and `needs-sqlite3`; an existing but
+empty store directory reports `missing`. A store also carries `indexed_sessions`
+and, when it holds peer-synced work, `indexed_from_elsewhere`; a store whose
+permission walk was cut short or blocked carries `partial` or `unchecked`.
+Version `state` is `ok`, `update-available`, `ahead`, `dev`, `offline` (under
+`--offline`), or `unknown`. `policy.state` is `default`, `active` or
+`unreadable` (which adds an `error`); `activations` keys are `search`, `mcp` and
+`auto`, each with the rule in force and how many sessions it withheld;
+`ignored` and `inert` list policy lines that matched no harness or no import.
+Per-harness `ingest_health` may also carry `clipped_messages` and `last_error`.
 
 ## `deja blame <path> --json`
 

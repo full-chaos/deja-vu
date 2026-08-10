@@ -270,7 +270,12 @@ func eachRecordForKeys(path string, t *recordTables, want map[string]bool, fn fu
 		}
 		rec, derr := decodeRecord(b, t)
 		if derr != nil {
-			continue
+			// The record was fully framed (a valid length prefix, n bytes read),
+			// so a payload that will not decode is real corruption in the middle
+			// of the log, not the tolerated in-flight tail that the EOF branches
+			// above return nil for. Surface it like the length-cap check does so
+			// the read path rebuilds instead of silently dropping the message.
+			return fmt.Errorf("%w: %v", errCorruptIndex, derr)
 		}
 		fn(rec)
 	}
@@ -891,7 +896,7 @@ const (
 // calls fn for each one it could decode. Offsets that turn out to reach past
 // the span read for them fall back to a single read, so a long record costs
 // what it always did rather than forcing the span to grow.
-func eachRecordAt(f *os.File, offsets []int64, t *recordTables, fn func(Record)) {
+func eachRecordAt(f *os.File, offsets []int64, t *recordTables, fn func(Record)) error {
 	buf := make([]byte, 0, 64*1024)
 	for i := 0; i < len(offsets); {
 		j := i + 1
@@ -920,12 +925,25 @@ func eachRecordAt(f *os.File, offsets []int64, t *recordTables, fn func(Record))
 				fn(r)
 				continue
 			}
-			if r, err := readRecordAt(f, off, t); err == nil {
-				fn(r)
+			// decodeRecordIn only failed because the span did not hold the whole
+			// record, so re-read it on its own. This offset came from a committed
+			// posting, so it must resolve: a torn tail (EOF) is tolerated like the
+			// scan paths. Anything else is surfaced rather than dropping the
+			// message — readRecordAt already tags a corrupt record with
+			// errCorruptIndex and leaves a real IO error (a closed file, a denied
+			// read) as itself, so it is returned unwrapped and each keeps its kind.
+			r, err := readRecordAt(f, off, t)
+			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+					continue
+				}
+				return err
 			}
+			fn(r)
 		}
 		i = j
 	}
+	return nil
 }
 
 // decodeRecordIn decodes the record at rel inside an already-read span, and
