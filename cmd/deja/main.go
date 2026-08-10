@@ -574,7 +574,10 @@ func cmdCtx(dir string, rest []string) error {
 		o.FuzzyVariants = result.Variants
 	}
 	var hits []search.Hit
-	if result.Tier == search.TierRelevance {
+	if result.Tier == search.TierError {
+		fmt.Fprintln(os.Stderr, "deja: matched by error signature; showing the sessions that hit it")
+		hits = search.ErrorHits(ss)
+	} else if result.Tier == search.TierRelevance {
 		fmt.Fprintln(os.Stderr, "deja: no exact match; showing sessions ranked by relevance to the whole query")
 		hits = search.RelevanceHits(ss, index.RelevanceMatchTerms(o.Query))
 	} else if hits, err = search.Run(ss, o); err != nil {
@@ -810,7 +813,19 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 		o.FuzzyVariants = result.Variants
 	}
 	var hits []search.Hit
-	if result.Tier == search.TierRelevance {
+	switch result.Tier {
+	case search.TierError:
+		// A pasted error IS a match; ErrorHits keeps the ranking and the error
+		// neighbourhood the tier found. Re-scoring it as an ordinary run would
+		// zero it out — the word ladder already failed, which is why this tier
+		// fired at all.
+		fmt.Fprintln(os.Stderr, "deja: matched by error signature; showing the sessions that hit it")
+		hits = search.ErrorHits(ss)
+		o.Total, o.Capped = result.Total, result.Capped
+		if o.Total < len(hits) {
+			o.Total = len(hits)
+		}
+	case search.TierRelevance:
 		fmt.Fprintln(os.Stderr, "deja: no exact match; showing sessions ranked by relevance to the whole query")
 		hits = search.RelevanceHits(ss, index.RelevanceMatchTerms(o.Query))
 		// This tier ranks and truncates inside retrieval, so counting the
@@ -825,7 +840,7 @@ func runSearch(dir string, args []string, sourceInstance string) error {
 		if o.Total < len(hits) {
 			o.Total = len(hits)
 		}
-	} else {
+	default:
 		// RunDetailed rather than Run: the JSON envelope reports how many
 		// sessions matched before the cap, and that is not recoverable from a
 		// list the cap has already trimmed.
