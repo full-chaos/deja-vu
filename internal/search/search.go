@@ -845,6 +845,20 @@ func Print(w io.Writer, hits []Hit, o Options) {
 			}
 			fmt.Fprintln(w, note)
 		}
+		// Nobody sets the rejected state by hand, so the sessions that ended in
+		// a dead end look exactly like the ones that ended in an answer. When
+		// the transcript itself says something was backed out, say so — as
+		// evidence from the session, not as a state someone recorded. The
+		// wording is deliberately mild: a session that tried one thing, dropped
+		// it and found another is the most useful kind, so this flags an
+		// abandoned approach inside it, not the whole session as a dead end.
+		if h.Session.GaveUp && h.Lifecycle == "" {
+			note := "  mentions backing an approach out — one path here was abandoned"
+			if color {
+				note = cDim + note + cReset
+			}
+			fmt.Fprintln(w, note)
+		}
 		if h.Moved != "" {
 			note := h.Moved
 			if color {

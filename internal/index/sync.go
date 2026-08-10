@@ -858,6 +858,9 @@ func appendImportedRecords(dir string, m *Manifest, recsByKey map[string][]Recor
 		if hh := hitFromRecords(recsByKey[key]); len(hh) > 0 {
 			meta.Hit = hh
 		}
+		// And whether the session reports backing something out, so a peer's
+		// dead end arrives marked instead of reading like a live answer.
+		batchGaveUp := gaveUpFromRecords(recsByKey[key])
 		old := m.Sessions[key]
 		if old.ID != "" {
 			meta.Ord = old.Ord
@@ -875,7 +878,12 @@ func appendImportedRecords(dir string, m *Manifest, recsByKey map[string][]Recor
 			meta.Touched = mergeCappedStrings(old.Touched, meta.Touched, touchedFileCap)
 			meta.Asked = mergeCappedU64(old.Asked, meta.Asked, askedQuestionCap)
 			meta.Hit = mergeCappedU64(old.Hit, meta.Hit, frictionSessionCap)
+			// Same reason: a reversal reported in an earlier batch is not in
+			// this one, so OR with what the row already carried rather than
+			// letting a later batch clear the mark.
+			meta.GaveUp = old.GaveUp || batchGaveUp
 		} else {
+			meta.GaveUp = batchGaveUp
 			meta.Ord = nextOrd
 			nextOrd++
 		}

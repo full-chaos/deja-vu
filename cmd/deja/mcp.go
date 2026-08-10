@@ -628,6 +628,15 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 		if line := lifecycleLine(h); line != "" {
 			fmt.Fprintf(&b, "%s\n", line)
 		}
+		// A session that says it backed an approach out carries a signal the
+		// lifecycle states would carry if anyone set them by hand — on a real
+		// 1160-session store not one did. The wording tells the agent an
+		// approach inside was abandoned, not that the whole session is a dead
+		// end: the tried-then-fixed session is the most useful one, and the
+		// excerpts show which path was dropped.
+		if h.Session.GaveUp && h.Lifecycle == "" {
+			fmt.Fprintln(&b, "[this session abandoned one approach partway — check the excerpts for which, the rest may still hold]")
+		}
 		if h.Superseded != "" {
 			fmt.Fprintf(&b, "[earlier attempt — a newer session in this project covers the same ground, updated %s]\n", h.Superseded)
 		}
