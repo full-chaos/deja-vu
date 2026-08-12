@@ -122,8 +122,9 @@
      "source": "https://opencode.ai/docs/skills/"
     },
     "command": {
-     "state": "unknown",
-     "why": "not investigated yet"
+     "state": "todo",
+     "why": "reads markdown commands from ~/.config/opencode/commands/ and .opencode/commands/",
+     "source": "https://opencode.ai/docs/commands/"
     }
    }
   },
@@ -157,11 +158,11 @@
     },
     "skill": {
      "state": "unknown",
-     "why": "not investigated yet"
+     "why": "no source found either way; aider has no MCP client and no hooks, but that is not evidence about skills"
     },
     "command": {
      "state": "unknown",
-     "why": "not investigated yet"
+     "why": "aider documents a fixed built-in command set and no extension mechanism, but nothing states one cannot exist — needs a source before this is called a limit"
     }
    }
   },
@@ -233,8 +234,9 @@
      "source": "https://cursor.com/docs/skills"
     },
     "command": {
-     "state": "unknown",
-     "why": "not investigated yet"
+     "state": "todo",
+     "why": "reads markdown commands from .cursor/commands/",
+     "source": "https://cursor.com/docs/commands"
     }
    }
   },
@@ -262,8 +264,9 @@
    },
    "gaps": {
     "command": {
-     "state": "unknown",
-     "why": "not investigated yet"
+     "state": "todo",
+     "why": "reads commands from a commands/*.toml convention inside a plugin",
+     "source": "https://toolsbase.dev/en/reference/antigravity-cli-commands"
     }
    }
   },
@@ -331,8 +334,9 @@
    },
    "gaps": {
     "skill": {
-     "state": "unknown",
-     "why": "not investigated yet"
+     "state": "todo",
+     "why": "has a SKILL.md skills system; note a plugin-bundled skill is opt-in and absent from skills_list, so it would need to be a top-level skill to be found",
+     "source": "https://hermes-agent.nousresearch.com/docs/user-guide/features/skills"
     }
    }
   },
@@ -490,12 +494,14 @@
    },
    "gaps": {
     "skill": {
-     "state": "unknown",
-     "why": "not investigated yet"
+     "state": "todo",
+     "why": "watches skill roots and reloads on SKILL.md change",
+     "source": "https://docs.openclaw.ai/tools/skills"
     },
     "command": {
-     "state": "unknown",
-     "why": "not investigated yet"
+     "state": "todo",
+     "why": "a skill is invocable by its stable command name, so this follows from shipping one",
+     "source": "https://docs.openclaw.ai/tools/skills"
     }
    }
   },
