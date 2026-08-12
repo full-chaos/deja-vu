@@ -24,6 +24,8 @@ var readmeGuidanceNames = map[string]string{
 	"pi":          "pi",
 	"copilot":     "Copilot",
 	"cursor":      "Cursor",
+	"goose":       "Goose",
+	"openclaw":    "OpenClaw",
 	"hermes":      "Hermes",
 	"roo":         "Roo Code",
 	// Grok is named in its own sentence in the same paragraph, because the
