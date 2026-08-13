@@ -211,17 +211,10 @@
     "mcp": true,
     "auto": true,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": true,
     "handoff": "exec",
     "prereq": ""
-   },
-   "gaps": {
-    "command": {
-     "state": "todo",
-     "why": "reads commands from a commands/*.toml convention inside a plugin",
-     "source": "https://toolsbase.dev/en/reference/antigravity-cli-commands"
-    }
    }
   },
   {
@@ -312,16 +305,10 @@
     "mcp": true,
     "auto": true,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": true,
     "handoff": "exec",
     "prereq": "deja goose"
-   },
-   "gaps": {
-    "command": {
-     "state": "unknown",
-     "why": "not investigated yet"
-    }
    }
   },
   {
@@ -348,7 +335,8 @@
    "gaps": {
     "command": {
      "state": "unknown",
-     "why": "not investigated yet"
+     "why": "its docs say /skills lists skills you can invoke directly, which would make the skill deja installs the command surface — but /skills is rejected in non-interactive mode, so this needs an interactive session to confirm",
+     "source": "https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/"
     }
    }
   },
@@ -377,7 +365,8 @@
    "gaps": {
     "command": {
      "state": "unknown",
-     "why": "not investigated yet"
+     "why": "its docs describe invoking a skill as /skill:<name>, which would make deja's skill reachable without a command file; not confirmed against a running session",
+     "source": "https://moonshotai.github.io/kimi-code/docs/en/customization/skills.html"
     }
    }
   },
@@ -420,17 +409,10 @@
     "mcp": true,
     "auto": true,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": false,
     "handoff": "paste",
     "prereq": ""
-   },
-   "gaps": {
-    "command": {
-     "state": "todo",
-     "why": "a skill is invocable by its stable command name, so this follows from shipping one",
-     "source": "https://docs.openclaw.ai/tools/skills"
-    }
    }
   },
   {
