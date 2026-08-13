@@ -69,17 +69,10 @@
     "mcp": true,
     "auto": true,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": true,
     "handoff": "exec",
     "prereq": ""
-   },
-   "gaps": {
-    "command": {
-     "state": "impossible",
-     "why": "the Codex plugin format has no command component; interface.defaultPrompt is starter text, not a command",
-     "source": "https://developers.openai.com/plugins/build/plugins"
-    }
    }
   },
   {
@@ -131,16 +124,18 @@
    },
    "gaps": {
     "mcp": {
-     "state": "impossible",
-     "why": "aider has no MCP client; recall arrives through the read: context file it re-reads every message"
+     "state": "blocked",
+     "why": "aider has no MCP client. Not a design limit but an unimplemented feature: several open requests and an open PR adding it, so this becomes work the day they ship it. Until then recall reaches aider through the read: context file",
+     "source": "https://github.com/Aider-AI/aider/pull/5539"
     },
     "skill": {
      "state": "unknown",
-     "why": "no source found either way; aider has no MCP client and no hooks, but that is not evidence about skills"
+     "why": "no skills mechanism found and none requested beyond surfacing skills published elsewhere; aider offers no plugin surface deja could use, but nothing states it cannot"
     },
     "command": {
-     "state": "unknown",
-     "why": "aider documents a fixed built-in command set and no extension mechanism, but nothing states one cannot exist — needs a source before this is called a limit"
+     "state": "blocked",
+     "why": "the slash command set is built in; adding custom commands is an open feature request upstream, not something a third party can wire today",
+     "source": "https://github.com/Aider-AI/aider/issues/894"
     }
    }
   },
@@ -323,17 +318,10 @@
     "mcp": true,
     "auto": true,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": false,
     "handoff": "exec",
     "prereq": ""
-   },
-   "gaps": {
-    "command": {
-     "state": "unknown",
-     "why": "its docs say /skills lists skills you can invoke directly, which would make the skill deja installs the command surface — but /skills is rejected in non-interactive mode, so this needs an interactive session to confirm",
-     "source": "https://qwenlm.github.io/qwen-code-docs/en/users/features/skills/"
-    }
    }
   },
   {
@@ -353,17 +341,10 @@
     "mcp": true,
     "auto": true,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": true,
     "handoff": "exec",
     "prereq": ""
-   },
-   "gaps": {
-    "command": {
-     "state": "unknown",
-     "why": "its docs describe invoking a skill as /skill:<name>, which would make deja's skill reachable without a command file; not confirmed against a running session",
-     "source": "https://moonshotai.github.io/kimi-code/docs/en/customization/skills.html"
-    }
    }
   },
   {
@@ -427,7 +408,7 @@
     "mcp": true,
     "auto": false,
     "skill": true,
-    "command": false,
+    "command": true,
     "resume": true,
     "handoff": "exec",
     "prereq": ""
@@ -436,10 +417,6 @@
     "auto": {
      "state": "impossible",
      "why": "Copilot runs the hooks but drops their context, so recall there is MCP plus the skill"
-    },
-    "command": {
-     "state": "unknown",
-     "why": "not investigated yet"
     }
    }
   },
@@ -469,7 +446,8 @@
    "gaps": {
     "auto": {
      "state": "unknown",
-     "why": "not investigated yet"
+     "why": "Roo's docs enumerate skills, slash commands, modes, auto-approve and the orchestrator, and have no hooks page — /features/hooks is a 404. Without a lifecycle hook there is nowhere to put a per-session recall, so this may be a limit rather than work; absence from the docs is not proof, and nobody has asked them",
+     "source": "https://roocodeinc.github.io/Roo-Code/"
     }
    }
   }
