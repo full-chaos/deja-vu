@@ -2387,12 +2387,15 @@ func indexKeys(s string) []string {
 	for _, part := range identifierParts(s) {
 		out = append(out, "t"+part)
 	}
-	for _, bg := range cjkBigrams(s) {
-		// Fold Traditional to Simplified so the same word written either way
-		// lands on one key and a query in one script reaches content in the
-		// other. Folding only the key keeps the stored text untouched.
-		out = append(out, "t"+cjkfold.String(bg))
-	}
+	// Bigram keys fold Traditional to Simplified so the same word written
+	// either way lands on one key and a query in one script reaches content in
+	// the other. Folding only the key keeps the stored text untouched. The
+	// emitter folds runs in place and dedupes folded pairs — cheaper than
+	// folding each emitted bigram, and every caller collapses repeated keys
+	// anyway (#492).
+	cjkIndexKeys(s, func(tok string) {
+		out = append(out, tok)
+	})
 	return out
 }
 
@@ -2538,19 +2541,6 @@ func recordMatchesQueryVariants(r Record, o query.Options, variants map[string][
 // and Greek token in the corpus landed in the single bucket "t_". Each lookup
 // then had to scan the whole non-ASCII vocabulary. Sharding by runes keeps
 // ASCII bucket names exactly as they were and spreads the rest over 256.
-func bucket(tok string) string {
-	runes := []rune(tok)
-	if len(runes) >= 2 && isShardASCII(runes[0]) && isShardASCII(runes[1]) {
-		return safe(string(runes[:2]))
-	}
-	if len(runes) > 3 {
-		runes = runes[:3]
-	}
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(string(runes)))
-	return fmt.Sprintf("x%02x", h.Sum32()%256)
-}
-
 // isShardASCII reports whether a rune is one byte wide, so slicing it cannot
 // split a multi-byte sequence.
 func isShardASCII(r rune) bool { return r < 128 }
