@@ -3,7 +3,13 @@ name: CI
 on:
   push:
     branches: [main]
+  # `labeled` is here because the windows leg is opt-in per pull request below,
+  # and the default trigger set does not include it: labelling a PR would have
+  # done nothing until someone happened to push another commit, which is the
+  # worst kind of switch — one that looks connected.
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
   schedule:
     - cron: '17 5 * * 1'   # weekly canary against fresh runner images
 
@@ -18,21 +24,41 @@ jobs:
   test:
     name: test / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    # windows runs the suite about four times slower than the others and had
-    # grown into the 20-minute cap: the run was cancelled a second after the
-    # last package passed.
+    # windows runs the suite about ten times slower than the others; the cap is
+    # what turns a slow run into a cancellation that prints no test output.
     timeout-minutes: 30
+    env:
+      # Whether this leg does real work. The windows runner needs twenty-odd
+      # minutes for a job the others finish in two, and it varies by a third
+      # between identical runs, which is what tipped it over the cap and
+      # produced cancellations that looked like hangs. Caching the build and
+      # excluding it from Defender were both measured and neither helped
+      # (#1229), so it comes off the per-commit path instead.
+      #
+      # It still runs on every push to main, on the weekly canary, on demand,
+      # and on a pull request labelled `windows` — which is how a fix like
+      # #1239 gets checked on the platform it is about.
+      #
+      # The leg is skipped from the inside rather than dropped from the matrix,
+      # so `test / windows-latest` still reports and stays a required check.
+      # Dropping it from the matrix would leave every unlabelled PR waiting on
+      # a check that never arrives.
+      FULL: ${{ matrix.os != 'windows-latest' || github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'windows') }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.FULL == 'true'
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        if: env.FULL == 'true'
         with:
           go-version: '1.25.x'
       - run: go mod verify
+        if: env.FULL == 'true'
       - run: go vet ./...
+        if: env.FULL == 'true'
       # -timeout below the job's own patience: a hung test then dies with every
       # goroutine's stack in the log, instead of the runner sitting on it until
       # the queue times out and the log says only "go test -race" (#838). Raised
@@ -46,9 +72,25 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
       - run: go test -race -timeout 12m ./...
-        if: runner.os != 'Linux'
+        if: runner.os == 'macOS'
+        shell: bash
+      # Windows runs the suite without -race. Of that leg's 26m17s, the tests
+      # themselves were 5m16s and the other twenty minutes were compiling
+      # race-instrumented objects — measured, not assumed (#1229). Two things
+      # were tried first and neither moved it: rotating the build cache made it
+      # slower, and excluding the build from Defender bought about a minute,
+      # which is noise. The runner is simply that slow at this.
+      #
+      # Nothing is lost by dropping it here. Go's race detector finds races in
+      # the scheduler's memory model, not in the operating system, so the same
+      # race is caught on the linux and macOS legs above. Windows is in this
+      # matrix for paths, file locking and case rules, and plain `go test`
+      # exercises every one of those.
+      - run: go test -timeout 12m ./...
+        if: runner.os == 'Windows' && env.FULL == 'true'
         shell: bash
       - run: go build ./cmd/deja
+        if: env.FULL == 'true'
       - name: Benchmark lexical recall floor
         if: matrix.os == 'ubuntu-latest'
         shell: bash
