@@ -74,28 +74,41 @@ func handoffMark(kind string) string {
 
 func markdownTable(r registry) string {
 	var b strings.Builder
-	b.WriteString("| Harness | Store | MCP recall | Auto-recall | Skill | Command | Resume | Handoff | Needs |\n")
-	b.WriteString("| --- | --- | :-: | :-: | :-: | :-: | :-: | :-: | --- |\n")
+	// No Store column here. The glob paths are four lines deep for some
+	// harnesses and they turned the widest table on the front page into one
+	// that scrolls sideways. They are reference material, so they live on the
+	// reference page, which is the HTML table below.
+	// The list answers the only question most readers have here — is my agent in
+	// it — and the grid answers the one a few of them have next, so the grid
+	// folds rather than spending seventeen rows of the front page on it.
+	names := make([]string, 0, len(r.Harnesses))
+	for _, e := range r.Harnesses {
+		if e.ID != "deja" {
+			names = append(names, e.DisplayName)
+		}
+	}
+	fmt.Fprintf(&b, "%s.\n\n", strings.Join(names, " &middot; "))
+	b.WriteString("<details>\n<summary>What each one supports</summary>\n\n")
+	b.WriteString("| Harness | MCP recall | Auto-recall | Skill | Command | Resume | Handoff | Needs |\n")
+	b.WriteString("| --- | :-: | :-: | :-: | :-: | :-: | :-: | --- |\n")
 	for _, e := range r.Harnesses {
 		if e.ID == "deja" {
 			continue
 		}
-		quoted := make([]string, 0, len(e.StorePaths))
-		for _, sp := range e.StorePaths {
-			quoted = append(quoted, "`"+sp+"`")
-		}
-		store := strings.Join(quoted, "<br>")
 		prereq := e.Capabilities.Prereq
 		if prereq == "" {
 			prereq = "—"
 		}
-		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
-			e.DisplayName, store, gapMark(e, "mcp", e.Capabilities.MCP), gapMark(e, "auto", e.Capabilities.Auto),
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | %s | %s | %s |\n",
+			e.DisplayName, gapMark(e, "mcp", e.Capabilities.MCP), gapMark(e, "auto", e.Capabilities.Auto),
 			gapMark(e, "skill", e.Capabilities.Skill), gapMark(e, "command", e.Capabilities.Command),
 			gapMark(e, "resume", e.Capabilities.Resume), handoffMark(e.Capabilities.Handoff), prereq)
 	}
 	b.WriteString("\n✅ works &middot; — possible, not built yet &middot; ✕ the harness has no such mechanism &middot; ⚠ blocked by an upstream bug &middot; ? not investigated\n")
-	b.WriteString(notes(r, func(s string) string { return "`" + s + "`" }, func(s string) string { return s }))
+	// The per-gap notes name upstream PRs and issue numbers. That is real work
+	// and worth publishing, but on a front page it reads as a maintainer's
+	// notebook, so it goes to the reference page only.
+	b.WriteString("\n</details>\n")
 	return b.String()
 }
 
