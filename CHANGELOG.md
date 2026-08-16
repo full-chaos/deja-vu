@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [0.17.2] - 2026-08-16
+
+A question asked in plain words is answered better, and by how much is measured
+rather than argued: hit@5 over a 1910-session corpus went from 28/40 to 31/40
+with longmemeval unmoved. Three changes earned that; two more were tried, failed
+to earn it, and are not here.
+
+### Added
+- The first-minute benchmark reports where an answer landed, not only whether it cleared a threshold. Once every answer is inside the window the counters that used to move stop moving, and a change lifting eight answers from rank 30 to rank 7 shows up in none of them. (#1260)
+- The MCP tool list has a budget, because it is the one part of the surface every session pays for whether or not deja is used, and nothing was watching it. (#1260)
+
+### Changed
+- Satisfying the strict word-for-word match is worth a fixed number of places rather than the whole front of the answer. On a large history that match is usually one incidental session, and it led regardless of what the ranking made of it. (#1265)
+- The ranking scores the whole question and its rare part separately and takes the better of the two, at a price. "How many bikes do I own" ranks on `many`, `bikes` and `own`, and the session that answers it holds only the rare one. (#1266)
+- The excerpt under a result is the message that earned the rank, chosen with the ranking's own term weights rather than by counting words one each. It is the whole of what an agent reads before deciding whether a result is worth anything. (#1264, #1267)
+- The mark is a cat that breathes, blinks through its eyelid, and now and then gathers itself and hops. (#1254, #1256, #1257, #1258, #1259)
+- The site is repainted in the brand's colours, reads on a phone, and the home page has a rhythm and somewhere to land. (#1249, #1250, #1251)
+
+### Fixed
+- One decisive word is a match. A session holding the single rare word of a question was sorted behind every session holding two common ones before scoring had a say — rank 46 of 50 on the question that named the problem. (#1261)
+- The relevance tier no longer serves what exact search hides. It never scanned records, so `--role=user` could come back holding assistant text, and an ordinary recall could be carried by a file list or a command. (#1263)
+- Proximity is measured across the tightest window rather than between the first mention of each word, which is nearly the opposite of measuring it. (#1268)
+- `deja doctor` had codex's hook backwards in both directions: a working hook read "untrusted", and one codex had never been shown — where it silently runs nothing, `codex exec` included — read "wired". (#1262)
+- The stats card no longer prints a line out of the reader's own history onto an image made for sharing. (#1252)
+
+
 ## [0.17.1] - 2026-08-14
 
 Four harnesses were being handed memory chosen before the user had typed
