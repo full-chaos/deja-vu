@@ -1,90 +1,234 @@
+/* The guide pages, in the language the home page settled on.
+   Sans for what you read, mono for what you run. They were monospace from the
+   heading to the footnote, which is why they had no hierarchy — and their link
+   hovers still glowed the phosphor green of the old identity, in rgba shadows
+   the palette swap could not reach because they were not tokens. */
 :root{
-  --bg:#050807;
-  --ph:#4af08b;
-  --ph-hi:#8affc0;
-  --ph-dim:#2f9459;
-  --amber:#ffb454;
-  --body:#a9cbb6;
-  --faint:#5d8a6e;
-  --line:#12291c;
-  --panel:#070d0a;
+  --bg:#0b0f10;
+  --panel:#12171a;
+  --panel-2:#161c1f;
+  --line:#1e262a;
+  --ph:#8787af;          /* coat: the primary */
+  --ph-hi:#afafd7;
+  --ph-dim:#5f5f87;
+  --amber:#ff8700;
+  --ink:#f4f7f7;
+  --body:#c4cdcf;
+  --faint:#6b7a80;
   --mono:"Berkeley Mono","SF Mono","JetBrains Mono","Fira Code",Menlo,Consolas,monospace;
+  --sans:"Inter","SF Pro Display",-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,sans-serif;
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html{scroll-behavior:smooth}
-body{background:var(--bg);color:var(--body);font:15px/1.7 var(--mono);-webkit-font-smoothing:antialiased}
-::selection{background:#1c5c38;color:#eafff2}
-a{color:var(--ph);text-decoration:none}
-a:hover{color:var(--ph-hi);text-shadow:0 0 8px rgba(74,240,139,.45)}
-code{font-family:var(--mono);font-size:.92em}
+body{background:var(--bg);color:var(--body);font:16.5px/1.72 var(--sans);
+  -webkit-font-smoothing:antialiased}
+::selection{background:#3a3a5c;color:var(--ink)}
+/* No underline by default — the old rule had one and dropping it underlined the
+   nav, the sidebar and the brand. Prose links keep it, because in a paragraph
+   the underline is what makes a link findable. */
+a{color:var(--ph-hi);text-decoration:none}
+a:hover{color:var(--ink)}
+.doc article p a,.doc article li a{text-decoration:underline;
+  text-decoration-color:var(--ph-dim);text-underline-offset:3px}
+.doc article p a:hover,.doc article li a:hover{text-decoration-color:var(--ink)}
+code{font-family:var(--mono);font-size:.88em}
 
-/* CRT overlay reuses the .glow div every page already has */
-.glow{position:fixed;inset:0;pointer-events:none;z-index:60;
-  background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.14) 2px 3px)}
-.glow::after{content:"";position:fixed;inset:0;
-  background:radial-gradient(ellipse 130% 100% at 50% 45%,transparent 55%,rgba(0,0,0,.4) 100%)}
+/* The texture is the grid the sprite is drawn on, blown up until it is nearly
+   not there. It replaces the CRT scanlines, which belonged to the terminal the
+   site used to pretend to be. */
+.glow{position:fixed;inset:0;pointer-events:none;z-index:0;
+  background-image:linear-gradient(var(--line) 1px,transparent 1px),
+                   linear-gradient(90deg,var(--line) 1px,transparent 1px);
+  background-size:48px 48px;opacity:.35;
+  -webkit-mask-image:radial-gradient(ellipse 90% 50% at 50% 0%,#000 10%,transparent 65%);
+  mask-image:radial-gradient(ellipse 90% 50% at 50% 0%,#000 10%,transparent 65%)}
 
-.wrap{max-width:1000px;margin:0 auto;padding:0 22px;position:relative;z-index:1}
-nav{display:flex;align-items:center;gap:16px;padding:12px 22px;max-width:1000px;margin:0 auto;position:relative;z-index:2;border-bottom:1px solid var(--line);font-size:.85rem}
-nav .brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--ph);text-shadow:0 0 10px rgba(74,240,139,.35)}
-nav .brand:hover{text-decoration:none;color:var(--ph-hi)}
-nav .brand img{width:22px;height:22px}
+.wrap{max-width:1060px;margin:0 auto;padding:0 32px;position:relative;z-index:1}
+
+nav{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:6px;
+  padding:16px 32px;max-width:1060px;margin:0 auto;font:13px/1 var(--mono);
+  backdrop-filter:blur(8px);background:rgba(11,15,16,.72)}
+nav .brand{display:flex;align-items:center;gap:10px;font-weight:600;color:var(--ink)}
+nav .brand img{width:26px;height:26px}
 nav .spacer{flex:1}
-nav a.lnk{color:var(--faint)}
-nav a.lnk:hover{color:var(--ph);text-decoration:none}
-nav a.lnk[aria-current]{color:var(--ph)}
-.btn{display:inline-block;padding:9px 18px;font-size:.88rem;border:1px solid var(--line);color:var(--ph)}
-.btn:hover{text-decoration:none;border-color:var(--ph-dim);text-shadow:0 0 8px rgba(74,240,139,.45)}
-.btn.primary{background:var(--panel);border-color:var(--ph-dim)}
+nav a.lnk{color:var(--faint);padding:7px 10px;border-radius:6px}
+nav a.lnk:hover{color:var(--ink);background:var(--panel)}
+nav a.lnk[aria-current]{color:var(--ph-hi)}
+.btn{display:inline-block;padding:8px 14px;border-radius:7px;font:600 13px var(--mono);
+  background:var(--ph);color:var(--bg);border:0}
+.btn:hover{background:var(--ph-hi);color:var(--bg)}
 
-h1{font-size:1.5rem;line-height:1.3;font-weight:700;color:#d7f5e2}
-h2{font-size:1.05rem;margin:0 0 8px;color:var(--ph);text-shadow:0 0 7px rgba(74,240,139,.3);font-weight:700}
-h3{font-size:.95rem;margin:0 0 6px;color:#d7f5e2}
-p{margin:0 0 14px}
+h1{font:700 clamp(30px,3.6vw,40px)/1.15 var(--sans);letter-spacing:-.024em;color:var(--ink)}
+h2{font:700 21px/1.3 var(--sans);letter-spacing:-.015em;color:var(--ink)}
+h3{font:600 16.5px var(--sans);color:var(--ink);margin:0 0 6px}
+p{margin:0 0 16px}
 .grad{color:var(--amber)}
+
 .js .reveal{opacity:0;transform:translateY(10px);transition:opacity .5s ease,transform .5s ease}
 .js .reveal.in{opacity:1;transform:none}
 @media(prefers-reduced-motion:reduce){.reveal{opacity:1;transform:none;transition:none}}
-footer{border-top:1px solid var(--line);margin-top:90px;padding:30px 0;color:var(--faint);font-size:.82rem}
+
+footer{border-top:1px solid var(--line);margin-top:96px;padding:32px 0 56px;
+  color:var(--faint);font:12.5px var(--mono)}
 footer a{color:var(--faint)}
-footer a:hover{color:var(--ph)}
+footer a:hover{color:var(--ph-hi)}
 
-/* docs layout */
-.doc{display:grid;grid-template-columns:212px 1fr;gap:44px;padding:34px 0 0}
-.doc aside{position:sticky;top:20px;align-self:start;font-size:.85rem}
-.doc aside .grp{color:#3d5c4a;text-transform:uppercase;letter-spacing:.12em;font-size:.68rem;margin:18px 0 7px}
-.doc aside a{display:block;color:var(--faint);padding:3px 0;white-space:pre}
-.doc aside a::before{content:"  "}
-.doc aside a:hover{color:var(--ph);text-decoration:none}
-.doc aside a[aria-current]{color:var(--ph)}
-.doc aside a[aria-current]::before{content:"> "}
-.doc article{min-width:0}
-.doc article h1{margin-bottom:10px}
-.doc article h1::before{content:"$ ";color:var(--faint)}
-.doc article h2{margin-top:36px;padding-top:6px}
-.doc article h2::before{content:"## ";color:var(--faint);font-weight:400}
-.doc article ul,.doc article ol{margin:0 0 14px 22px}
-.doc article li{margin:5px 0}
-.doc article li::marker{color:var(--faint)}
-.doc article pre{background:var(--panel);border:1px solid var(--line);padding:14px 16px;overflow-x:auto;margin:0 0 16px;font-family:var(--mono);font-size:.85rem;line-height:1.6;color:var(--ph);box-shadow:inset 0 0 30px rgba(74,240,139,.03)}
-.doc article :not(pre)>code{color:var(--ph);background:var(--panel);border:1px solid var(--line);padding:1px 6px}
-.doc article table{width:100%;border-collapse:collapse;margin:0 0 16px;font-size:.85rem;display:block;overflow-x:auto}
-.doc article th,.doc article td{border:1px solid var(--line);padding:7px 11px;text-align:left}
-.doc article th{background:var(--panel);color:var(--faint);font-weight:400;text-transform:uppercase;font-size:.72rem;letter-spacing:.1em}
-.doc article img{max-width:100%;border:1px solid var(--line)}
-.note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);padding:12px 16px;margin:0 0 16px;font-size:.88rem}
-.term-shot{border:1px solid var(--line);background:var(--panel);padding:8px;margin:0 0 16px}
-.term-shot img{display:block;width:100%;border:none}
-.term-shot .cap{color:#3d5c4a;font-size:.76rem;padding:8px 6px 2px}
-@media(max-width:760px){.doc{grid-template-columns:1fr;gap:20px}.doc aside{position:static}}
+/* ── the doc layout ───────────────────────────────────────────────────── */
+.doc{display:grid;grid-template-columns:224px 1fr;gap:56px;padding:40px 0 0}
+.doc aside{position:sticky;top:76px;align-self:start;font:13.5px var(--mono)}
+.doc aside .grp{color:var(--faint);text-transform:uppercase;letter-spacing:.14em;
+  font-size:10.5px;margin:22px 0 8px;opacity:.75}
+.doc aside a{display:block;color:var(--faint);padding:5px 10px;border-radius:6px;
+  border-left:2px solid transparent}
+.doc aside a:hover{color:var(--ink);background:var(--panel)}
+.doc aside a[aria-current]{color:var(--ph-hi);border-left-color:var(--ph);background:var(--panel)}
+.doc article{min-width:0;max-width:74ch}
 
-/* guide ergonomics */
-.pre-wrap{position:relative;margin:0 0 16px}
+/* The prompt before the title stays: it is a terminal tool, and the mark of one
+   costs a heading nothing. The ## before every h2 did not — at one per section
+   it read as noise rather than as a joke. */
+.doc article h1{margin-bottom:14px}
+.doc article h1::before{content:"$ ";color:var(--faint);font-family:var(--mono);
+  font-size:.62em;font-weight:400;vertical-align:.22em}
+.doc article h2{margin:52px 0 14px}
+.doc article ul,.doc article ol{margin:0 0 16px 22px}
+.doc article li{margin:7px 0}
+.doc article li::marker{color:var(--ph-dim)}
+.doc article pre{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:16px 18px;overflow-x:auto;margin:0 0 18px;font-family:var(--mono);
+  font-size:13.5px;line-height:1.65;color:var(--ph-hi)}
+.doc article :not(pre)>code{color:var(--ph-hi);background:var(--panel);
+  border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+.doc article table{width:100%;border-collapse:collapse;margin:0 0 18px;
+  font:13.5px var(--mono);display:block;overflow-x:auto}
+.doc article th,.doc article td{border:1px solid var(--line);padding:9px 13px;text-align:left}
+.doc article th{background:var(--panel);color:var(--faint);font-weight:400;
+  text-transform:uppercase;font-size:10.5px;letter-spacing:.12em}
+.doc article img{max-width:100%;border:1px solid var(--line);border-radius:10px}
+
+.note{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);
+  border-radius:0 10px 10px 0;padding:14px 18px;margin:0 0 18px;font-size:15px}
+.term-shot{border:1px solid var(--line);border-radius:12px;background:var(--panel);
+  padding:10px;margin:0 0 18px}
+.term-shot img{display:block;width:100%;border:none;border-radius:6px}
+.term-shot .cap{color:var(--faint);font:12px var(--mono);padding:10px 6px 2px}
+
+@media(max-width:860px){
+  .doc{grid-template-columns:1fr;gap:24px}
+  .doc aside{position:static}
+  .doc article{max-width:none}
+}
+
+/* ── ergonomics ───────────────────────────────────────────────────────── */
+.pre-wrap{position:relative;margin:0 0 18px}
 .pre-wrap pre{margin:0}
-.pre-copy{position:absolute;top:8px;right:8px;background:var(--bg);border:1px solid var(--line);color:var(--faint);font:inherit;font-size:.72rem;padding:3px 10px;cursor:pointer;opacity:0;transition:opacity .15s}
+.pre-copy{position:absolute;top:10px;right:10px;background:var(--bg);border:1px solid var(--line);
+  border-radius:6px;color:var(--faint);font:11px var(--mono);padding:4px 10px;cursor:pointer;
+  opacity:0;transition:opacity .15s}
 .pre-wrap:hover .pre-copy,.pre-copy:focus{opacity:1}
-.pre-copy:hover{color:var(--ph);border-color:var(--ph-dim)}
-.hlink{opacity:0;color:var(--faint);font-weight:400}
+.pre-copy:hover{color:var(--ink);border-color:var(--ph-dim)}
+.hlink{opacity:0;color:var(--faint);font-weight:400;font-size:.7em}
 h2:hover .hlink{opacity:1}
-.hlink:hover{color:var(--ph);text-decoration:none}
-.pn{display:flex;justify-content:space-between;gap:16px;margin-top:56px;padding-top:18px;border-top:1px solid var(--line);font-size:.88rem}
+.hlink:hover{color:var(--ph-hi)}
+
+.pn{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:64px;padding-top:24px;
+  border-top:1px solid var(--line);font:14px var(--sans)}
+.pn a{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:14px 18px;color:var(--body)}
+.pn a:hover{border-color:var(--ph-dim);color:var(--ink)}
+.pn a:last-child{text-align:right}
+.pn a small{display:block;color:var(--faint);font:11px var(--mono);
+  text-transform:uppercase;letter-spacing:.12em;margin-bottom:4px}
+
+/* the cat, at the foot of the sidebar. A documentation page is exactly where a
+   project can afford to be liked.
+
+   Selected as `.doc aside a.sidecat`, not `.sidecat`: the sidebar's own link
+   rule is two classes deep and won on specificity, so the layout stayed block
+   and the caption ran across the animal. */
+.doc aside a.sidecat{display:flex;flex-direction:column;align-items:center;
+  gap:10px;margin-top:32px;padding:18px 12px;border-top:1px solid var(--line);
+  border-left:0;border-radius:0;color:var(--faint);font:11px/1.5 var(--mono);
+  text-align:center}
+.doc aside a.sidecat img{flex:none;border-radius:10px;opacity:.9;transition:opacity .2s}
+.doc aside a.sidecat span{opacity:.7;max-width:19ch}
+.doc aside a.sidecat:hover{background:none;color:var(--ph-hi)}
+.doc aside a.sidecat:hover img{opacity:1}
+.doc aside a.sidecat:hover span{opacity:1}
+
+/* the pair at the foot of a page: an empty first slot keeps the second one
+   right-aligned on the first page, where there is nothing before it */
+.pn span{display:block}
+
+/* ── a hairline that fills as you read ───────────────────────────────── */
+.progress{position:fixed;top:0;left:0;right:0;height:2px;z-index:40;
+  background:linear-gradient(90deg,var(--ph),var(--amber));
+  transform:scaleX(0);transform-origin:0 50%;transition:transform .1s linear}
+
+/* ── contents ────────────────────────────────────────────────────────── */
+.toc{position:sticky;top:76px;align-self:start;font:12.5px var(--mono);
+  border-left:1px solid var(--line);padding-left:16px}
+.toc .grp{color:var(--faint);text-transform:uppercase;letter-spacing:.14em;
+  font-size:10.5px;margin-bottom:10px;opacity:.75}
+.toc a{display:block;color:var(--faint);padding:4px 0;line-height:1.45}
+.toc a:hover{color:var(--ink)}
+.toc a.on{color:var(--ph-hi)}
+@media(min-width:1240px){
+  .doc{grid-template-columns:224px minmax(0,1fr) 200px;gap:48px}
+}
+@media(max-width:1239px){.toc{display:none}}
+
+/* ── the palette ─────────────────────────────────────────────────────── */
+.palette{position:fixed;inset:0;z-index:60;display:none;
+  background:rgba(11,15,16,.72);backdrop-filter:blur(4px);padding-top:12vh}
+.palette.on{display:block}
+.pbox{max-width:620px;margin:0 auto;background:var(--panel);border:1px solid var(--line);
+  border-radius:14px;overflow:hidden;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.pbox input{width:100%;background:none;border:0;outline:0;color:var(--ink);
+  font:15px var(--mono);padding:18px 20px;border-bottom:1px solid var(--line)}
+.pbox input::placeholder{color:var(--faint)}
+.phits{max-height:52vh;overflow:auto}
+.phit{display:flex;align-items:baseline;gap:12px;padding:12px 20px;color:var(--body);
+  border-bottom:1px solid var(--line)}
+.phit b{font:600 14px var(--sans);color:var(--ink);flex:1}
+.phit span{font:11.5px var(--mono);color:var(--faint)}
+.phit.on,.phit:hover{background:var(--panel-2)}
+.phit.on b{color:var(--ph-hi)}
+.pnone{padding:16px 20px;color:var(--faint);font:12.5px var(--mono)}
+.pfoot{display:flex;justify-content:space-between;gap:12px;padding:11px 20px;
+  color:var(--faint);font:11px var(--mono);background:var(--panel-2)}
+.pfoot kbd{border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ph-hi)}
+.plocal{color:var(--ph-dim)}
+
+/* ── what the page answers ───────────────────────────────────────────── */
+.pagelede{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+  margin:0 0 26px;color:var(--amber);font:13px var(--mono)}
+.pagelede .mins{color:var(--faint)}
+.pagelede .mins::before{content:"· "}
+
+/* ── the sidebar keeps count ─────────────────────────────────────────── */
+.doc aside .grp{display:flex;align-items:baseline;gap:8px}
+.doc aside .grp .count{color:var(--ph-dim);letter-spacing:0}
+.doc aside a.read::after{content:"·";float:right;color:var(--ph);opacity:.85}
+.doc aside a[aria-current].read::after{content:""}
+
+/* ── code with a lid ─────────────────────────────────────────────────── */
+.pre-wrap{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--panel)}
+.pre-wrap pre{border:0;border-radius:0;margin:0;background:none}
+.pre-lid{display:flex;align-items:center;gap:10px;padding:8px 12px;
+  border-bottom:1px solid var(--line);background:var(--panel-2);
+  font:11px var(--mono);color:var(--faint)}
+.pre-lid .what{flex:1;letter-spacing:.08em;text-transform:uppercase;opacity:.8}
+.pre-copy{position:static;opacity:1;padding:3px 9px}
+
+/* ── the long grid keeps its header ──────────────────────────────────── */
+.doc article table thead th{position:sticky;top:0;z-index:2}
+.doc article table tbody tr:nth-child(2n){background:rgba(255,255,255,.014)}
+.doc article table tbody tr:hover{background:var(--panel)}
+
+.searchhint{display:flex;align-items:center;gap:9px;background:var(--panel);
+  border:1px solid var(--line);border-radius:7px;padding:6px 10px;cursor:pointer;
+  color:var(--faint);font:12px var(--mono)}
+.searchhint:hover{border-color:var(--ph-dim);color:var(--ink)}
+.searchhint kbd{border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--ph-hi)}
+@media(max-width:700px){.searchhint span{display:none}}

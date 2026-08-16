@@ -13,7 +13,8 @@
 <meta property="og:url" content="https://vshulcz.github.io/deja-vu/guide/compare.html">
 <meta property="og:image" content="https://vshulcz.github.io/deja-vu/assets/og.png">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" type="image/svg+xml" href="../assets/favicon.svg">
+<link rel="icon" type="image/svg+xml" sizes="16x16" href="../assets/favicon.svg">
+<link rel="icon" type="image/svg+xml" sizes="any" href="../assets/icon.svg">
 <link rel="stylesheet" href="../assets/site.css">
 
 <meta name="author" content="vshulcz">
@@ -28,27 +29,43 @@
 <meta name="twitter:description" content="Capture model, storage fidelity, infrastructure, retrieval and benchmarks — deja-vu next to Mem0, Letta, memU, Memori, claude-mem and agentmemory.">
 <meta name="twitter:image" content="https://vshulcz.github.io/deja-vu/assets/og.png">
 <meta name="twitter:image:alt" content="deja-vu — searchable local memory for coding agents">
-<link rel="apple-touch-icon" href="../assets/favicon.svg">
+<link rel="apple-touch-icon" href="../assets/icon.svg">
 <link rel="sitemap" type="application/xml" href="https://vshulcz.github.io/deja-vu/sitemap.xml">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"TechArticle","headline":"How deja compares","description":"An honest feature-by-feature comparison of deja-vu with Mem0, Letta, memU, Memori, claude-mem and agentmemory.","url":"https://vshulcz.github.io/deja-vu/guide/compare.html","inLanguage":"en","author":{"@type":"Person","name":"vshulcz"},"publisher":{"@type":"Person","name":"vshulcz"},"mainEntityOfPage":{"@type":"WebPage","@id":"https://vshulcz.github.io/deja-vu/guide/compare.html"},"isPartOf":{"@type":"WebSite","name":"deja-vu","url":"https://vshulcz.github.io/deja-vu/"}}</script>
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"deja-vu","item":"https://vshulcz.github.io/deja-vu/"},{"@type":"ListItem","position":2,"name":"Compare","item":"https://vshulcz.github.io/deja-vu/guide/compare.html"}]}</script>
 <style>
 /* Full-width page: the matrix needs every pixel, so the sidebar folds into a top strip. */
-.doc{display:block}
-.doc aside{display:none}
-.cmpwrap{overflow-x:auto;margin:0 0 16px;border:1px solid var(--line)}
-.cmpwrap table{table-layout:fixed;border-collapse:collapse;margin:0;font-size:.8rem;min-width:820px;width:100%}
-.cmpwrap th,.cmpwrap td{padding:7px 9px;vertical-align:top;overflow-wrap:break-word;border:1px solid var(--line)}
-.cmpwrap td:first-child,.cmpwrap th:first-child{position:sticky;left:0;z-index:1;background:var(--bg);width:118px;color:var(--faint);font-size:.72rem;text-transform:uppercase;letter-spacing:.06em}
-.cmpwrap th{background:var(--panel)}
-.cmpwrap th.us,.cmpwrap td.us{background:rgba(74,240,139,.08);color:#a5eec0}
-.cmpwrap .y{color:#7ee2a0}
-.cmpwrap .n{color:#5d8a6e}
+/* The table takes the width the contents column would have had. Dropping the
+   sidebar was the old answer and it cost the reader their place in the guide;
+   dropping the three-item contents list on this one page costs nothing.
+
+   Removing the article's max-width alone was not enough — the grid still held
+   the middle column, so four of the seven columns stayed off-screen. */
+.doc{grid-template-columns:224px minmax(0,1fr)}
+.doc .toc{display:none}
+.doc article{max-width:none}
+.cmpwrap{overflow-x:auto;margin:0 0 20px;border:1px solid var(--line);border-radius:10px}
+.cmpwrap table{table-layout:fixed;border-collapse:collapse;margin:0;
+  font:12.5px var(--mono);min-width:1040px;width:100%}
+.cmpwrap th,.cmpwrap td{padding:11px 13px;vertical-align:top;overflow-wrap:break-word;
+  border:1px solid var(--line);line-height:1.5}
+.cmpwrap td:first-child,.cmpwrap th:first-child{position:sticky;left:0;z-index:1;
+  background:var(--bg);width:142px;color:var(--faint);font-size:10.5px;
+  text-transform:uppercase;letter-spacing:.1em}
+.cmpwrap thead th{position:sticky;top:0;z-index:2;background:var(--panel);
+  color:var(--faint);text-transform:uppercase;font-size:10.5px;letter-spacing:.12em}
+/* the subject of the page, marked as the subject */
+.cmpwrap th.us,.cmpwrap td.us{background:rgba(135,135,175,.13);color:var(--ink)}
+.cmpwrap thead th.us{color:var(--ph-hi);box-shadow:inset 0 2px 0 var(--amber)}
+.cmpwrap tbody tr:hover td{background:rgba(255,255,255,.02)}
+.cmpwrap tbody tr:hover td.us{background:rgba(135,135,175,.18)}
+.cmpwrap .y{color:var(--ph-hi)}
+.cmpwrap .n{color:var(--faint)}
 </style>
 </head>
 <body>
 <div class="glow"></div>
-<nav><a class="brand" href="../"><img src="../assets/favicon.svg" alt="">deja-vu</a><span class="spacer"></span><a class="lnk" href="../">Home</a><a class="lnk" href="getting-started.html">Docs</a><a class="lnk" href="https://github.com/vshulcz/deja-vu">GitHub</a></nav>
+<nav><a class="brand" href="../"><img src="../assets/icon.svg" alt="" width="22" height="22">deja-vu</a><span class="spacer"></span><a class="lnk" href="../">Home</a><a class="lnk" href="getting-started.html">Docs</a><a class="lnk" href="https://github.com/vshulcz/deja-vu">GitHub</a></nav>
 <div class="wrap"><div class="doc">
 <aside><a href="../">← deja-vu</a><div class="grp">Guide</div>
 <a href="getting-started.html">Getting started</a>
@@ -62,10 +79,11 @@
 <div class="grp">Reference</div>
 <a href="https://github.com/vshulcz/deja-vu/blob/main/docs/ARCHITECTURE.md">Architecture</a>
 <a href="https://github.com/vshulcz/deja-vu/blob/main/docs/SECURITY-MODEL.md">Security model</a>
-<a href="../registry/README.md">Format registry</a></aside>
+<a href="../registry/README.md">Format registry</a><a class="sidecat" href="../"><img src="../assets/icon-live.svg" width="46" height="46" alt=""><span>it remembers, so you do not have to</span></a></aside>
 <article>
 
 <h1>How deja compares</h1>
+<p class="pagelede">where deja sits among the memory tools<span class="mins" data-mins></span></p>
 <p>There are a lot of AI memory systems. Most solve a different problem than deja: they give <em>applications</em> a memory API you call from code, or wrap an agent runtime around their own store. deja is narrower — it makes the transcripts your coding agents <em>already write to disk</em> searchable, and serves them back to those agents. That one difference (retroactive indexing vs forward capture) drives most of the table below.</p>
 
 <div class="cmpwrap">
