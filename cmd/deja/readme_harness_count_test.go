@@ -49,24 +49,36 @@ func TestReadmeSpellsTheHarnessCountTheRegistryHas(t *testing.T) {
 	// re-reads when the main one changes — it was still leading with the
 	// previous tagline months later, on a page that gets five hundred installs
 	// a week. Third-party write-ups were quoting a count from before July.
-	for _, name := range []string{"README.md", "npm/README.md"} {
+	// Seven files spell the count and only two were checked, so when Zed made it
+	// eighteen the other five stayed on seventeen — including the two manifest
+	// descriptions, which is the line the MCP registry shows next to the name,
+	// and the harnesses page, which says it in the lede and in three meta tags.
+	for _, name := range []string{
+		"README.md",
+		"npm/README.md",
+		"llms-install.md",
+		"docs/ARCHITECTURE.md",
+		"server.json",
+		"packaging/mcpb/manifest.json",
+		"docs/guide/harnesses.html",
+	} {
 		b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(name)))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
 		text := strings.ToLower(string(b))
 
+		// The word, not a phrase around it. These four documents each have their
+		// own voice — "eighteen coding agents", "the eighteen harnesses deja
+		// installs into", "the eighteen the loader registers" — and pinning one
+		// phrasing meant the other two were never checked at all.
 		for _, stale := range words {
-			if stale == want {
-				continue
-			}
-			if strings.Contains(text, stale+" coding agents") ||
-				strings.Contains(text, stale+" harnesses") {
-				t.Errorf("%s counts %q harnesses; the registry has %d (%s)", name, stale, n, want)
+			if stale != want && strings.Contains(text, stale) {
+				t.Errorf("%s still counts %q; the registry has %d (%s)", name, stale, n, want)
 			}
 		}
-		if !strings.Contains(text, want+" coding agents") {
-			t.Errorf("%s does not say %q coding agents; the registry has %d", name, want, n)
+		if !strings.Contains(text, want) {
+			t.Errorf("%s never says %q; the registry has %d harnesses", name, want, n)
 		}
 	}
 }
