@@ -344,7 +344,13 @@ func mergeFixes(dir, tmp string, replacements []model.Session, replaced map[stri
 			break
 		}
 	}
-	_ = writeGob(fixesPath(tmp), out)
+	// Atomic, unlike buildFixes above: that one writes into a directory made
+	// moments earlier, where the file cannot exist. This one runs after
+	// carrySidecars has copied the live table into the build directory, and the
+	// swap ships whatever is there. A truncating write that failed partway would
+	// ship an undecodable file, which ReadFixes reports as no pairs at all —
+	// silence until the next full rebuild.
+	_ = writeGobAtomic(fixesPath(tmp), out)
 }
 
 // ReadFixes loads the mined pairs. An index built before they existed simply
