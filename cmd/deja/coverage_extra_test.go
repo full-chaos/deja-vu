@@ -54,6 +54,13 @@ func hermeticEnv(t *testing.T) string {
 	t.Setenv("DEJA_GROK_ROOT", filepath.Join(tmp, "grok"))
 	t.Setenv("DEJA_QWEN_ROOT", filepath.Join(tmp, "qwen"))
 	t.Setenv("DEJA_COPILOT_ROOT", filepath.Join(tmp, "copilot"))
+	// Zed resolves its store through the platform data directory, which on
+	// macOS sits under the home directory but on Linux follows XDG_DATA_HOME.
+	// Both are pinned so a contributor's own threads never reach a golden.
+	t.Setenv("DEJA_ZED_ROOT", filepath.Join(tmp, "zed"))
+	t.Setenv("DEJA_ZED_DB", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("FLATPAK_XDG_DATA_HOME", "")
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("GEMINI_CLI_HOME", "")

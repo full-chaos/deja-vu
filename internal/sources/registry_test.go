@@ -43,6 +43,7 @@ func TestFormatRegistryConformance(t *testing.T) {
 		"DEJA_OPENCLAW_ROOT", "OPENCLAW_STATE_DIR",
 		"DEJA_INCLUDE_SUBAGENTS", "DEJA_OPENCODE_DB", "GEMINI_CLI_HOME",
 		"GROK_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+		"DEJA_ZED_ROOT", "DEJA_ZED_DB", "FLATPAK_XDG_DATA_HOME",
 		"DEJA_NOTES_FILE",
 	} {
 		t.Setenv(key, "")
@@ -195,6 +196,27 @@ func parseRegistryFixture(t *testing.T, id, path string) []model.Session {
 			t.Fatalf("create sqlite fixture: %v: %s", runErr, out)
 		}
 		sessions, err = ParseHermesDB(db)
+	case "zed":
+		if !SQLite3Available() {
+			t.Skip("sqlite3 not installed")
+		}
+		sql, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		db := filepath.Join(t.TempDir(), "threads.db")
+		// On stdin rather than as an argument: this fixture documents its
+		// opaque blob in a leading `--` comment, and the sqlite3 CLI reads a
+		// leading `--` as an option.
+		build := exec.Command("sqlite3", db)
+		build.Stdin = strings.NewReader(string(sql))
+		if out, runErr := build.CombinedOutput(); runErr != nil {
+			t.Fatalf("create sqlite fixture: %v: %s", runErr, out)
+		}
+		// Without zstd the fixture's compressed thread is skipped and its
+		// uncompressed one still parses, which is the degradation the harness
+		// is documented to have rather than a reason to skip the row.
+		sessions, err = ParseZedDB(db)
 	case "qwen":
 		sessions, err = ParseQwenFile(path)
 	case "pi":

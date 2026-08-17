@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Zed's built-in agent is the eighteenth harness deja indexes. Its threads are one SQLite store under Zed's *data* directory — `~/Library/Application Support/Zed/threads/threads.db` on macOS, not the `~/.config/zed` that holds only settings — and every thread body inside it is a zstd frame, so reading them needs the `zstd` CLI beside `sqlite3`. With either tool missing, `deja sources` says which one rather than reporting an empty history. Both thread document generations parse, because Zed rewrites a thread in the current shape only when that thread is next saved, so a store mixes them indefinitely. (#183)
+
 
 ## [0.17.2] - 2026-08-16
 

@@ -484,6 +484,56 @@
      "source": "no CLI ships with the extension"
     }
    }
+  },
+  {
+   "id": "zed",
+   "store_paths": [
+    "~/Library/Application Support/Zed/threads/threads.db",
+    "${XDG_DATA_HOME}/zed/threads/threads.db",
+    "%LOCALAPPDATA%/Zed/threads/threads.db",
+    "${DEJA_ZED_ROOT}/threads/threads.db",
+    "${DEJA_ZED_DB}"
+   ],
+   "format_kind": "sqlite",
+   "fixture_paths": [
+    "fixtures/registry/zed/zed.sql"
+   ],
+   "parser_source": "internal/sources/zed.go",
+   "last_verified": "2026-08-17",
+   "display_name": "Zed",
+   "capabilities": {
+    "mcp": false,
+    "auto": false,
+    "skill": false,
+    "command": false,
+    "resume": false,
+    "handoff": "paste",
+    "prereq": "sqlite3 + zstd"
+   },
+   "gaps": {
+    "mcp": {
+     "state": "todo",
+     "why": "Zed runs MCP servers — it keeps a context server registry and reads them from settings — but deja has no install target that writes that wiring, so nothing here claims it works yet"
+    },
+    "auto": {
+     "state": "impossible",
+     "why": "Zed's agent exposes no lifecycle hook: nothing in the editor runs a command before a prompt is sent, so there is no point at which recall could be injected. Becomes work the day Zed ships one",
+     "source": "no hook API in Zed 0.61"
+    },
+    "skill": {
+     "state": "todo",
+     "why": "Zed reads rules files, so guidance has somewhere to live, but deja neither owns nor writes one for it yet"
+    },
+    "command": {
+     "state": "todo",
+     "why": "Follows the skill gap: deja writes no file for Zed, so there is nothing for a command to be defined in"
+    },
+    "resume": {
+     "state": "impossible",
+     "why": "The agent lives in the editor and no zed CLI flag reopens a thread by id, so there is nothing for deja to print. Reopening a thread is a thing the editor does, not a command",
+     "source": "no resume flag in the zed CLI"
+    }
+   }
   }
  ]
 }

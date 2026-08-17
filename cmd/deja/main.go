@@ -1855,6 +1855,7 @@ func printSources(dir string) {
 		{"roo", strings.Join(sources.RooRoots(), string(os.PathListSeparator)), sources.RooRoots(), sources.LoadRoo},
 		{"pi", sources.PiRoot(), []string{sources.PiRoot()}, sources.LoadPi},
 		{"openclaw", sources.OpenClawRoot(), []string{sources.OpenClawRoot()}, sources.LoadOpenClaw},
+		{"zed", sources.ZedDB(), []string{sources.ZedDB()}, sources.LoadZed},
 		{"deja", sources.NotesFile(), []string{sources.NotesFile()}, sources.LoadNotes},
 	}
 	for _, it := range items {
@@ -1882,6 +1883,14 @@ func printSources(dir string) {
 		}
 		if it.name == "cursor" && len(sources.CursorDBs()) > 0 && !sources.SQLite3Available() {
 			note = "\t(sqlite3 CLI not found — Cursor IDE sessions unavailable)"
+		}
+		// Zed needs zstd as well as sqlite3: sqlite3 alone opens the store and
+		// reads nothing out of it, since every thread body is a compressed
+		// frame. SkipReason already words which of the two is missing.
+		if it.name == "zed" {
+			if reason := sources.SkipReason("zed"); reason != "" {
+				note = "\t(" + reason + " — Zed threads unavailable)"
+			}
 		}
 		if n := len(sources.ExclusionPatterns()); n > 0 {
 			note += fmt.Sprintf("\texcluded-patterns=%d", n)

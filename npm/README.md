@@ -11,9 +11,10 @@ Every memory tool starts empty and records forward. **deja starts full.** It
 indexes the sessions your coding agents already wrote to disk — months of
 history from before you installed it — and serves them back over MCP.
 
-Seventeen coding agents write every conversation to local files: Claude Code,
+Eighteen coding agents write every conversation to local files: Claude Code,
 Codex, Cursor, opencode, Gemini CLI, Cline, Copilot CLI, Roo Code, aider,
-Goose, Qwen Code, Kimi Code, Antigravity, Grok Build, OpenClaw, pi and Hermes.
+Goose, Qwen Code, Kimi Code, Antigravity, Grok Build, OpenClaw, pi, Hermes and
+Zed.
 deja turns those files into one memory layer that all of them can read.
 
 One Go binary. No LLM, no embeddings, no API key, nothing leaves the machine.

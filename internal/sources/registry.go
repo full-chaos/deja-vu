@@ -324,6 +324,17 @@ func Registry() []Harness {
 			}},
 		},
 		{
+			// Zed's agent writes no session files: one SQLite store under its
+			// data dir, whose thread bodies are zstd frames rather than JSON.
+			Name: "zed", Load: LoadZed, Files: func() []string { return []string{ZedDB()} },
+			Kinds: []FileKind{{
+				Name:      "zed",
+				Match:     func(p string) bool { return p == ZedDB() },
+				Parse:     dbParse(ParseZedDB, ParseZedDBSince),
+				ParseFrom: dbParseFrom(ParseZedDB, ParseZedDBSince),
+			}},
+		},
+		{
 			Name: "deja", Load: LoadNotes, Files: func() []string { return []string{NotesFile()} },
 			Kinds: []FileKind{{
 				Name:      "deja",

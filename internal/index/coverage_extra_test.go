@@ -33,6 +33,13 @@ func hermeticIndexEnv(t *testing.T) string {
 	t.Setenv("DEJA_CURSOR_CLI_ROOT", filepath.Join(tmp, "cursor-cli"))
 	t.Setenv("DEJA_ANTIGRAVITY_ROOT", filepath.Join(tmp, "antigravity"))
 	t.Setenv("DEJA_INCLUDE_SUBAGENTS", "")
+	// Zed resolves its store through the platform data directory, so both the
+	// XDG roots and the deja override are pinned. Without this an index run
+	// reads the contributor's own threads.
+	t.Setenv("DEJA_ZED_ROOT", filepath.Join(tmp, "zed"))
+	t.Setenv("DEJA_ZED_DB", "")
+	t.Setenv("XDG_DATA_HOME", "")
+	t.Setenv("FLATPAK_XDG_DATA_HOME", "")
 	t.Setenv("DEJA_NOTES_FILE", filepath.Join(tmp, "notes.jsonl"))
 	return tmp
 }

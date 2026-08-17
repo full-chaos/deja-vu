@@ -1,13 +1,20 @@
 package sources
 
-// SkipReason says why a harness deja can see on disk produced nothing. Today
-// that is only a missing sqlite3 CLI: five stores are read through it, and an
+// SkipReason says why a harness deja can see on disk produced nothing. That is
+// a missing external tool: six stores are read through the sqlite3 CLI, and an
 // index run that names every harness it read while staying silent about the
 // one it could not made an empty deja look like an empty history (#794).
+//
+// Zed needs a second tool. Its store is SQLite like the others, but every
+// thread body inside it is a zstd frame, so sqlite3 alone opens the store and
+// reads nothing out of it — the failure this exists to stop, one layer down.
 //
 // It returns "" when there is nothing to explain — including on a machine that
 // never used the harness, where a note about a tool would be noise.
 func SkipReason(harness string) string {
+	if harness == "zed" {
+		return zedSkipReason()
+	}
 	if SQLite3Available() {
 		return ""
 	}
@@ -28,4 +35,20 @@ func SkipReason(harness string) string {
 		return ""
 	}
 	return "sqlite3 CLI not found"
+}
+
+func zedSkipReason() string {
+	if !fileExists(ZedDB()) {
+		return ""
+	}
+	sqlite, zstd := SQLite3Available(), ZstdAvailable()
+	switch {
+	case !sqlite && !zstd:
+		return "sqlite3 and zstd CLIs not found"
+	case !sqlite:
+		return "sqlite3 CLI not found"
+	case !zstd:
+		return "zstd CLI not found"
+	}
+	return ""
 }
