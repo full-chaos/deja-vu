@@ -577,6 +577,8 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 		return installGooseAuto(exe, uninstall)
 	case "statusline":
 		return installStatusline(exe, uninstall)
+	case "sync-timer":
+		return installSyncTimer(exe, uninstall)
 	default:
 		return installResult{}, unknownTargetError(target)
 	}
@@ -1496,7 +1498,7 @@ func min3(a, b, c int) int {
 // installTarget without appearing here is caught rather than quietly missing
 // from both.
 func installTargetNames() []string {
-	return []string{
+	names := []string{
 		"claude-code", "claude-auto",
 		"codex", "codex-auto",
 		"opencode", "opencode-auto",
@@ -1516,4 +1518,21 @@ func installTargetNames() []string {
 		"zed",
 		"statusline",
 	}
+	// Not a harness, and deliberately not "-auto": that suffix means a
+	// harness's auto-recall hook, and this is the timer that keeps this
+	// machine's memory in step with the others. It belongs in this list
+	// because `deja install --all` is where someone setting up a second
+	// machine looks — but only where deja can actually schedule anything.
+	// Offering a target that always fails is worse than not offering it.
+	if syncTimerSchedulable(runtime.GOOS) {
+		names = append(names, "sync-timer")
+	}
+	return names
+}
+
+// syncTimerSchedulable reports whether this platform has a service manager the
+// timer knows how to write for. Taking the platform as an argument keeps the
+// answer checkable from any machine.
+func syncTimerSchedulable(goos string) bool {
+	return goos == "darwin" || goos == "linux"
 }
