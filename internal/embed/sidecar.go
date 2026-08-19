@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/vshulcz/deja-vu/internal/index"
+
+	"github.com/vshulcz/deja-vu/internal/atomicfile"
 )
 
 const sidecarVersion uint16 = 1
@@ -227,59 +229,56 @@ func Read(dir string) (Sidecar, error) {
 	return out, nil
 }
 
+// write publishes the sidecar in one step. The temp name used to be the
+// destination plus ".tmp", and EmbedIndex takes no lock — two embeds at once
+// shared that name, so one could rename a file the other was still writing and
+// leave a sidecar that decodes as nothing (#1319).
 func write(dir string, s Sidecar) error {
-	tmp := Path(dir) + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	good := false
-	defer func() {
-		if !good {
-			_ = os.Remove(tmp)
+	return atomicfile.WriteStream(Path(dir), 0o600, func(w io.Writer) error {
+		// An error-remembering writer rather than a check after every field:
+		// the fields are a fixed sequence, the first failure is the one worth
+		// reporting, and the checks were branches nothing could reach.
+		ew := &errWriter{w: w}
+		ew.write(magic[:])
+		ew.num(sidecarVersion)
+		ew.num(uint16(s.Dim))
+		ew.str(s.Model)
+		ew.str(s.Generation)
+		ew.num(uint64(len(s.Vectors)))
+		ew.num(uint64(s.Covered))
+		for _, v := range s.Vectors {
+			ew.num(v.Offset)
+			ew.str(v.Key)
+			ew.num(v.Values)
 		}
-	}()
-	if _, err = f.Write(magic[:]); err == nil {
-		err = binary.Write(f, binary.LittleEndian, sidecarVersion)
-	}
-	if err == nil {
-		err = binary.Write(f, binary.LittleEndian, uint16(s.Dim))
-	}
-	if err == nil {
-		err = writeString(f, s.Model)
-	}
-	if err == nil {
-		err = writeString(f, s.Generation)
-	}
-	if err == nil {
-		err = binary.Write(f, binary.LittleEndian, uint64(len(s.Vectors)))
-	}
-	if err == nil {
-		err = binary.Write(f, binary.LittleEndian, uint64(s.Covered))
-	}
-	for _, v := range s.Vectors {
-		if err == nil {
-			err = binary.Write(f, binary.LittleEndian, v.Offset)
-		}
-		if err == nil {
-			err = writeString(f, v.Key)
-		}
-		if err == nil {
-			err = binary.Write(f, binary.LittleEndian, v.Values)
-		}
-	}
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(tmp, Path(dir)); err != nil {
-		return err
-	}
-	good = true
-	return nil
+		return ew.err
+	})
 }
+
+// errWriter keeps the first error and ignores everything after it.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) write(b []byte) {
+	if e.err == nil {
+		_, e.err = e.w.Write(b)
+	}
+}
+
+func (e *errWriter) num(v any) {
+	if e.err == nil {
+		e.err = binary.Write(e.w, binary.LittleEndian, v)
+	}
+}
+
+func (e *errWriter) str(v string) {
+	if e.err == nil {
+		e.err = writeString(e.w, v)
+	}
+}
+
 func writeString(w interface{ Write([]byte) (int, error) }, s string) error {
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(s))); err != nil {
 		return err
