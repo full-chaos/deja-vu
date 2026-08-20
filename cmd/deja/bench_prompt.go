@@ -144,6 +144,11 @@ type promptReport struct {
 	// and read as worthless. Correct here means the first line the agent sees
 	// carries a word from the question.
 	Shown promptArmReport `json:"shown_line"`
+	// The decoy arm: the session that answers also says an ordinary word of the
+	// question, three times, about something else. Correct means the block opens
+	// on the line that carries the subject rather than the one that carries the
+	// ordinary word.
+	Decoy promptArmReport `json:"decoy_line"`
 	// Questions whose subject the project has never held, asked with words it
 	// has. Every fire is a false one: there is nothing to answer with.
 	//
@@ -233,6 +238,18 @@ func measurePrompt(seed int64) (promptReport, error) {
 			arm = &report.Haystack
 		case "russian":
 			arm = &report.Russian
+		case "decoy":
+			// Scored with the question's own terms, the way the hook builds the
+			// block. An earlier version of this arm rebuilt it from the topic
+			// alone and so could never see the decoy at all — it read 2/2 while
+			// the block opened on "decide whether to decide this now".
+			arm = &report.Decoy
+			arm.Cases++
+			if firstShownLineCarries(indexDir, scope, terms, chain.Topic) {
+				arm.Fired++
+				arm.Correct++
+			}
+			continue
 		default:
 			realTerms = append(realTerms, len(terms))
 		}
@@ -297,6 +314,7 @@ func measurePrompt(seed int64) (promptReport, error) {
 		}
 	}
 	finishPromptArm(&report.Shown, nil)
+	finishPromptArm(&report.Decoy, nil)
 	finishPromptArm(&report.AbsentSubject, nil)
 	return report, nil
 }
@@ -336,6 +354,35 @@ func shownLineCarriesATerm(dir, project string, terms []string) bool {
 			}
 		}
 		return false
+	}
+	return false
+}
+
+// firstShownLineCarries builds the block the hook would inject for this question
+// and reports whether its first quoted line carries the subject rather than an
+// ordinary word the question shares with the same session.
+func firstShownLineCarries(dir, project string, terms []string, topic string) bool {
+	ranked, matched, strong, err := index.ProjectRelevant(dir, []string{project}, terms, 8)
+	if err != nil || len(ranked) == 0 {
+		return false
+	}
+	var keep []model.Session
+	for i := range ranked {
+		if !recallWorthShowing(terms, matched[i], strong[i]) {
+			continue
+		}
+		keep = append(keep, ranked[i])
+		break
+	}
+	if len(keep) == 0 {
+		return false
+	}
+	for _, ln := range strings.Split(search.AutoRecallDigestFor(keep, 2000, terms), "\n") {
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "- User:") && !strings.HasPrefix(ln, "- Assistant:") {
+			continue
+		}
+		return search.TextCarriesTerm(ln, topic)
 	}
 	return false
 }

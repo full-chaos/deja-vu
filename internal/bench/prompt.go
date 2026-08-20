@@ -277,6 +277,35 @@ func GeneratePrompt(seed int64) PromptCorpus {
 			}},
 		})
 	}
+	// The decoy line. The session that answers also says an ordinary word the
+	// question happens to use, in a place that has nothing to do with the
+	// subject. Measured on a real store: "what did we decide about mm_status"
+	// returned that session and quoted "1. **Decide**: User settings (global) or
+	// project settings?" — the right session, the wrong line, because the
+	// digest weighs every query word alike while the ranking knows which one
+	// identified the match.
+	for i, d := range []promptTopic{
+		{"quicksilver", "quicksilver retries are capped at four", "what did we decide about quicksilver"},
+		{"harbourmaster", "harbourmaster writes its log to stderr", "what did we decide about harbourmaster"},
+	} {
+		id := fmt.Sprintf("prompt-decoy-%02d", i)
+		project := fmt.Sprintf("promptbenchdecoy%02d", i)
+		t := base.Add(time.Duration(2500+i*10) * time.Minute)
+		chains = append(chains, PromptChain{
+			ID: id, Project: project, Kind: "decoy",
+			Topic: d.word, Question: d.question,
+			Sessions: []model.Session{{
+				ID: id + "-session", Harness: "claude", Project: project,
+				Started: t, Updated: t.Add(3 * time.Minute),
+				Messages: []model.Message{
+					// The ordinary word of the question, said three times, about
+					// something else entirely.
+					{Role: "user", Text: "decide whether to decide this now or decide it later", Time: t},
+					{Role: "assistant", Text: "we decided " + d.fact, Time: t.Add(time.Minute)},
+				},
+			}},
+		})
+	}
 	// The haystack. Measured on a frozen copy of a real index 2026-08-20: of 45
 	// live prompts, 33 were answered by one session of 38131 messages and 11 by
 	// one of 29190 — the two largest in the index, in order of size, for
