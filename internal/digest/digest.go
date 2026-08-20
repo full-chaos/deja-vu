@@ -517,9 +517,28 @@ var decisionMarkers = []string{
 // session-start digest uses to find what a session decided; per-prompt recall
 // had no use for them and picked its line by where the query's words fell.
 func CarriesDecision(text string) bool {
+	return CarriesDecisionExcept(text, nil)
+}
+
+// CarriesDecisionExcept is the same, ignoring markers the asker used. A marker
+// that is also a word of the question makes the check circular: "в итоге" is
+// both, so a line matched on that phrase then counted as a conclusion because
+// of it. Measured on the benchmark, the question "по чему у нас в итоге
+// шардирование" promoted a session about something else entirely.
+func CarriesDecisionExcept(text string, asked []string) bool {
 	low := strings.ToLower(text)
 	for _, d := range decisionMarkers {
-		if strings.Contains(low, d) {
+		if !strings.Contains(low, d) {
+			continue
+		}
+		skip := false
+		for _, a := range asked {
+			if a != "" && strings.Contains(d, strings.ToLower(a)) {
+				skip = true
+				break
+			}
+		}
+		if !skip {
 			return true
 		}
 	}

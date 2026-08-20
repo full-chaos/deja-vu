@@ -314,6 +314,45 @@ func GeneratePrompt(seed int64) PromptCorpus {
 			}},
 		})
 	}
+	// Two sessions hold the subject: one only ever mentioned it, the other
+	// concluded something about it. Ranking counts term matches and how rare
+	// they are, and is blind to which of the two settled anything — so the one
+	// that merely talked about it can win on saying it more often.
+	for i, c := range []promptTopic{
+		{"nightjar", "nightjar batches are flushed every 30 seconds", "what did we decide about nightjar"},
+		{"lodestone", "lodestone runs on the read replica now", "what did we decide about lodestone"},
+	} {
+		id := fmt.Sprintf("prompt-concluded-%02d", i)
+		project := fmt.Sprintf("promptbenchconcluded%02d", i)
+		t := base.Add(time.Duration(2700+i*10) * time.Minute)
+		var chatter []model.Message
+		for k := 0; k < 60; k++ {
+			chatter = append(chatter, model.Message{
+				Role: "assistant",
+				Text: "смотрел " + c.word + " ещё раз, пока ничего не трогаю",
+				Time: t.Add(time.Duration(k) * time.Minute),
+			})
+		}
+		chains = append(chains, PromptChain{
+			ID: id + "-talk", Project: project, Kind: "concluded-noise",
+			Sessions: []model.Session{{
+				ID: id + "-talk-session", Harness: "claude", Project: project,
+				Started: t, Updated: t.Add(6 * time.Minute), Messages: chatter,
+			}},
+		})
+		answer := t.Add(-200 * time.Minute)
+		chains = append(chains, PromptChain{
+			ID: id, Project: project, Kind: "concluded",
+			Topic: c.word, Question: c.question, Fact: c.fact,
+			Sessions: []model.Session{{
+				ID: id + "-session", Harness: "claude", Project: project,
+				Started: answer, Updated: answer,
+				Messages: []model.Message{
+					{Role: "assistant", Text: "в итоге решили: " + c.fact, Time: answer},
+				},
+			}},
+		})
+	}
 	// The decoy line. The session that answers also says an ordinary word the
 	// question happens to use, in a place that has nothing to do with the
 	// subject. Measured on a real store: "what did we decide about mm_status"

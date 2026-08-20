@@ -546,6 +546,47 @@ func rankOfBestTerm(line string, terms []string) int {
 	return 0
 }
 
+// LeadWithConclusion puts a session that settled something about the query
+// first. Ranking counts how often and how rarely the query's words appear and
+// cannot see the difference between settling a question and discussing it: a
+// session that mentioned the subject sixty times outranks the one that answered
+// it in a sentence.
+func LeadWithConclusion(ss []model.Session, terms []string) []model.Session {
+	if len(ss) < 2 || ConcludedAbout(ss[0], terms) {
+		return ss
+	}
+	for i := 1; i < len(ss); i++ {
+		if ConcludedAbout(ss[i], terms) {
+			ss[0], ss[i] = ss[i], ss[0]
+			break
+		}
+	}
+	return ss
+}
+
+// ConcludedAbout reports whether the lines this session is about to show carry
+// something concluded rather than a passing mention.
+//
+// It asks about the lines the digest will pick, not about the session at large.
+// An earlier version scanned every message, and a session rose on a line the
+// digest then did not choose: measured live, that lost nine answers of 120 and
+// what the reader saw instead was "we did not decide any such thing in this
+// session".
+func ConcludedAbout(s model.Session, terms []string) bool {
+	// The first line, not any line. Promoting a session for its second line
+	// left the reader looking at the first: measured live, that lost nine
+	// answers of 120 and showed "we did not decide any such thing in this
+	// session" in their place.
+	problem, conclusions := matchedLines(s, terms)
+	if problem != "" {
+		return digest.CarriesDecisionExcept(problem, terms)
+	}
+	if len(conclusions) == 0 {
+		return false
+	}
+	return digest.CarriesDecisionExcept(conclusions[0], terms)
+}
+
 // densestLine returns the line of a message carrying the most query terms, and
 // how many, so a message is both chosen and quoted where it answers rather
 // than where it opens.

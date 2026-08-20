@@ -237,6 +237,10 @@ var cyrPromptStop = map[string]bool{
 	// guessed: these are the words that appeared when the floor came down over
 	// live questions from this machine.
 	"про": true, "вот": true, "раз": true, "еще": true, "чтоб": true,
+	// "в итоге" is how a question asks for the outcome, not a thing to search
+	// for; it also sits in the decision markers, so keeping it made a line
+	// count as a conclusion because the asker had used the phrase.
+	"итоге": true, "итог": true, "конце": true, "концов": true,
 	"для": true, "при": true, "над": true, "под": true, "без": true,
 	"она": true, "они": true, "оно": true, "был": true, "была": true,
 	"мне": true, "нам": true, "вам": true,

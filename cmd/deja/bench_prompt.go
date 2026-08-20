@@ -155,6 +155,10 @@ type promptReport struct {
 	// that tell one from the other are English, and half the sessions on a real
 	// store are not.
 	Decision promptArmReport `json:"decision_line"`
+	// The concluded arm: two sessions hold the subject, one only mentioned it
+	// and the other settled it. Correct means the block carries what was
+	// settled.
+	Concluded promptArmReport `json:"concluded_session"`
 	// Questions whose subject the project has never held, asked with words it
 	// has. Every fire is a false one: there is nothing to answer with.
 	//
@@ -220,7 +224,8 @@ func measurePrompt(seed int64) (promptReport, error) {
 		}
 		// Filler that only exists to fill the bucket has no question of its
 		// own; it is asked about through the bucket-answer chain below.
-		if chain.Kind == "bucket" || chain.Kind == "haystack-noise" {
+		if chain.Kind == "bucket" || chain.Kind == "haystack-noise" ||
+			chain.Kind == "concluded-noise" {
 			continue
 		}
 		terms := prompt.Terms(chain.Question)
@@ -249,6 +254,14 @@ func measurePrompt(seed int64) (promptReport, error) {
 				report.Decision.Fired++
 				report.Decision.Correct++
 			}
+		case "concluded":
+			arm = &report.Concluded
+			arm.Cases++
+			if blockCarries(indexDir, scope, terms, chain.Fact, chain.Topic) {
+				arm.Fired++
+				arm.Correct++
+			}
+			continue
 		case "decoy":
 			// Scored with the question's own terms, the way the hook builds the
 			// block. An earlier version of this arm rebuilt it from the topic
@@ -327,6 +340,7 @@ func measurePrompt(seed int64) (promptReport, error) {
 	finishPromptArm(&report.Shown, nil)
 	finishPromptArm(&report.Decoy, nil)
 	finishPromptArm(&report.Decision, nil)
+	finishPromptArm(&report.Concluded, nil)
 	finishPromptArm(&report.AbsentSubject, nil)
 	return report, nil
 }
@@ -416,12 +430,16 @@ func blockCarries(dir, project string, terms []string, fact, topic string) bool 
 			continue
 		}
 		keep = append(keep, ranked[i])
-		break
+		if len(keep) == 2 {
+			break
+		}
 	}
 	if len(keep) == 0 {
 		return false
 	}
-	block := search.AutoRecallDigestFor(keep, 2000, terms)
+	// The same ordering the hook applies, from the same function.
+	keep = search.LeadWithConclusion(keep, terms)
+	block := search.AutoRecallDigestFor(keep[:1], 2000, terms)
 	// Skip the subject itself. It appears in every session that mentions the
 	// thing, so checking for it asks whether the block is about the subject —
 	// which it is either way — rather than whether it carries the conclusion.
