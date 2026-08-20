@@ -17,6 +17,23 @@ import (
 // within it, earliest against latest, and how many times the line repeats the
 // word. All of them read "I'll look at the shard later" and "we moved the shard
 // to the region" as the same line.
+// The same in Russian. The markers were an English list, so every line of a
+// Russian session read as a passing mention — and half the sessions on a real
+// store are Russian.
+func TestBlockPrefersTheRussianLineThatConcluded(t *testing.T) {
+	at := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
+	msgs := []model.Message{
+		{Role: "assistant", Text: "потом посмотрю про шардирование, пока не трогаю", Time: at},
+		{Role: "assistant", Text: "снова про шардирование, руки не дошли", Time: at.Add(time.Minute)},
+		{Role: "assistant", Text: "в итоге шардирование перенесли на регион", Time: at.Add(2 * time.Minute)},
+	}
+	s := model.Session{ID: "one", Harness: "claude", Project: "app", Started: at, Updated: at, Messages: msgs}
+	block := AutoRecallDigestFor([]model.Session{s}, 2000, []string{"шардирование"})
+	if !strings.Contains(block, "перенесли на регион") {
+		t.Fatalf("the decision was dropped in favour of two passing mentions:\n%s", block)
+	}
+}
+
 func TestBlockPrefersTheLineThatConcluded(t *testing.T) {
 	at := time.Date(2026, 5, 2, 10, 0, 0, 0, time.UTC)
 	msgs := []model.Message{

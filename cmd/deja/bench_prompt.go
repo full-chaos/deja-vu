@@ -149,6 +149,12 @@ type promptReport struct {
 	// on the line that carries the subject rather than the one that carries the
 	// ordinary word.
 	Decoy promptArmReport `json:"decoy_line"`
+	// The decision arm: a session says its subject in passing before it
+	// concludes anything about it, in Russian. Correct means the block carries
+	// what was concluded rather than the line that put it off — the markers
+	// that tell one from the other are English, and half the sessions on a real
+	// store are not.
+	Decision promptArmReport `json:"decision_line"`
 	// Questions whose subject the project has never held, asked with words it
 	// has. Every fire is a false one: there is nothing to answer with.
 	//
@@ -238,6 +244,11 @@ func measurePrompt(seed int64) (promptReport, error) {
 			arm = &report.Haystack
 		case "russian":
 			arm = &report.Russian
+			report.Decision.Cases++
+			if blockCarries(indexDir, scope, terms, chain.Fact, chain.Topic) {
+				report.Decision.Fired++
+				report.Decision.Correct++
+			}
 		case "decoy":
 			// Scored with the question's own terms, the way the hook builds the
 			// block. An earlier version of this arm rebuilt it from the topic
@@ -315,6 +326,7 @@ func measurePrompt(seed int64) (promptReport, error) {
 	}
 	finishPromptArm(&report.Shown, nil)
 	finishPromptArm(&report.Decoy, nil)
+	finishPromptArm(&report.Decision, nil)
 	finishPromptArm(&report.AbsentSubject, nil)
 	return report, nil
 }
@@ -386,6 +398,42 @@ func firstShownLineCarries(dir, project string, terms []string, topic string) bo
 			continue
 		}
 		return search.TextCarriesTerm(ln, topic)
+	}
+	return false
+}
+
+// blockCarries builds the block the hook would inject and reports whether it
+// holds a distinctive word of what the session concluded.
+func blockCarries(dir, project string, terms []string, fact, topic string) bool {
+	ranked, matched, strong, idfOf, err := index.ProjectRelevant(dir, []string{project}, terms, 8)
+	if err != nil || len(ranked) == 0 {
+		return false
+	}
+	terms = byIdentifying(terms, idfOf)
+	var keep []model.Session
+	for i := range ranked {
+		if !recallWorthShowing(terms, matched[i], strong[i]) {
+			continue
+		}
+		keep = append(keep, ranked[i])
+		break
+	}
+	if len(keep) == 0 {
+		return false
+	}
+	block := search.AutoRecallDigestFor(keep, 2000, terms)
+	// Skip the subject itself. It appears in every session that mentions the
+	// thing, so checking for it asks whether the block is about the subject —
+	// which it is either way — rather than whether it carries the conclusion.
+	// An arm that did not skip it read 2/2 even after the conclusion had been
+	// emptied of its content.
+	for _, w := range strings.Fields(fact) {
+		if len([]rune(w)) < 7 || search.TextCarriesTerm(topic, w) {
+			continue
+		}
+		if search.TextCarriesTerm(block, w) {
+			return true
+		}
 	}
 	return false
 }

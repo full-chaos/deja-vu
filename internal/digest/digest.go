@@ -504,6 +504,12 @@ var decisionMarkers = []string{
 	"root cause", "because", "the fix", "fixed", "decided", "instead of",
 	"turned out", "the problem was", "solution", "so the answer", "conclusion",
 	"works now", "passes now", "merged", "released", "chose", "won't work",
+	// Half the sessions on a real store are in Russian, and a list of English
+	// phrases reads every line of them as a passing mention. These are the
+	// same shapes: what was concluded, what turned out, what got fixed.
+	"решили", "в итоге", "оказалось", "причина", "выяснилось", "вывод",
+	"выбрали", "остановились", "исправил", "починил", "заработало",
+	"не будем", "убрали", "переделали", "смержил", "выкатили",
 }
 
 // CarriesDecision reports whether a line reads as something concluded rather

@@ -24,6 +24,10 @@ type PromptChain struct {
 	Project  string
 	Topic    string
 	Question string
+	// Fact is what the session concluded, so an arm can ask whether the block
+	// carries the conclusion rather than merely the subject: a passing mention
+	// says the subject too.
+	Fact     string
 	Sessions []model.Session
 	Negative bool
 	// Kind names what this chain is here to measure: "" for the plain case,
@@ -283,13 +287,27 @@ func GeneratePrompt(seed int64) PromptCorpus {
 				model.Message{Role: "assistant", Text: "снова прогнал и поправил", Time: at.Add(time.Second)},
 			)
 		}
+		// The subject is said in passing before anything is concluded about it.
+		// The decision markers that separate the two are English only, and half
+		// the sessions on a real store are not.
+		// Three passing mentions and one conclusion, so that the block cannot
+		// hold both kinds: the two slots go to whichever lines win, and every
+		// way of choosing by where or how often the word fell hands them to the
+		// mentions.
+		for k := 0; k < 3; k++ {
+			msgs = append(msgs, model.Message{
+				Role: "assistant",
+				Text: "потом посмотрю про " + ru.word + ", пока не трогаю",
+				Time: t.Add(time.Duration(150+k) * time.Minute),
+			})
+		}
 		msgs = append(msgs, model.Message{
-			Role: "assistant", Text: "решили: " + ru.fact,
+			Role: "assistant", Text: "в итоге решили: " + ru.fact,
 			Time: t.Add(200 * time.Minute),
 		})
 		chains = append(chains, PromptChain{
 			ID: id, Project: project, Kind: "russian",
-			Topic: ru.word, Question: ru.question,
+			Topic: ru.word, Question: ru.question, Fact: ru.fact,
 			Sessions: []model.Session{{
 				ID: id + "-session", Harness: "claude", Project: project,
 				Started: t, Updated: t.Add(200 * time.Minute), Messages: msgs,
