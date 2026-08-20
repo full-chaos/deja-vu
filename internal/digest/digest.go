@@ -506,6 +506,20 @@ var decisionMarkers = []string{
 	"works now", "passes now", "merged", "released", "chose", "won't work",
 }
 
+// CarriesDecision reports whether a line reads as something concluded rather
+// than something mentioned in passing. The markers are the same ones the
+// session-start digest uses to find what a session decided; per-prompt recall
+// had no use for them and picked its line by where the query's words fell.
+func CarriesDecision(text string) bool {
+	low := strings.ToLower(text)
+	for _, d := range decisionMarkers {
+		if strings.Contains(low, d) {
+			return true
+		}
+	}
+	return false
+}
+
 // selectConclusions keeps assistant messages that carry a decision marker,
 // plus the final message (the outcome), in transcript order. Conversational
 // sessions where nothing matches keep everything — the filter only kicks in
