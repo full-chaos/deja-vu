@@ -33,7 +33,7 @@
 <div class="glow"></div>
 <nav><a class="brand" href="../"><img src="../assets/icon.svg" alt="" width="22" height="22">deja-vu</a><span class="spacer"></span><a class="lnk" href="../">Home</a><a class="lnk" href="../guide/getting-started.html">Docs</a><a class="lnk" href="https://github.com/vshulcz/deja-vu">GitHub</a></nav>
 <div class="wrap"><div class="doc">
-<aside><a href="../">&larr; deja-vu</a><div class="grp">Guide</div><a href="../guide/getting-started.html">Getting started</a><a href="../guide/harnesses.html">Harnesses</a><div class="grp">Session formats</div><a href="README.html">All formats</a><a href="aider.html">aider</a><a href="antigravity.html">Antigravity</a><a href="claude-code.html">Claude Code</a><a href="cline.html">Cline</a><a href="codex.html">Codex CLI</a><a href="copilot.html">Copilot CLI</a><a href="cursor.html">Cursor</a><a href="deepseek.html" aria-current="page">DeepSeek Harness</a><a href="gemini.html">Gemini CLI</a><a href="goose.html">Goose</a><a href="grok.html">Grok Build</a><a href="hermes.html">Hermes</a><a href="kimi.html">Kimi Code</a><a href="openclaw.html">OpenClaw</a><a href="opencode.html">opencode</a><a href="pi.html">pi</a><a href="qwen.html">Qwen Code</a><a href="roo.html">Roo Code</a><a href="zed.html">Zed</a></aside>
+<aside><a href="../">&larr; deja-vu</a><div class="grp">Guide</div><a href="../guide/getting-started.html">Getting started</a><a href="../guide/harnesses.html">Harnesses</a><div class="grp">Session formats</div><a href="README.html">All formats</a><a href="aider.html">aider</a><a href="antigravity.html">Antigravity</a><a href="claude-code.html">Claude Code</a><a href="cline.html">Cline</a><a href="codex.html">Codex CLI</a><a href="copilot.html">Copilot CLI</a><a href="cursor.html">Cursor</a><a href="deepseek.html" aria-current="page">DeepSeek Harness</a><a href="gemini.html">Gemini CLI</a><a href="goose.html">Goose</a><a href="grok.html">Grok Build</a><a href="hermes.html">Hermes</a><a href="kimi.html">Kimi Code</a><a href="omp.html">omp (Oh My Pi)</a><a href="openclaw.html">OpenClaw</a><a href="opencode.html">opencode</a><a href="pi.html">pi</a><a href="qwen.html">Qwen Code</a><a href="roo.html">Roo Code</a><a href="zed.html">Zed</a></aside>
 <article>
 <h1>DeepSeek Harness</h1>
 <ul>
@@ -51,7 +51,7 @@
 <p>The first line is the session header — `{&#34;type&#34;:&#34;session&#34;,&#34;id&#34;:&#34;session-&lt;uuid&gt;&#34;,</p>
 <p>&#34;createdAt&#34;:&lt;ms&gt;,&#34;cwd&#34;:&#34;…&#34;}<code> — and the project comes from that </code>cwd`. Every</p>
 <p>line after it is one event: <code>{type, seq, time, data}</code>.</p>
-<p>Three event types carry the conversation:</p>
+<p>These event types carry the conversation:</p>
 <ul>
 <li><code>user/message</code> with <code>data.source.kind == &#34;user&#34;</code> is what a person typed. The</li>
 </ul>
@@ -59,13 +59,26 @@
 <p>snapshot, the skill catalogue — under other source kinds, and those are the</p>
 <p>harness describing itself rather than history worth recalling.</p>
 <ul>
-<li><code>assistant/chunk</code> with <code>data.chunk.type == &#34;text-delta&#34;</code> holds the answer a</li>
+<li><code>assistant/message</code> is the agent&#39;s turn, complete: <code>data.message.content</code> is a</li>
 </ul>
-<p>token at a time; the deltas of one run are joined into a single message.</p>
+<p>block array of <code>text</code> and <code>reasoning</code>. Only the text is recalled; reasoning is</p>
+<p>the model thinking out loud rather than what it told the person.</p>
 <ul>
-<li><code>assistant/chunk</code> with <code>data.chunk.type == &#34;tool-result&#34;</code> is tool output, kept</li>
+<li><code>assistant/chunk</code> with <code>chunk.type == &#34;text-delta&#34;</code> is the same answer as it</li>
 </ul>
-<p>under the <code>tool-output</code> role so search can tell it from speech.</p>
+<p>streamed. It is read only as a fallback, for a run interrupted before the</p>
+<p>complete message landed — otherwise the answer would land twice.</p>
+<ul>
+<li><code>text-chunks</code> is a packed row: a run of three or more consecutive deltas</li>
+</ul>
+<p>stored as one line with the pieces in <code>data.texts</code>. A reader that knows only</p>
+<p><code>assistant/chunk</code> keeps the stray deltas and loses every long answer, which is</p>
+<p>exactly the interrupted case the fallback exists for.</p>
+<ul>
+<li><code>tool/result</code> is tool output, whose content nests a <code>tool-result</code> block around</li>
+</ul>
+<p>the text; it is kept under the <code>tool-output</code> role so search can tell it from</p>
+<p>speech.</p>
 <p><code>session/title</code> gives the session its name; when the model never answered, the</p>
 <p>harness falls back to the first prompt.</p>
 <ul>
@@ -78,14 +91,17 @@
 </ul>
 <p>pre-prompt event deja can attach to.</p>
 <ul>
-<li><strong>Resume</strong>: dsh&#39;s own <code>--resume &lt;session&gt;</code>; deja stores the session id, and the</li>
+<li><strong>Resume</strong>: the tui app takes <code>--resume &lt;session&gt;</code> (a flag of the booted app,</li>
 </ul>
-<p>mapping is direct.</p>
+<p>not of the launcher — <code>dsh --profile headless --resume</code> is rejected). deja</p>
+<p>stores the session id the flag wants, so the mapping is direct.</p>
 <ul>
 <li><strong>Handoff</strong>: paste.</li>
 </ul>
-<p>Format verified by installing dsh 0.1.1-rc.2, running it, and reading what it</p>
-<p>wrote (<code>@deepseek-ai/dsh-session-persistence-jsonl</code>).</p>
+<p>Format verified by installing dsh 0.1.1-rc.2, pointing it at a local model over</p>
+<p>an OpenAI-compatible route, and reading what it wrote across sessions that</p>
+<p>answered, called a tool, were interrupted mid-answer, and failed before</p>
+<p>answering (<code>@deepseek-ai/dsh-session-persistence-jsonl</code>).</p>
 <p><strong>Last verified:</strong> 2026-08-21</p>
 
 <hr>
