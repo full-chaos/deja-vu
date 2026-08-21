@@ -45,14 +45,35 @@ harness falls back to the first prompt.
 - **Skill**: the shared `~/.agents/skills/deja-history/SKILL.md`. dsh splices a
   skill catalogue into the turn and reads that directory, so it needs no file of
   its own — checked by asking a running dsh to list its skills.
-- **Command**: still open. Slash commands are plugin rows rather than files in a
-  directory, so a `/deja` command means shipping a command plugin.
-- **Auto-recall**: no hook found. The harness has a plugin runtime but nothing
-  published says which event runs before a prompt reaches the model, and one
-  firing after is too late to inject recall.
-- **Resume**: the tui app takes `--resume <session>` (a flag of the booted app,
-  not of the launcher — `dsh --profile headless --resume` is rejected). deja
-  stores the session id the flag wants, so the mapping is direct.
+- **Command**: `deja install deepseek` also writes a plugin at
+  `$DSH_HOME/plugins/deja/command.js` and names it from the same layer, because
+  dsh registers slash commands in code (`ctx.commands.register`) rather than
+  from a directory of markdown. A profile row may name an absolute path, which
+  is how deja ships one without publishing a package. Three details fail the
+  whole profile load rather than skipping the plugin, and each was found by
+  running it: the dependency is declared as `apply.inject`, the field is
+  `handler` and not `handle`, and a row naming a file that is not there yet
+  takes the profile down — so the plugin is written before the layer and the
+  layer is rewritten before the plugin is removed. The command plane itself is
+  a UI service, so `/deja` lives in the web profile; a headless run has no
+  command adapter, and what a headless boot proves is that the plugin registers
+  cleanly.
+- **Auto-recall**: `deja install deepseek-auto` writes a second plugin at
+  `$DSH_HOME/plugins/deja/auto.js`. It listens on `agent/pre-step`, the event
+  that carries the messages entering the step the agent is about to take, and
+  splices the recall block in front of the last user message. The handler is
+  middleware, so it calls `next()` first and returns that decision with the
+  longer message list — returning a bare `{messages}` ends the turn with
+  `Cannot read properties of undefined (reading 'kind')`. The plain
+  `deja install deepseek` target keeps the MCP server and `/deja` but writes no
+  such plugin, and removes it along with its row when someone drops back to it.
+  Verified against a local model with no tools in play: dsh answered a question
+  about a pool size that only the injected block carried.
+- **Resume**: none. The launcher's examples mention a tui profile taking
+  `--resume <session>`, but this release ships no bundle for one — the two apps
+  are `headless`, which takes a task and exits, and `web`, whose flags are all
+  about the server. Reopening a conversation is something the web sidebar does,
+  so there is nothing for deja to print.
 - **Handoff**: paste.
 
 Format verified by installing dsh 0.1.1-rc.2, pointing it at a local model over

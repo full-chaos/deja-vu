@@ -95,19 +95,40 @@
 <p>skill catalogue into the turn and reads that directory, so it needs no file of</p>
 <p>its own — checked by asking a running dsh to list its skills.</p>
 <ul>
-<li><strong>Command</strong>: still open. Slash commands are plugin rows rather than files in a</li>
+<li><strong>Command</strong>: <code>deja install deepseek</code> also writes a plugin at</li>
 </ul>
-<p>directory, so a <code>/deja</code> command means shipping a command plugin.</p>
+<p><code>$DSH_HOME/plugins/deja/command.js</code> and names it from the same layer, because</p>
+<p>dsh registers slash commands in code (<code>ctx.commands.register</code>) rather than</p>
+<p>from a directory of markdown. A profile row may name an absolute path, which</p>
+<p>is how deja ships one without publishing a package. Three details fail the</p>
+<p>whole profile load rather than skipping the plugin, and each was found by</p>
+<p>running it: the dependency is declared as <code>apply.inject</code>, the field is</p>
+<p><code>handler</code> and not <code>handle</code>, and a row naming a file that is not there yet</p>
+<p>takes the profile down — so the plugin is written before the layer and the</p>
+<p>layer is rewritten before the plugin is removed. The command plane itself is</p>
+<p>a UI service, so <code>/deja</code> lives in the web profile; a headless run has no</p>
+<p>command adapter, and what a headless boot proves is that the plugin registers</p>
+<p>cleanly.</p>
 <ul>
-<li><strong>Auto-recall</strong>: no hook found. The harness has a plugin runtime but nothing</li>
+<li><strong>Auto-recall</strong>: <code>deja install deepseek-auto</code> writes a second plugin at</li>
 </ul>
-<p>published says which event runs before a prompt reaches the model, and one</p>
-<p>firing after is too late to inject recall.</p>
+<p><code>$DSH_HOME/plugins/deja/auto.js</code>. It listens on <code>agent/pre-step</code>, the event</p>
+<p>that carries the messages entering the step the agent is about to take, and</p>
+<p>splices the recall block in front of the last user message. The handler is</p>
+<p>middleware, so it calls <code>next()</code> first and returns that decision with the</p>
+<p>longer message list — returning a bare <code>{messages}</code> ends the turn with</p>
+<p><code>Cannot read properties of undefined (reading &#39;kind&#39;)</code>. The plain</p>
+<p><code>deja install deepseek</code> target keeps the MCP server and <code>/deja</code> but writes no</p>
+<p>such plugin, and removes it along with its row when someone drops back to it.</p>
+<p>Verified against a local model with no tools in play: dsh answered a question</p>
+<p>about a pool size that only the injected block carried.</p>
 <ul>
-<li><strong>Resume</strong>: the tui app takes <code>--resume &lt;session&gt;</code> (a flag of the booted app,</li>
+<li><strong>Resume</strong>: none. The launcher&#39;s examples mention a tui profile taking</li>
 </ul>
-<p>not of the launcher — <code>dsh --profile headless --resume</code> is rejected). deja</p>
-<p>stores the session id the flag wants, so the mapping is direct.</p>
+<p><code>--resume &lt;session&gt;</code>, but this release ships no bundle for one — the two apps</p>
+<p>are <code>headless</code>, which takes a task and exits, and <code>web</code>, whose flags are all</p>
+<p>about the server. Reopening a conversation is something the web sidebar does,</p>
+<p>so there is nothing for deja to print.</p>
 <ul>
 <li><strong>Handoff</strong>: paste.</li>
 </ul>
