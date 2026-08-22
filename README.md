@@ -231,9 +231,9 @@ Claude Code &middot; Cline &middot; Codex CLI &middot; opencode &middot; aider &
 | Cline | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Codex CLI | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | opencode | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | sqlite3 |
-| aider | ⚠ | ✅ | ? | ⚠ | ✕ | ✅ | deja aider |
-| Gemini CLI | ✅ | ✅ | ✅ | ✅ | — | ✅ | — |
-| Cursor | ✅ | ✅ | ✅ | ✅ | — | ✅ | sqlite3 (IDE chats) |
+| aider | ⚠ | ✅ | ✕ | ⚠ | ✕ | ✅ | deja aider |
+| Gemini CLI | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
+| Cursor | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | sqlite3 (IDE chats) |
 | Antigravity | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | Grok Build | ✅ | ✅ | ✅ | ✅ | ? | ✅ | sqlite3 (grok-dev store) |
 | Hermes | ✅ | ✅ | ✅ | ✅ | ✅ | paste | sqlite3 |
@@ -242,7 +242,7 @@ Claude Code &middot; Cline &middot; Codex CLI &middot; opencode &middot; aider &
 | Kimi Code | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | pi | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
 | omp (Oh My Pi) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | — |
-| OpenClaw | ✅ | ✅ | ✅ | ✅ | — | paste | — |
+| OpenClaw | ✅ | ✅ | ✅ | ✅ | ✅ | paste | — |
 | Copilot CLI | ✅ | ✕ | ✅ | ✅ | ✅ | ✅ | — |
 | Roo Code | ✅ | ⚠ | ✅ | ✅ | ✕ | paste | — |
 | DeepSeek Harness | ✅ | ✅ | ✅ | ✅ | ✕ | paste | zstd |
