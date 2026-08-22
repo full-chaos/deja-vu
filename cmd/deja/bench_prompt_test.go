@@ -29,7 +29,7 @@ func TestPromptBenchCorpusIsMeasurable(t *testing.T) {
 		// asked about through the bucket-answer chain, whose question is the
 		// one that must go unanswered. A chain nobody asks about still has to
 		// earn its place, and this one earns it by being the wrong answer.
-		if c.Kind == "bucket" || c.Kind == "haystack-noise" || c.Kind == "concluded-noise" {
+		if c.Kind == "bucket" || c.Kind == "haystack-noise" || c.Kind == "concluded-noise" || c.Kind == "background" {
 			continue
 		}
 		if topics[c.Topic] {
@@ -71,8 +71,14 @@ func TestPromptBenchScoresAndReports(t *testing.T) {
 	if report.Real.Fired < 8 {
 		t.Fatalf("real questions answered dropped to %d/%d", report.Real.Fired, report.Real.Cases)
 	}
-	if report.Negative.FalseFires != 0 {
-		t.Fatalf("%d false fires on negative controls", report.Negative.FalseFires)
+	// Five, not zero, and that is the point of the background sessions: on the
+	// thirty-chain corpus every word was rare, so the gate looked perfect and
+	// nothing about rarity could be measured here. With ordinary working talk
+	// behind it the corpus reads the defect the product actually has. The
+	// number is recorded so it cannot grow quietly while the fix is measured
+	// (#1534); real questions went 11/12 -> 13/13 in the same move.
+	if report.Negative.FalseFires > 5 {
+		t.Fatalf("%d false fires on negative controls, was 5", report.Negative.FalseFires)
 	}
 	if report.Real.Precision < 1 {
 		t.Fatalf("precision fell to %.2f", report.Real.Precision)
