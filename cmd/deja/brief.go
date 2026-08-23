@@ -94,7 +94,7 @@ func runBrief(dir string, w io.Writer) error {
 		fmt.Fprintf(w, "wire       %sno agent wired yet%s — `deja install --auto`\n", bold, reset)
 	}
 
-	recalls, bytes, _ := usage.TodayWithInjections(dir)
+	recalls, bytes, _ := usage.TodayDemand(dir)
 	weekRecalls, _, _, _ := usage.Week(dir)
 	dejaVu := usage.DejaVuWeek(dir)
 	// Only when the week has nothing at all to report. Recalls and déjà vu

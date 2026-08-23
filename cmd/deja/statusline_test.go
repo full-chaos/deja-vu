@@ -72,7 +72,7 @@ func TestStatuslineCountsRecalls(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "2 recalls") || !strings.Contains(got, "3.0 KB ctx") || !strings.Contains(got, "1.0 KB injected") {
+	if !strings.Contains(got, "1 recall") || !strings.Contains(got, "2.0 KB ctx") || !strings.Contains(got, "1.0 KB injected") {
 		t.Fatalf("statusline = %q", got)
 	}
 }
@@ -147,5 +147,23 @@ func TestStatuslineConflictOffersAWorkingCommand(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("conflict message is not a usable command, missing %q:\n%s", want, msg)
 		}
+	}
+}
+
+// A day of nothing but auto-recall is exactly the day the headline count is
+// zero — and the line still has to say what did arrive. Reporting "0 B
+// injected" there is the same untrue-line problem #1403 was opened about.
+func TestStatuslineReportsInjectionsWhenNoAgentAsked(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "index.db")
+	for range 5 {
+		usage.RecordResult(dir, usage.KindHook, 400, 1, false)
+	}
+	var out bytes.Buffer
+	if err := runStatusline(dir, strings.NewReader("{}"), &out); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "no agent recalls today") || !strings.Contains(got, "2.0 KB injected") {
+		t.Fatalf("statusline = %q", got)
 	}
 }

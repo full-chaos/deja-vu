@@ -161,6 +161,19 @@ func TestRotateKeepsRecentWindow(t *testing.T) {
 	}
 }
 
+func TestTodayExcludesEmptyRecallsAndInjections(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "index.db")
+	RecordResult(dir, KindRecall, 700, 1, true)
+	RecordResult(dir, KindHook, 300, 1, false)
+	RecordResult(dir, KindRecall, 500, 1, false)
+	if recalls, bytes, injected := TodayDemand(dir); recalls != 1 || bytes != 500 || injected != 300 {
+		t.Fatalf("today demand = %d recalls, %d bytes, %d injected; want 1/500/300", recalls, bytes, injected)
+	}
+	if recalls, bytes, injected := TodayWithInjections(dir); recalls != 3 || bytes != 1500 || injected != 300 {
+		t.Fatalf("today all = %d recalls, %d bytes, %d injected; want 3/1500/300", recalls, bytes, injected)
+	}
+}
+
 // Record must stay silent when the log directory cannot be created.
 func TestRecordSilentOnMkdirFailure(t *testing.T) {
 	parent := filepath.Join(t.TempDir(), "blocker")
