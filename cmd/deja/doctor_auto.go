@@ -94,6 +94,19 @@ func doctorAutoRecall(w io.Writer) {
 		if a.kind != "" {
 			note = "  (" + a.kind + ")"
 		}
+		// Same as the MCP line: the plugin carries this harness's recall, and
+		// its own hook is the one that runs when the installer has not written
+		// here at all.
+		if a.name == "kimi" && kimiPluginInstalled() && (err != nil || !strings.Contains(string(b), a.marker)) {
+			// Behind is the line worth the width: what it does is in the
+			// README, what to run is not obvious from anywhere.
+			note := kimiPluginNote()
+			if note == "" || note == "v"+kimiPluginVersion {
+				note = "the Kimi Code plugin recalls on every prompt"
+			}
+			fmt.Fprintf(w, "  %-12s %-11s %s  (%s)\n", a.name, "plugin", path, note)
+			continue
+		}
 		switch {
 		case err != nil:
 			fmt.Fprintf(w, "  %-12s %-11s %s%s\n", a.name, "missing", path, note)
