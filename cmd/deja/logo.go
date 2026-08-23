@@ -234,12 +234,18 @@ func firstIndexInfo(b index.BuildSummary, tryLine string) []string {
 		if h.Messages == 0 {
 			continue
 		}
-		info = append(info, fmt.Sprintf("%-*s  %s%6d%s messages · %d session%s",
-			nameW, h.Name, logoBold, h.Messages, logoReset, h.Sessions, pluralS(h.Sessions)))
+		// One session and one message is what a first run on a fresh machine
+		// looks like, and this line used to greet it with "1 messages" three
+		// words from a brief that said "1 session" (#1598).
+		// The noun is padded as well as the number: with one harness at 1 and
+		// another at 1000, a bare plural moved the separator a column left.
+		info = append(info, fmt.Sprintf("%-*s  %s%6d%s message%-2s · %d session%s",
+			nameW, h.Name, logoBold, h.Messages, logoReset, pluralS(h.Messages), h.Sessions, pluralS(h.Sessions)))
 	}
 	return append(info,
 		"",
-		fmt.Sprintf("indexed %s%d%s messages across %s%d%s agents", logoBold, b.Messages, logoReset, logoBold, b.Harnesses, logoReset),
+		fmt.Sprintf("indexed %s%d%s message%s across %s%d%s agent%s",
+			logoBold, b.Messages, logoReset, pluralS(b.Messages), logoBold, b.Harnesses, logoReset, pluralS(b.Harnesses)),
 		tryLine,
 	)
 }
