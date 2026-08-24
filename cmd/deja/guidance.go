@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -296,9 +297,29 @@ func writeGuidanceFile(path string, old, next []byte) (string, error) {
 		fmt.Printf("skill: kept your edited %s — `deja install --force` to take deja's version\n", shortHome(path))
 		return "kept", nil
 	}
+	// deja cannot tell its own pre-marks copy from a file someone else wrote at
+	// the same path, and treating every unmarked file as a stranger's would
+	// freeze the skill on every machine installed before marks existed
+	// (skill_marks.go). What it can do is say what it replaced, rather than
+	// calling it an update and leaving the backup unmentioned (#1703).
+	replacing := len(old) > 0 && !bytes.Equal(old, next) && !skillIsMarked(path)
+	if replacing {
+		// backupOnce keeps the first .bak it ever made and skips the rest, so
+		// the promise below would have named a copy of some older file while
+		// the one being destroyed went unsaved. This copy is of the content
+		// deja is about to replace, which is the only one the message can
+		// honestly point at (#1703).
+		if err := os.WriteFile(path+".bak", old, 0o600); err != nil {
+			return "", err
+		}
+	}
 	action, err := writeIfChanged(path, old, next)
 	if err != nil {
 		return action, err
+	}
+	if replacing && action != "unchanged" {
+		fmt.Printf("skill: replaced %s, which deja has no record of writing — your copy is at %s\n",
+			shortHome(path), shortHome(path+".bak"))
 	}
 	rememberSkill(path, next)
 	return action, nil
