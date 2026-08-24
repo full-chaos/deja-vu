@@ -36,7 +36,11 @@ type doctorStore struct {
 	// rather than the whole harness (#816).
 	// Unchecked says the permission walk stopped at its budget, so no
 	// permission problem past that point was looked for (#1025).
+	// Skipped is why part of the store could not be read at all — a missing
+	// sqlite3 or zstd CLI. The text row has carried it in its detail; a reader
+	// of --json saw a state and no reason (#1758).
 	Denied    string `json:"denied,omitempty"`
+	Skipped   string `json:"skipped,omitempty"`
 	Partial   bool   `json:"partial,omitempty"`
 	Unchecked bool   `json:"unchecked,omitempty"`
 }
@@ -315,6 +319,19 @@ func anotherFileOpens(files []string, except string) bool {
 	return false
 }
 
+// stateForMissingTool names the state by the tool that is missing. zed and
+// deepseek need zstd rather than sqlite3, and calling that "needs-sqlite3"
+// sends the reader to install the wrong package (#1758).
+func stateForMissingTool(reason string) string {
+	if strings.Contains(reason, "sqlite3") {
+		return "needs-sqlite3"
+	}
+	if strings.Contains(reason, "zstd") {
+		return "needs-zstd"
+	}
+	return "unreadable"
+}
+
 func presentDoctorFile(path string) []string {
 	// By content: an empty notes file is not a store with something in it, and
 	// counting it made the two forms of this command disagree about the same
@@ -438,6 +455,16 @@ func inspectDoctorStore(check doctorStoreCheck) (doctorStore, time.Time) {
 	_ = f.Close()
 	sessions, parseErr := check.parse(newest)
 	store.State = "ok"
+	// A store can be half-readable: cursor keeps CLI transcripts as JSONL and
+	// its IDE sessions in SQLite, so the newest file can parse while the other
+	// half cannot be read at all. The text row has said so in its detail all
+	// along; this form called the store ok (#1758).
+	if reason := sources.SkipReason(check.name); reason != "" {
+		store.State = stateForMissingTool(reason)
+		store.Skipped = reason
+		store.Partial = len(check.files) > 1
+		return store, mod
+	}
 	// A parser that could not run is not a store that could not be understood.
 	// Without this, removing the sqlite3 CLI told the user their harness had
 	// changed its format and asked them to report it — two lines above deja
