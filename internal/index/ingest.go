@@ -1566,6 +1566,18 @@ func sortedKeys[V any](m map[string]V) []string {
 var collisions atomic.Int64
 var emptied atomic.Int64
 
+// evicted counts the indexed files that left because their store went away —
+// a disk unmounted, a directory deleted. The command layer needs it to tell a
+// machine deja has never seen history from ("nothing to index yet") from one
+// whose history has just gone (#1762).
+var evicted atomic.Int64
+
+// ReportEvictedFiles returns how many indexed files were dropped for having
+// disappeared since the last build, and clears the counter.
+func ReportEvictedFiles() int {
+	return int(evicted.Swap(0))
+}
+
 // attributeSession decides which of two transcripts sharing an id owns the
 // manifest row, and whether they collided at all. Lexicographically smallest
 // path wins, so the answer does not depend on which file was read first.
@@ -1893,6 +1905,9 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 			}
 		}
 	}
+	// Counted after the keep-back above: records that came off an unmounted
+	// volume are still in the index, so they did not go away.
+	evicted.Add(int64(len(removed)))
 	if progress != nil {
 		for _, g := range gone {
 			verb := "is"
