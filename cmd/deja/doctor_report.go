@@ -216,7 +216,7 @@ func firstDeniedDir(paths []string) (string, bool) {
 // storeNeedsSQLite3 names the harnesses deja reads through the sqlite3 CLI.
 func storeNeedsSQLite3(name string) bool {
 	switch name {
-	case "opencode", "cursor", "grok", "hermes", "goose":
+	case "opencode", "cursor", "grok", "hermes", "goose", "zed":
 		return true
 	}
 	return false
@@ -277,8 +277,18 @@ func doctorStoreChecks() []doctorStoreCheck {
 		// (#999).
 		{"cline", []string{sources.ClineSessionsDir()}, sources.ClineSessionFiles(), sources.ParseClineFile},
 		{"roo", sources.RooRoots(), sources.RooTaskFiles(), sources.ParseRooTask},
+		{"deepseek", []string{sources.DeepSeekRoot()}, sources.DeepSeekSessionFiles(), sources.ParseDeepSeekFile},
+		// Zed keeps one SQLite store rather than session files, so the file
+		// list is the database itself — the shape opencode's row uses.
+		{"zed", []string{sources.ZedDB()}, presentDoctorFile(sources.ZedDB()), doctorProbeZed},
 		{"deja", []string{sources.NotesFile()}, presentDoctorFile(sources.NotesFile()), sources.ParseNotesFile},
 	}
+}
+
+// doctorProbeZed reads the thread store the way the indexer does, so the row
+// says what a real read would find rather than that the file exists.
+func doctorProbeZed(path string) ([]model.Session, error) {
+	return sources.ParseZedDB(path)
 }
 
 func presentDoctorFile(path string) []string {
