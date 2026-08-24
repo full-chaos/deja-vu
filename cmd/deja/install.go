@@ -854,6 +854,22 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 	}
 	tmp, terr := os.CreateTemp(filepath.Dir(path), ".deja-tmp-")
 	if terr != nil {
+		// The scratch file is deja's business; the reader's is the config it
+		// could not write. A read-only ~/.codex was reported as a permission
+		// error on ~/.codex/.deja-tmp-4168817699, which cannot be looked at,
+		// chmod-ed or found (#1686, the shape of #865). Rewriting the path in
+		// place keeps the error a *PathError, so errors.Is still sees the
+		// permission underneath and the remedy still names permissions.
+		//
+		// Only for a permission denial: the destination is the right thing to
+		// name when the directory refuses us, and the wrong thing when the
+		// failure is about the scratch file itself — "config.toml: no such
+		// file or directory" would send the reader after a directory that is
+		// the actual problem.
+		var pe *os.PathError
+		if errors.Is(terr, fs.ErrPermission) && errors.As(terr, &pe) {
+			pe.Path = path
+		}
 		return "", terr
 	}
 	tmpName := tmp.Name()
