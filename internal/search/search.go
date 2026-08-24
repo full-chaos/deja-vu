@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -1786,14 +1787,105 @@ func collapseTool(s string) string {
 var (
 	lineNumberRE = regexp.MustCompile(`^\s*\d{1,5}[:|]\s+`)
 	toolDumpRE   = regexp.MustCompile(`(?i)(tool_use|tool_result|<local-command|netcat|npm ERR!|panic:|goroutine \d+)`)
+	// The literal each alternative of toolDumpRE begins with, in the same
+	// order. A line holding none of them cannot match, and looksToolDump uses
+	// that to skip the engine entirely.
+	toolDumpLiterals = []string{"tool_use", "tool_result", "<local-command", "netcat", "npm err!", "panic:", "goroutine "}
 )
+
+// containsFold is strings.Contains for a lowercase ASCII needle, without
+// allocating a lowercased copy of the line.
+func containsFold(hay, lowerNeedle string) bool {
+	if len(lowerNeedle) == 0 || len(hay) < len(lowerNeedle) {
+		return len(lowerNeedle) == 0
+	}
+	last := len(hay) - len(lowerNeedle)
+	for i := 0; i <= last; i++ {
+		k := 0
+		for k < len(lowerNeedle) {
+			c := hay[i+k]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != lowerNeedle[k] {
+				break
+			}
+			k++
+		}
+		if k == len(lowerNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolDumpEngineCalls counts the lines that reach the regexp engine. The point
+// of the prefilter is that ordinary prose does not, and a counter says so in a
+// test without timing anything (#1742).
+var toolDumpEngineCalls atomic.Int64
+
+// looksToolDump is toolDumpRE with the scan the regexp engine spends most of
+// its time on done by hand: every alternative starts with a literal, so a line
+// holding none of them cannot match. Rendering a digest ran this per line over
+// the whole session — 16.5 s of the 17 s a 240 MB render took (#1742).
+func looksToolDump(line string) bool {
+	for i := 0; i < len(line); i++ {
+		if line[i] >= 0x80 {
+			// Case folding is Unicode-wide in the engine (ſ folds to s), and
+			// this prefilter is ASCII. A line with any byte outside ASCII goes
+			// to the engine rather than being decided here.
+			toolDumpEngineCalls.Add(1)
+			return toolDumpRE.MatchString(line)
+		}
+	}
+	for _, lit := range toolDumpLiterals {
+		if containsFold(line, lit) {
+			toolDumpEngineCalls.Add(1)
+			return toolDumpRE.MatchString(line)
+		}
+	}
+	return false
+}
+
+// looksNumbered is lineNumberRE — `^\s*\d{1,5}[:|]\s+` — read directly. It
+// anchors at the start, so the whole line never needs scanning.
+func looksNumbered(line string) bool {
+	i := 0
+	for i < len(line) && isRegexSpace(line[i]) {
+		i++
+	}
+	digits := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' && digits < 6 {
+		i++
+		digits++
+	}
+	if digits == 0 || digits > 5 || i >= len(line) {
+		return false
+	}
+	if line[i] != ':' && line[i] != '|' {
+		return false
+	}
+	i++
+	return i < len(line) && isRegexSpace(line[i])
+}
+
+// isRegexSpace is \s as the regexp engine reads it: [\t\n\f\r ]. Leaving out
+// the ones a caller usually trims is how a fast path drifts from the pattern it
+// stands in for.
+func isRegexSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\f', '\r':
+		return true
+	}
+	return false
+}
 
 func proseForSnippet(s string) string {
 	s = redact.SafeForDisplay(s)
 	var keep []string
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || lineNumberRE.MatchString(line) || toolDumpRE.MatchString(line) {
+		if line == "" || looksNumbered(line) || looksToolDump(line) {
 			continue
 		}
 		keep = append(keep, line)
