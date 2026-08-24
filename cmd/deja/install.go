@@ -1404,6 +1404,63 @@ func updateOpencodeJSON(old []byte, exe string, uninstall bool) ([]byte, error) 
 	return append(next, '\n'), nil
 }
 
+// jsoncLastCodeLine finds the last line of a .jsonc block that a parser would
+// read as code, and where that code ends on it. It returns -1 when the block
+// holds nothing but comments and blank lines.
+//
+// The comma that joins deja's entry to the previous one has to land at the end
+// of the code, not the end of the line. Appended after a trailing // comment it
+// is stripped with the comment and the two entries lose their separator;
+// appended inside a /* … */ block it either vanishes with the block or is left
+// behind as a comma of its own (#1695).
+func jsoncLastCodeLine(body []string) (idx, end int, code string) {
+	idx = -1
+	inBlock := false
+	for i, line := range body {
+		c, nextBlock, e := jsoncCodeOf(line, inBlock)
+		if c != "" {
+			idx, end, code = i, e, c
+		}
+		inBlock = nextBlock
+	}
+	return idx, end, code
+}
+
+// jsoncCodeOf returns the code a parser reads on one line, whether the line
+// leaves a /* … */ block open, and the offset where that code ends.
+func jsoncCodeOf(line string, inBlock bool) (code string, stillInBlock bool, end int) {
+	var b strings.Builder
+	inString, escaped := false, false
+	end = 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if inBlock {
+			if c == '*' && i+1 < len(line) && line[i+1] == '/' {
+				inBlock, i = false, i+1
+			}
+			continue
+		}
+		switch {
+		case escaped:
+			escaped = false
+		case c == '\\' && inString:
+			escaped = true
+		case c == '"':
+			inString = !inString
+		case !inString && c == '/' && i+1 < len(line) && line[i+1] == '/':
+			return strings.TrimSpace(b.String()), false, end
+		case !inString && c == '/' && i+1 < len(line) && line[i+1] == '*':
+			inBlock, i = true, i+1
+			continue
+		}
+		b.WriteByte(c)
+		if c != ' ' && c != '\t' {
+			end = i + 1
+		}
+	}
+	return strings.TrimSpace(b.String()), inBlock, end
+}
+
 func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, error) {
 	line := fmt.Sprintf(`    "deja": {"type":"local","command":[%q,"mcp"]}`, exe)
 	s := string(old)
@@ -1437,12 +1494,15 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, error)
 			}
 		}
 		if !uninstall {
-			for i := len(body) - 1; i >= 0; i-- {
-				trim := strings.TrimSpace(body[i])
-				if trim != "" && !strings.HasPrefix(trim, "//") && !strings.HasSuffix(trim, ",") {
-					body[i] += ","
-					break
-				}
+			// Only the last line that carries content decides whether a comma
+			// is needed. Walking on past it — which is what looking for the
+			// first line not ending in a comma did — runs through an entry
+			// whose every line ends in one, which is what a .jsonc written
+			// with trailing commas looks like, and puts the comma on the line
+			// that opens the entry: `"mine": {,` (#1695).
+			if i, code, trim := jsoncLastCodeLine(body); i >= 0 &&
+				!strings.HasSuffix(trim, ",") && !strings.HasSuffix(trim, "{") && !strings.HasSuffix(trim, "[") {
+				body[i] = body[i][:code] + "," + body[i][code:]
 			}
 			body = append(body, line)
 		}
