@@ -268,9 +268,55 @@ func keepRegular(paths []string) []string {
 	return out
 }
 
+// resolvedRoot follows a store root that is itself a symlink. People keep
+// ~/.claude in a dotfiles repo, on an external disk, in a synced folder;
+// WalkDir lstats its root, so the walk saw a symlink rather than a directory
+// and descended nowhere — the store indexed nothing while every surface called
+// it found and empty (#1744). Only the root: a link inside a store is still
+// skipped, which is what keeps a FIFO from hanging the build and a link from
+// walking out of the store.
+func resolvedRoot(root string) string {
+	fi, err := os.Lstat(root)
+	if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		return root
+	}
+	target, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return root
+	}
+	if st, err := os.Stat(target); err != nil || !st.IsDir() {
+		return root
+	}
+	return target
+}
+
+// walkRoot returns the directory to walk for a configured root and a function
+// putting each walked path back under that root. Walking the target is what
+// makes a symlinked store readable; reporting the configured spelling is what
+// keeps it usable, since the kind predicates test strings.HasPrefix against the
+// root and the manifest and the incremental pass key on the same string.
+func walkRoot(root string) (string, func(string) string) {
+	walked := resolvedRoot(root)
+	if walked == root {
+		return root, func(p string) string { return p }
+	}
+	return walked, func(p string) string {
+		rel, err := filepath.Rel(walked, p)
+		if err != nil {
+			return p
+		}
+		return filepath.Join(root, rel)
+	}
+}
+
 func walkFiles(root string, pred func(string) bool) []string {
 	var out []string
-	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	// Walk the target, report paths under the configured root: everything
+	// downstream — the kind predicates that test strings.HasPrefix against the
+	// root, the manifest, the incremental offsets — keys on the path the user
+	// configured, and handing it two spellings of one file loses the file.
+	walked, under := walkRoot(root)
+	_ = filepath.WalkDir(walked, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			// A directory the process cannot read takes its sessions out of
 			// recall. Dropping the error here left the index run with nothing
@@ -286,8 +332,8 @@ func walkFiles(root string, pred func(string) bool) []string {
 		// no writer and never returns, so one such file in a scanned store
 		// froze indexing for good. IsRegular already excludes symlinks and
 		// directories, so it subsumes the checks it replaces.
-		if d.Type().IsRegular() && pred(p) {
-			out = append(out, p)
+		if q := under(p); d.Type().IsRegular() && pred(q) {
+			out = append(out, q)
 		}
 		return nil
 	})
