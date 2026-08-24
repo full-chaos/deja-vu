@@ -830,6 +830,15 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 		if h.Superseded != "" {
 			fmt.Fprintf(&hb, "[earlier attempt — a newer session in this project covers the same ground, updated %s]\n", h.Superseded)
 		}
+		// `deja brief` counts these — a wrong clock, a transcript copied from a
+		// machine set wrong, a harness writing local time as UTC — so deja knew
+		// and the page that an agent reads did not. The date stays as the
+		// transcript wrote it; what is added is that it cannot be trusted for
+		// "newest", which is the one thing the top of a recall page implies
+		// (#1753).
+		if index.StampedAhead(h.Session.Updated, time.Now()) {
+			fmt.Fprintln(&hb, "[stamped later than this machine's clock — its date cannot place it against the others]")
+		}
 		if h.Tier != search.TierExact {
 			fmt.Fprintf(&hb, "[%s]\n", h.Tier)
 		}
