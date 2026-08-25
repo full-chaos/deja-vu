@@ -32,6 +32,14 @@ type Peer struct {
 	// succeeds. A peer that has been failing for a week is the thing this file
 	// exists to make visible.
 	LastError string `json:"last_error,omitempty"`
+	// Machine is what the host calls itself, learned from the records that
+	// arrived from it. Host is an ssh alias someone typed, and an imported
+	// session is stamped with the sender's own hostname, so counting what came
+	// from a machine by its alias found nothing whenever the two differ — the
+	// normal case for anyone with an ssh config (#1887). Absent until a pull
+	// has something to learn from, so a file written before this reads
+	// unchanged.
+	Machine string `json:"machine,omitempty"`
 }
 
 // Last is the more recent of the two directions.
@@ -174,6 +182,9 @@ func mergePeers(a, b Peer) Peer {
 	if b.Last().After(a.Last()) {
 		out.LastError = b.LastError
 	}
+	if out.Machine == "" {
+		out.Machine = b.Machine
+	}
 	return out
 }
 
@@ -223,6 +234,40 @@ func recordLocked(host string, pulled bool, when time.Time, err error) error {
 		}
 	}
 	return save(list)
+}
+
+// machineNameMax bounds a learned name. A hostname's own limit is 253 bytes;
+// this is the same figure deja bounds an exported field to.
+const machineNameMax = 120
+
+// Learn notes what a host calls itself, so what arrived from it can be counted
+// against its row. Nothing is written when the name is empty or already there.
+func Learn(host, machine string) error {
+	host, machine = strings.TrimSpace(host), strings.TrimSpace(machine)
+	if host == "" || machine == "" {
+		return nil
+	}
+	// The name is another machine's word for itself. Import already bounds it,
+	// but this file outlives any one index and is read by every sync, so the
+	// bound is applied where the value is written rather than trusted from
+	// upstream. A name longer than this is not one.
+	if r := []rune(machine); len(r) > machineNameMax {
+		machine = string(r[:machineNameMax])
+	}
+	return withLock(func() error {
+		list := Load()
+		for i := range list {
+			if identity(list[i].Host) != identity(host) {
+				continue
+			}
+			if list[i].Machine == machine {
+				return nil
+			}
+			list[i].Machine = machine
+			return save(list)
+		}
+		return nil
+	})
 }
 
 // Forget drops a host from the list. Reports whether it was there.

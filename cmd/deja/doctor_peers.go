@@ -48,7 +48,7 @@ func doctorPeers(w io.Writer, dir string, now time.Time) {
 		}
 	}
 	for i, p := range list {
-		state := peerLine(p, from[peers.Identity(p.Host)], now)
+		state := peerLine(p, peerSessionCount(from, p), now)
 		pad := width - termwidth.Columns(names[i])
 		if pad < 0 {
 			fmt.Fprintf(w, "  %s\n  %s %s\n", names[i], strings.Repeat(" ", width), state)
@@ -147,4 +147,45 @@ func importsByPeerName(dir string) map[string]int {
 		out[peers.Identity(name)] += n
 	}
 	return out
+}
+
+// peerSessionCount is what arrived from one machine, by either name it is known
+// under: the alias in the row, or what the machine calls itself, learned from a
+// pull (#1887).
+func peerSessionCount(from map[string]int, p peers.Peer) int {
+	if n := from[peers.Identity(p.Host)]; n > 0 {
+		return n
+	}
+	if p.Machine == "" {
+		return 0
+	}
+	return from[peers.Identity(p.Machine)]
+}
+
+// learnPeerMachine notes what the host deja just pulled from calls itself.
+//
+// The pairing is only ever visible here: the alias is what the connection used,
+// and the origin is stamped on the records that arrived. `before` is the count
+// per machine taken ahead of the import, so only what this exchange brought is
+// attributed — a batch from a third machine already in the index must not
+// rename the peer.
+func learnPeerMachine(dir, host string, before map[string]int) {
+	best, grown := "", 0
+	for name, n := range importsByPeerName(dir) {
+		if n > before[peers.Identity(name)] {
+			best = name
+			grown++
+		}
+	}
+	// Only when one machine grew. A batch can carry records from more than one
+	// origin — a machine that itself imported from a third — and another
+	// process can import while this runs, so picking the largest of several
+	// would sometimes write down a machine this host never sent. Learning
+	// nothing leaves the count at zero, which is what it was.
+	if grown != 1 || peers.Identity(best) == peers.Identity(host) {
+		return
+	}
+	// Best effort: a sync that worked must not fail because a name could not be
+	// written down.
+	_ = peers.Learn(host, best)
 }
