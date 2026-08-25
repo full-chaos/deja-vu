@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +41,43 @@ func isNotification(id json.RawMessage) bool {
 	return len(id) == 0 || string(id) == "null"
 }
 
+// parseBatch reports whether a frame is an array of requests, and returns them.
+// A frame that only starts like one — a truncated `[` — is not a batch and
+// keeps its parse error.
+func parseBatch(frame string) ([]json.RawMessage, bool) {
+	if !strings.HasPrefix(frame, "[") {
+		return nil, false
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(frame), &elems); err != nil {
+		return nil, false
+	}
+	return elems, true
+}
+
+// batchReply says whether a batch is owed an answer and which id to put on it.
+// The id is the first request in the array that carries one, so the refusal can
+// be matched to something the client sent. A batch of nothing but notifications
+// is owed no answer — the spec forbids replying to one, inside a batch or out
+// of it — while an empty or malformed array is an invalid request like any
+// other and gets the refusal with a null id.
+func batchReply(elems []json.RawMessage) (json.RawMessage, bool) {
+	notificationsOnly := len(elems) > 0
+	for _, elem := range elems {
+		var req rpcRequest
+		if !bytes.HasPrefix(bytes.TrimSpace(elem), []byte("{")) || json.Unmarshal(elem, &req) != nil {
+			// Not a request object at all, so it asked for nothing and is not
+			// a notification either: the array is malformed and says so.
+			notificationsOnly = false
+			continue
+		}
+		if !isNotification(req.ID) {
+			return req.ID, true
+		}
+	}
+	return nil, !notificationsOnly
+}
+
 const mcpMaxFrame = 10 * 1024 * 1024
 
 func serveMCP(dir string, r io.Reader, w io.Writer) error {
@@ -52,8 +91,25 @@ func serveMCP(dir string, r io.Reader, w io.Writer) error {
 			writeRPCError(enc, nil, -32700, "parse error")
 		} else if trimmed := strings.TrimSpace(string(line)); trimmed != "" {
 			var req rpcRequest
-			if uerr := json.Unmarshal([]byte(trimmed), &req); uerr != nil {
+			if batch, isBatch := parseBatch(trimmed); isBatch {
+				// A batch is valid JSON, and answering -32700 told a client its
+				// bytes were corrupt when they were not — with a null id, so it
+				// could not tell which of its requests died either. deja serves
+				// one request per frame; the refusal says so (#1795). A batch
+				// carrying nothing but notifications gets no reply at all, as a
+				// notification does on its own line: the spec forbids answering
+				// one, inside a batch or out of it.
+				if id, answer := batchReply(batch); answer {
+					writeRPCError(enc, id, -32600, "batch requests are not supported — send one request per line")
+				}
+			} else if uerr := json.Unmarshal([]byte(trimmed), &req); uerr != nil {
 				writeRPCError(enc, nil, -32700, "parse error")
+			} else if req.JSONRPC != "" && req.JSONRPC != "2.0" {
+				// The member that says which protocol the frame speaks. An
+				// absent one is still served — clients in the wild omit it and
+				// the request is unambiguous — but "1.0" asks for a protocol
+				// this server does not speak and used to be answered anyway.
+				writeRPCError(enc, req.ID, -32600, "unsupported jsonrpc version "+req.JSONRPC+" — this server speaks 2.0")
 			} else if !isNotification(req.ID) {
 				result, code, msg := handleMCP(dir, req)
 				if code != 0 {
@@ -190,6 +246,43 @@ func toolText(text string) map[string]any {
 	return map[string]any{"content": []map[string]string{{"type": "text", "text": text}}}
 }
 
+// decodeToolArgs reads a tool call's arguments. The field is optional in the
+// protocol, so an absent one is an empty object rather than an error, and a
+// decode failure is reported in terms of the argument the caller sent — an
+// agent can fix `"query" must be a string`, it can do nothing with
+// `json: cannot unmarshal number into Go struct field .query` (#1723).
+func decodeToolArgs(tool string, raw json.RawMessage, into any) error {
+	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
+		raw = json.RawMessage("{}")
+	}
+	err := json.Unmarshal(raw, into)
+	if err == nil {
+		return nil
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) && typeErr.Field != "" {
+		return fmt.Errorf("%s: %q must be %s", tool, strings.TrimPrefix(typeErr.Field, "."), jsonTypeName(typeErr.Type.Kind()))
+	}
+	return fmt.Errorf("%s: arguments must be an object", tool)
+}
+
+// jsonTypeName names a Go kind the way the tool schema does, so the message
+// matches what the caller was asked for rather than how it is stored.
+func jsonTypeName(k reflect.Kind) string {
+	switch k {
+	case reflect.String:
+		return "a string"
+	case reflect.Bool:
+		return "a boolean"
+	case reflect.Slice, reflect.Array:
+		return "an array"
+	case reflect.Map, reflect.Struct:
+		return "an object"
+	default:
+		return "a number"
+	}
+}
+
 func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 	switch name {
 	case "recall":
@@ -199,7 +292,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			Limit   mcpNumber `json:"limit"`
 			Offset  mcpNumber `json:"offset"`
 		}
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if err := decodeToolArgs(name, raw, &a); err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(a.Query) == "" {
@@ -211,9 +304,15 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		if line := buildingNowForAgent(dir); line != "" {
 			return frameRecall(line), nil
 		}
-		text, sessions, raw, ids, err := recallTextResult(dir, a.Query, a.Harness, int(a.Limit), int(a.Offset), 4096-recallFrameOverhead)
+		// The block goes out once per session and lands after the frame, so it
+		// has to come out of the same budget: appended afterwards it put the
+		// first recall of every session — the one an agent plans against — over
+		// the cap by its own length (#1806).
+		env, deliverEnv := environmentOnce(dir)
+		text, sessions, raw, ids, err := recallTextResult(dir, a.Query, a.Harness, int(a.Limit), int(a.Offset), recallMCPBudget-recallFrameOverhead-len(env))
 		if err == nil {
-			text = frameRecall(text) + environmentOnce(dir)
+			text = frameRecall(text) + env
+			deliverEnv()
 			usage.RecordServedSessions(dir, usage.KindRecall, len(text), sessions, sessions == 0, raw, ids)
 			usage.SnapshotPolicy(dir, usage.KindRecall, text, sessions, policy.Load().Describe(policy.ActivationMCP))
 		}
@@ -223,7 +322,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			Query   string `json:"query"`
 			Harness string `json:"harness"`
 		}
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if err := decodeToolArgs(name, raw, &a); err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(a.Query) == "" {
@@ -237,7 +336,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		}
 		text, sessions, raw, ids, err := recallContextResult(dir, a.Query, a.Harness)
 		if err == nil {
-			text = frameRecall(text)
+			text = frameRecall(fitContextDigest(text, a.Query, contextMCPBudget-recallFrameOverhead))
 			usage.RecordServedSessions(dir, usage.KindContext, len(text), sessions, sessions == 0, raw, ids)
 			usage.SnapshotPolicy(dir, usage.KindContext, text, sessions, policy.Load().Describe(policy.ActivationMCP))
 		}
@@ -251,7 +350,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			Limit   mcpNumber `json:"limit"`
 			All     bool      `json:"all"`
 		}
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if err := decodeToolArgs(name, raw, &a); err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(a.Path) == "" {
@@ -268,10 +367,11 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 				return "", err
 			}
 		}
-		// blame reaches index.EnsureForSearch through findBlameHits, which
-		// blocks and can run the whole build inside this call. The CLI keeps
-		// that — someone typed it and watches the progress — but an agent gets
-		// the same sentence as every other tool (#1306).
+		// The agent-facing blame reads without waiting, the way recall does:
+		// it is the tool called before editing a file, so declining for the
+		// length of a refresh means the edit happens without the history
+		// (#1784). Only a store deja cannot answer from at all still gets the
+		// sentence (#1306).
 		if line := buildingNowForAgent(dir); line != "" {
 			return line, nil
 		}
@@ -290,7 +390,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			Error string    `json:"error"`
 			Limit mcpNumber `json:"limit"`
 		}
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if err := decodeToolArgs(name, raw, &a); err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(a.Error) == "" {
@@ -329,7 +429,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			Project string    `json:"project"`
 			Limit   mcpNumber `json:"limit"`
 		}
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if err := decodeToolArgs(name, raw, &a); err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(a.What) == "" {
@@ -377,7 +477,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			Project string   `json:"project"`
 			Tags    []string `json:"tags"`
 		}
-		if err := json.Unmarshal(raw, &a); err != nil {
+		if err := decodeToolArgs(name, raw, &a); err != nil {
 			return "", err
 		}
 		if strings.TrimSpace(a.Text) == "" {
@@ -386,23 +486,41 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		if strings.TrimSpace(a.Project) == "" {
 			a.Project = "notes"
 		}
-		if err := notesWriteError(sources.AppendNoteTagged(a.Project, a.Text, a.Tags, time.Now())); err != nil {
-			return "", err
+		switch err := sources.AppendNoteTagged(a.Project, a.Text, a.Tags, time.Now()); {
+		case errors.Is(err, sources.ErrNoteExists):
+			// Not an error to the agent: the fact it wanted stored is stored.
+			// Saying so stops it retrying, and stops one fact costing a line of
+			// every later recall (#1736).
+			return fmt.Sprintf("Already remembered under %s.", projectForEcho(a.Project)), nil
+		case err != nil:
+			return "", notesWriteError(err)
 		}
 		// The note is on disk either way; what is left is making it findable.
 		// On upgrade day that meant rebuilding the whole index inside the call
 		// (#1309), so the agent is told instead — the detached warmup picks it
 		// up with everything else.
-		if line := buildingNowForAgent(dir); line != "" {
+		if line := buildingNowForBlockingTool(dir); line != "" {
 			return "Saved. " + line, nil
 		}
-		if err := index.EnsureForSearch(dir, search.Options{All: true}, false, mcpProgress()); err != nil {
+		// The check above cannot cover a rebuild that starts after it: it and a
+		// blocking Ensure ask the same lock a moment apart, and what began in
+		// between was waited out inside the client's call (#1804). One attempt
+		// at the lock decides both.
+		busy, err := index.EnsureForSearchNoWait(dir, search.Options{All: true}, mcpProgress())
+		if err != nil {
 			return "", err
+		}
+		if busy {
+			requestWarmup(dir)
+			if line := buildingNowForBlockingTool(dir); line != "" {
+				return "Saved. " + line, nil
+			}
+			return "Saved. deja is refreshing its index; this note becomes findable when that finishes, in a few seconds.", nil
 		}
 		// The journal is where the user sees what the agent did with their
 		// store; a write belongs there at least as much as a read.
 		usage.RecordResult(dir, usage.KindRemember, len(a.Text), 1, false)
-		return fmt.Sprintf("Remembered under %s.", strings.TrimSpace(a.Project)), nil
+		return fmt.Sprintf("Remembered under %s.", projectForEcho(a.Project)), nil
 	default:
 		return "", fmt.Errorf("unknown tool %q", name)
 	}
@@ -414,7 +532,7 @@ func blameTextResult(dir string, o search.BlameOptions, path string, limit int) 
 	if err != nil {
 		return "", 0, err
 	}
-	hits, _, err := findBlameHits(dir, target, o, policy.ActivationMCP, mcpProgress())
+	hits, _, refreshing, err := findBlameHitsStale(dir, target, o, policy.ActivationMCP, mcpProgress())
 	if err != nil {
 		return "", 0, err
 	}
@@ -435,19 +553,82 @@ func blameTextResult(dir string, o search.BlameOptions, path string, limit int) 
 	// used to skip the truncation above and hand back 162 KB from a store where
 	// 300 sessions touched one file (#1071); a cap that an argument can turn
 	// off is not a cap.
-	body := mustMarshalBlame(hits, 0)
+	// Trimmed without the note, then rebuilt with it: a session must not be
+	// dropped to make room for a sentence about the index. The answer can end
+	// up the note's length over the budget, which is about a hundred bytes and
+	// worth more than the session it would otherwise cost.
+	body := mustMarshalBlame(hits, 0, false)
 	for len(body) > blameMCPBudget && len(hits) > 1 {
 		hits = hits[:max(len(hits)*3/4, 1)]
-		body = mustMarshalBlame(hits, 0)
+		body = mustMarshalBlame(hits, 0, false)
+	}
+	if refreshing {
+		body = mustMarshalBlame(hits, 0, true)
 	}
 	if omitted := found - len(hits); omitted > 0 {
 		// Silently returning the top slice let an agent conclude it had seen
 		// every session that touched the file. Say what was left out and what
 		// to do about it.
-		body = mustMarshalBlame(hits, omitted)
+		body = mustMarshalBlame(hits, omitted, refreshing)
 	}
 	return string(body), len(hits), nil
 }
+
+// recallMCPBudget is the whole recall reply: the framed page and, on the first
+// call of a session, the environment block after it.
+const recallMCPBudget = 4096
+
+// contextDigestCut is the line that admits a digest was cut. Without it the
+// reply ends mid-word and reads as the whole session, which is what an agent
+// then tells the user it saw.
+const contextDigestCut = "\n[digest trimmed to fit the ~8KB budget — call recall_context again for another session, or deja ctx <id> for the whole one]\n"
+
+// fitContextDigest trims a digest to budget, cutting at a line boundary where
+// one is near enough and saying that it cut. The marker is reserved before the
+// trim, the way recall reserves its paging line (#1726), so the thing that
+// explains the cut is not itself the thing that gets cut.
+func fitContextDigest(text, query string, budget int) string {
+	if len(text) <= budget {
+		return text
+	}
+	if budget <= len(contextDigestCut) {
+		return trimUTF8(text, budget)
+	}
+	body := trimUTF8(text, budget-len(contextDigestCut))
+	// Back up to the last line break if one is close, so the digest does not
+	// end in the middle of a sentence it will not finish — but never at the
+	// cost of the words the digest was asked for. A match sitting in that last
+	// line is the answer; ending mid-word is only untidy.
+	if i := strings.LastIndexByte(body, '\n'); i > len(body)-400 && i > 0 {
+		if shorter := body[:i]; keepsQuery(shorter, body, query) {
+			body = shorter
+		}
+	}
+	return body + contextDigestCut
+}
+
+// keepsQuery reports whether the shorter body still carries a query word that
+// the longer one did. A query whose words are nowhere in either is no reason to
+// keep the ragged ending.
+func keepsQuery(shorter, longer, query string) bool {
+	for _, word := range strings.Fields(strings.ToLower(query)) {
+		if len(word) < 3 {
+			continue
+		}
+		if strings.Contains(strings.ToLower(longer), word) && !strings.Contains(strings.ToLower(shorter), word) {
+			return false
+		}
+	}
+	return true
+}
+
+// contextMCPBudget is the whole framed recall_context reply, matching the
+// "~8KB" its tool description promises an agent. recall has been exact since it
+// passed 4096-recallFrameOverhead; this path passed no budget at all, so the
+// digest header — which carries a project name and a session id, neither of
+// them bounded — pushed an ordinary reply to 8221 bytes and a long-named one to
+// 8335 (#1797).
+const contextMCPBudget = 8192
 
 // blameMCPBudget bounds one blame answer. Higher than recall's ~4 KB because a
 // hit is a whole session rather than a snippet, and well under what an agent
@@ -471,13 +652,38 @@ type blameSessionJSON struct {
 	Project string    `json:"project,omitempty"`
 	Path    string    `json:"path,omitempty"`
 	Title   string    `json:"title,omitempty"`
-	Started time.Time `json:"started,omitempty"`
-	Updated time.Time `json:"updated,omitempty"`
+	Started time.Time `json:"-"`
+	Updated time.Time `json:"-"`
 	Touched []string  `json:"touched,omitempty"`
 }
 
-func mustMarshalBlame(hits []search.BlameHit, omitted int) []byte {
-	out := make([]any, 0, len(hits)+1)
+// MarshalJSON drops a stamp the harness never wrote. `omitempty` does nothing
+// to a struct, so a session with no start time told the agent it began in
+// January of year 1 (#1874).
+func (s blameSessionJSON) MarshalJSON() ([]byte, error) {
+	type plain blameSessionJSON
+	out := struct {
+		plain
+		Started *time.Time `json:"started,omitempty"`
+		Updated *time.Time `json:"updated,omitempty"`
+	}{plain: plain(s)}
+	if !s.Started.IsZero() {
+		out.Started = &s.Started
+	}
+	if !s.Updated.IsZero() {
+		out.Updated = &s.Updated
+	}
+	return json.Marshal(out)
+}
+
+func mustMarshalBlame(hits []search.BlameHit, omitted int, refreshing bool) []byte {
+	out := make([]any, 0, len(hits)+2)
+	if refreshing {
+		// The answer is the snapshot on disk while a rebuild adds to it — the
+		// same thing recall says in prose, said here in the shape this tool
+		// answers in (#1784).
+		out = append(out, map[string]any{"note": "index refresh running in the background — the very newest sessions may not appear yet"})
+	}
 	for _, h := range hits {
 		out = append(out, blameHitJSON{
 			Session: blameSessionJSON{
@@ -661,6 +867,18 @@ func wholeSessionForMCP(dir string, s model.Session) (model.Session, bool, error
 // needs precisely when the answer was too big to fit.
 const recallCountLineReserve = 160
 
+// twinSessionsFor pairs each session with the same session as it exists on
+// another machine, so a page holding both copies can say so. One manifest read
+// per page; empty when the index cannot be read, which costs a marker rather
+// than an answer.
+func twinSessionsFor(dir string) map[string][]string {
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return nil
+	}
+	return index.TwinSessions(metas)
+}
+
 func recallTextResult(dir, q, harness string, limit, offset, budget int) (string, int, int64, []string, error) {
 	if limit <= 0 {
 		limit = 5
@@ -722,6 +940,7 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 	// attempts and none of the 5 clean ones.
 	total := len(hits)
 	attachLifecycles(dir, hits)
+	twins := twinSessionsFor(dir)
 	demoted := demoteRejected(hits)
 	if offset > 0 {
 		if offset >= total {
@@ -784,8 +1003,29 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 		if h.Session.GaveUp && h.Lifecycle == "" {
 			fmt.Fprintln(&hb, "[this session abandoned one approach partway — check the excerpts for which, the rest may still hold]")
 		}
+		// Sync keeps both copies when a session id is on two machines, and
+		// nothing connected them: one session's two histories read as two
+		// unrelated sessions, sometimes disagreeing with each other (#1775).
+		if twin := twins[h.Session.Harness+":"+h.Session.ID]; len(twin) > 0 {
+			// OrigID is the fact; an "imported-" id is only the convention
+			// sync mints, and a harness could name a local session that way.
+			if h.Session.OrigID != "" {
+				fmt.Fprintf(&hb, "[another machine's copy of %s, which this machine has too — the two may not say the same thing]\n", joinCapped(twin, 3))
+			} else {
+				fmt.Fprintf(&hb, "[this machine's copy; the same session arrived from elsewhere as %s — they may not say the same thing]\n", joinCapped(twin, 3))
+			}
+		}
 		if h.Superseded != "" {
 			fmt.Fprintf(&hb, "[earlier attempt — a newer session in this project covers the same ground, updated %s]\n", h.Superseded)
+		}
+		// `deja brief` counts these — a wrong clock, a transcript copied from a
+		// machine set wrong, a harness writing local time as UTC — so deja knew
+		// and the page that an agent reads did not. The date stays as the
+		// transcript wrote it; what is added is that it cannot be trusted for
+		// "newest", which is the one thing the top of a recall page implies
+		// (#1753).
+		if index.StampedAhead(h.Session.Updated, time.Now()) {
+			fmt.Fprintln(&hb, "[stamped later than this machine's clock — its date cannot place it against the others]")
 		}
 		if h.Tier != search.TierExact {
 			fmt.Fprintf(&hb, "[%s]\n", h.Tier)
@@ -874,13 +1114,35 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 	// From what was served, not from the limit: the loop also stops on the
 	// token budget, and then this said "2 more" while five were left — the
 	// agent asks for offset=served and the arithmetic has to hold.
+	more := ""
 	if left := total - offset - served; left > 0 {
-		fmt.Fprintf(&b, "\n%d more match(es) — call recall again with offset=%d.\n", left, offset+served)
+		more = fmt.Sprintf("\n%d more match(es) — call recall again with offset=%d.\n", left, offset+served)
 	}
+	// The paging line is the instruction, not the evidence: appending it before
+	// the trim made a full page drop the one thing that says how to reach the
+	// rest, exactly where offset is meant to be used (#1726). Trim the excerpts
+	// to leave room for it instead.
 	out := b.String()
-	if len(out) > budget {
-		out = trimUTF8(out, budget)
+	if len(out)+len(more) > budget {
+		// A budget smaller than the instruction itself: keep the page and drop
+		// the line rather than trim to a negative length.
+		if len(more) >= budget {
+			more = ""
+		}
+		// Every excerpt shortened on its own ends with the marker; the one the
+		// page budget cut ended mid-word saying nothing, so the last line an
+		// agent reads was the one line it could not tell was a fragment
+		// (#1799). Reserved before the trim, like the paging line above.
+		room := budget - len(more)
+		if room <= len(cutMarker) {
+			// No room to say it was cut without eating what was cut from:
+			// keep the bytes, drop the marker.
+			out = trimUTF8(out, room)
+		} else {
+			out = markCut(trimUTF8(out, room-len(cutMarker)))
+		}
 	}
+	out += more
 	var raw int64
 	var ids []string
 	for i, h := range hits {
@@ -895,7 +1157,29 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 	return out, served, raw, ids, nil
 }
 
+// cutMarker ends a line the page budget cut, matching what an excerpt
+// shortened on its own already carries.
+const cutMarker = " …\n"
+
+// markCut ends a trimmed page with the marker, on its own line. A trim landing
+// exactly on a line break needs no marker inside the line, only the newline it
+// already has.
+func markCut(s string) string {
+	if strings.HasSuffix(s, "\n") {
+		return s
+	}
+	// A trim landing between an excerpt's own ellipsis and its newline already
+	// says the line was shortened; a second one reads as "… …".
+	if strings.HasSuffix(strings.TrimRight(s, " "), "…") {
+		return s + "\n"
+	}
+	return s + cutMarker
+}
+
 func trimUTF8(s string, budget int) string {
+	if budget <= 0 {
+		return ""
+	}
 	if len(s) <= budget {
 		return s
 	}
@@ -908,6 +1192,42 @@ func trimUTF8(s string, budget int) string {
 func recallContext(dir, q string) (string, error) {
 	text, _, _, _, err := recallContextResult(dir, q, "")
 	return text, err
+}
+
+// idContext is what contextByID reports alongside the text: the session it
+// opened and what that session weighs, both of which the caller records.
+type idContext struct {
+	session string
+	size    int64
+}
+
+// contextByID answers from the session an id-prefix names, for the tool an
+// agent calls with whatever deja printed at it (#1622). Empty when the string
+// is not an id, when it names nothing, or when this machine's policy withholds
+// what it names.
+func contextByID(dir, q string) (string, idContext, bool) {
+	if strings.ContainsAny(q, " \t\n") {
+		return "", idContext{}, false
+	}
+	// index.FindByPrefix directly, never the CLI's findByPrefix: that one calls
+	// index.Ensure first and blocks on the index lock, and this path serves a
+	// client that cannot wait (mcp_no_block_test.go guards it). The resource
+	// reader resolves an id the same way.
+	s, ok, err := index.FindByPrefix(dir, q)
+	if err != nil || !ok {
+		return "", idContext{}, false
+	}
+	kept, _ := policyFilterSessionsCounted(policy.ActivationMCP, []model.Session{s})
+	if len(kept) == 0 {
+		return "", idContext{}, false
+	}
+	whole := kept[0]
+	if full, ok, ferr := wholeSessionForMCP(dir, whole); ferr == nil && ok {
+		whole = full
+	}
+	var b bytes.Buffer
+	search.PrintContext(&b, whole, "")
+	return b.String(), idContext{session: whole.ID, size: rawSize([]model.Session{whole})}, true
 }
 
 func recallContextResult(dir, q, harness string) (string, int, int64, []string, error) {
@@ -950,6 +1270,15 @@ func recallContextResult(dir, q, harness string) (string, int, int64, []string, 
 		hits, _ = policyFilterHitsCounted(policy.ActivationMCP, hits)
 	}
 	if len(hits) == 0 {
+		// The words found nothing, so try the string as an id. Every line deja
+		// prints carries one, and `deja ctx <id>` opens the session it names —
+		// but the tool an agent is told to call took words only, and answered
+		// "no prior deja sessions matched" about a session deja holds (#1622).
+		// After the search, like the CLI does since #1614: there is no answer
+		// left for the id to shadow.
+		if text, id, ok := contextByID(dir, q); ok {
+			return text, 1, id.size, []string{id.session}, nil
+		}
 		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil
 	}
 	// The same order the search screen shows: this handed the agent a session
@@ -1030,6 +1359,16 @@ func (n *mcpNumber) UnmarshalJSON(b []byte) error {
 // — an internal path and an errno, handed to a model as a broken tool (#972).
 // Every other surface says the same thing in words.
 func buildingNowForAgent(dir string) string {
+	// A refresh is not an empty index. The snapshot on disk is published by an
+	// atomic swap and stays readable throughout one, which is why readers take
+	// tryLockDir rather than waiting — so answer from it and let recall say a
+	// refresh is running. Sending the agent away for the length of every
+	// refresh cost it the history it has: an agent does not ask again, it
+	// concludes there is none (#1733). The sentence below is for the state it
+	// was written for — nothing to answer from yet.
+	if index.HasManifest(dir) && !indexNeedsRebuild(dir) {
+		return ""
+	}
 	if st := readWarmupStatus(dir); st != nil {
 		return "deja is indexing this machine's history (" + st.progress() + "). Recall comes online in a few seconds; ask again then."
 	}
@@ -1055,4 +1394,23 @@ func buildingNowForAgent(dir string) string {
 	// Nothing indexed yet and nothing building: this is a first run, and
 	// building it here is how an install with no hooks ever gets an index.
 	return ""
+}
+
+// buildingNowForBlockingTool is buildingNowForAgent for the two tools that
+// still reach a blocking index.EnsureForSearch — blame and remember. Every
+// other tool reads through the non-blocking path and answers from the snapshot
+// while a refresh runs (#1733); these two would wait out the whole rebuild
+// inside the call, so for them a refresh in flight is still a reason to say so
+// rather than to hang.
+func buildingNowForBlockingTool(dir string) string {
+	if st := readWarmupStatus(dir); st != nil {
+		return "deja is indexing this machine's history (" + st.progress() + "). Recall comes online in a few seconds; ask again then."
+	}
+	if index.RebuildInProgress(dir) || warmupJustRequested(dir) {
+		return "deja is indexing this machine's history. Recall comes online in a few seconds; ask again then."
+	}
+	// Everything else these two have to say — an index written by another
+	// version, an index directory nobody can write — is the same sentence the
+	// reading tools get, so it is answered in one place rather than copied.
+	return buildingNowForAgent(dir)
 }

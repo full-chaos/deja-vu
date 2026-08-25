@@ -9,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/vshulcz/deja-vu/internal/index"
+	"github.com/vshulcz/deja-vu/internal/nfcfold"
 	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/termwidth"
@@ -105,11 +106,25 @@ func runBrief(dir string, w io.Writer) error {
 		recalls == 0 && weekRecalls == 0 && dejaVu == 0 && !ov.Oldest.IsZero()
 	line := fmt.Sprintf("today      %d session%s", ov.SessionsToday, pluralS(ov.SessionsToday))
 	if recalls > 0 {
-		line += fmt.Sprintf(" · %d recall%s served (%s", recalls, pluralS(recalls), humanBytes(int64(bytes)))
+		// Three widths of the same fact, longest first: a narrow pane gives up
+		// the raw total, then the served size, rather than wrapping them onto a
+		// line of their own (#1588). Dropping straight from both to neither
+		// loses a figure that had nine columns to spare at 60.
+		line += fmt.Sprintf(" · %d recall%s served", recalls, pluralS(recalls))
+		served := " (" + humanBytes(int64(bytes)) + ")"
+		full := served
 		if raw := usage.TodayRaw(dir); bytes > 0 && raw/int64(bytes) >= 2 {
-			line += " from " + humanBytes(raw)
+			full = " (" + humanBytes(int64(bytes)) + " from " + humanBytes(raw) + ")"
 		}
-		line += ")"
+		// printableWidth, not briefWidth: a pipe reads as "do not cut", and a
+		// script that redirects the brief wants the figures, not the layout.
+		room := printableWidth(w)
+		switch {
+		case room == 0 || barColumns(line+full) <= room:
+			line += full
+		case barColumns(line+served) <= room:
+			line += served
+		}
 	}
 	if !quietWeek {
 		fmt.Fprintln(w, line)
@@ -193,9 +208,28 @@ func runBrief(dir string, w io.Writer) error {
 			// in every store state — worst on an old store, where "Jun 27
 			// 2025" is six columns longer than "today" and the three lines
 			// came out three different lengths (#1073).
-			head := fmt.Sprintf("%s [%s] %s · %s · ", label, s.Harness, s.Project, search.RelativeDate(s.Updated))
+			// The project is the only part of this prefix that grows without
+			// bound, and a CJK name is two columns per character: at 60 columns
+			// the prefix alone reached 58, the budget fell to its floor and the
+			// line ran to 71 — a wrapped row rather than a ragged end (#1592).
+			// Shorten the path first, then budget the title against what is
+			// left.
+			// Measure the line with no project in it, so the two separators and
+			// the date are all counted exactly once.
+			// Both separators are counted: the project is measured as if it
+			// were there, because that is the line it has to fit.
+			bare := fmt.Sprintf("%s [%s] %s · %s · ", label, s.Harness, "", search.RelativeDate(s.Updated))
+			project := fitBriefProject(s.Project, barColumns(bare))
+			head := fmt.Sprintf("%s [%s] %s · ", label, s.Harness, search.RelativeDate(s.Updated))
+			if project != "" {
+				head = fmt.Sprintf("%s [%s] %s · %s · ", label, s.Harness, project, search.RelativeDate(s.Updated))
+			}
 			title = trimBriefTitleTo(title, briefTitleBudget(barColumns(head)))
-			fmt.Fprintf(w, "%s %s[%s]%s %s · %s%s%s", label, dim, s.Harness, reset, s.Project, dim, search.RelativeDate(s.Updated), reset)
+			if project != "" {
+				fmt.Fprintf(w, "%s %s[%s]%s %s · %s%s%s", label, dim, s.Harness, reset, project, dim, search.RelativeDate(s.Updated), reset)
+			} else {
+				fmt.Fprintf(w, "%s %s[%s]%s %s%s%s", label, dim, s.Harness, reset, dim, search.RelativeDate(s.Updated), reset)
+			}
 			if title != "" {
 				fmt.Fprintf(w, " · %s", title)
 			}
@@ -246,7 +280,7 @@ func runBrief(dir string, w io.Writer) error {
 				when += " · last worked " + last
 			}
 		}
-		fmt.Fprintf(w, "before     %s%s%s\n", dim, when, reset)
+		fmt.Fprintf(w, "before     %s%s%s\n", dim, fitBriefWhen(when, printableWidth(w)), reset)
 	}
 
 	if haveReused && !sameWork {
@@ -272,7 +306,19 @@ func runBrief(dir string, w io.Writer) error {
 	// suggestion. Printing it twice on the one screen that has to be legible
 	// is worse than not printing it at all.
 	if q := suggestFirstQuery(dir); q != "" && !justGreeted {
-		fmt.Fprintf(w, "try        %sdeja \"%s\"%s %s(from your own history)%s\n", bold, q, reset, dim, reset)
+		// The line is a command to copy, so it is never cut: an ellipsis inside
+		// it searches for a truncated word and a literal "…". What goes first
+		// is the note, and if the command alone still does not fit, the whole
+		// suggestion — the screen has other lines that say more (#1588).
+		room := printableWidth(w)
+		command := fmt.Sprintf("try        deja %q", q)
+		const note = " (from your own history)"
+		switch {
+		case room == 0 || barColumns(command+note) <= room:
+			fmt.Fprintf(w, "try        %sdeja %q%s %s(from your own history)%s\n", bold, q, reset, dim, reset)
+		case barColumns(command) <= room:
+			fmt.Fprintf(w, "try        %sdeja %q%s\n", bold, q, reset)
+		}
 	}
 	fmt.Fprintf(w, "%smore       deja log · deja stats · deja help%s\n", dim, reset)
 	return nil
@@ -312,9 +358,15 @@ func pluralS(n int) string {
 // rule for the status bar).
 func trimBriefTitle(t string) string { return trimBriefTitleTo(t, briefTitleMax) }
 
+// briefLabelColumns is the fixed prefix every line but `recent` carries: a
+// name, padded to the column the values line up on.
+const briefLabelColumns = 11
+
 // briefTitleMax is the width the fixed-prefix lines (`asked`, `reused`, `hit`)
 // are laid out to: an 11-column label plus 44 plus the ellipsis is 56, which
-// fits the narrowest terminal anyone opens.
+// fits a 60-column pane. Narrower than that they overflow, and widening the
+// rule here would also cut `hook-context` output, which is not a terminal line
+// at all — that is a separate item (#1588).
 const briefTitleMax = 44
 
 func trimBriefTitleTo(t string, max int) string {
@@ -324,7 +376,10 @@ func trimBriefTitleTo(t string, max int) string {
 		}
 		return r
 	}, t)
-	t = strings.Join(strings.Fields(t), " ")
+	// Composed with the whitespace: the cut composes what it returns, so
+	// without this a title that fits keeps its stored spelling and a cut one
+	// does not — the same title, two ways, depending on the width (#1844).
+	t = nfcfold.Compose(strings.Join(strings.Fields(t), " "))
 	// Columns rather than runes: the budget is what is left of the terminal,
 	// and a Chinese title is one rune and two columns per character, so a
 	// 44-rune cap printed 88 columns and the line the budget exists to fit
@@ -365,7 +420,20 @@ func briefTitleBudget(prefixLen int) int {
 // exporting it — a child process only sees it when someone exported it on
 // purpose, which is the same override briefWidth already honours.
 func printableWidth(w io.Writer) int {
-	if os.Getenv("COLUMNS") == "" && !statColorOK(w) {
+	if os.Getenv("COLUMNS") != "" {
+		return briefWidth()
+	}
+	// briefWanted, not statColorOK: this asks whether the reader has a screen,
+	// and a reader who turned colour off still has one. Asking the colour
+	// question here handed those readers a zero — "do not cut" — so the lines
+	// this budget exists to fit wrapped instead (#1596, the same shape as
+	// #1588).
+	//
+	// The reach is wider than the brief: `files`, `restore` and `search` read
+	// this too, and a NO_COLOR terminal now gets the same layout every other
+	// terminal already had.
+	f, ok := w.(*os.File)
+	if !ok || !briefWanted(f) {
 		return 0
 	}
 	return briefWidth()
@@ -467,6 +535,69 @@ func printNoHistory(w io.Writer, stale bool) {
 	fmt.Fprintln(w, "  deja sources     what was looked for, and where")
 	fmt.Fprintln(w, "  deja doctor      check the setup")
 	fmt.Fprintln(w, "  deja help        every command")
+}
+
+// fitBriefProject keeps a project name inside what the rest of the line leaves
+// it, so the title budget still has room to work with. The floor is the tail of
+// the path: "…/消费者重平衡" says which project this is, where the first
+// characters of a long prefix rarely do (#1592).
+func fitBriefProject(project string, rest int) string {
+	// Composed before the measurement, for the reason fitBriefWhen is: the cut
+	// composes what it returns, so the two paths otherwise print the same name
+	// two ways (#1844).
+	project = nfcfold.Compose(project)
+	room := briefWidth() - rest - briefRecentTitleFloor - 1 // the title's ellipsis
+	if barColumns(project) <= room {
+		return project
+	}
+	if room < briefProjectFloor {
+		// Even the floors do not fit — measured with harness `antigravity` and
+		// a date carrying its year, where the rest of the line is 42 columns of
+		// a 60-column pane. An eight-column tail of a path is close to
+		// unreadable anyway, so the project goes and the title keeps its floor,
+		// rather than printing a stub and overflowing regardless (#1592).
+		return ""
+	}
+	return "…" + termwidth.CutRight(project, room-1)
+}
+
+// briefRecentTitleFloor mirrors the floor in briefTitleBudget: shortening the
+// project buys nothing if the title is then cut to nothing anyway.
+const briefRecentTitleFloor = 12
+
+// briefProjectFloor is the shortest project fragment worth printing. Below it
+// the line overflows instead, the trade the title floor already makes.
+const briefProjectFloor = 8
+
+// fitBriefWhen makes the `before` line fit by shortening the project path and
+// nothing else. Cutting the end instead drops "last worked <date>" and the
+// reuse count — the two facts #843 added because they are not restatements of
+// the span. A project name is the only part of this line that grows without
+// bound (#1588).
+func fitBriefWhen(when string, room int) string {
+	// Composed first, not only on the cut path: the cut composes what it
+	// returns (#1842), so a line that happened to fit came back as stored
+	// while a cut one came back composed, and the same project showed two
+	// spellings in one screen depending on the terminal's width (#1844).
+	when = nfcfold.Compose(when)
+	room -= briefLabelColumns
+	if room <= 0 || barColumns(when) <= room {
+		return when
+	}
+	const in = " in "
+	start := strings.Index(when, in)
+	end := strings.Index(when, " · ")
+	if start < 0 || end < 0 || end <= start {
+		return when
+	}
+	project := when[start+len(in) : end]
+	keep := barColumns(project) - (barColumns(when) - room) - 1 // the ellipsis
+	if keep < 6 {
+		// Nothing readable would be left of the path, so the facts stay whole
+		// and the line overflows — the trade the `recent` floor already makes.
+		return when
+	}
+	return when[:start+len(in)] + termwidth.Cut(project, keep) + "…" + when[end:]
 }
 
 // askedWhen says how far apart the askings were, which is the point of the

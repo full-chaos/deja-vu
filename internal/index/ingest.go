@@ -184,6 +184,13 @@ func Ensure(dir string, harness string, force bool, progress io.Writer) error {
 	if !force && err == nil && notesZoneDrifted(m) {
 		force = true
 	}
+	// A store skipped for a missing CLI has unchanged files, so the
+	// incremental pass has nothing to revisit and the store stays out of the
+	// index. Installing the tool is a change to what deja can read, not to the
+	// transcripts, and only a full pass acts on it (#1760).
+	if !force && err == nil && toolsChanged(m) {
+		force = true
+	}
 	if !force && err == nil && manifestFresh(m, want, scope) && recordsIntact(dir, m) {
 		return nil
 	}
@@ -206,6 +213,51 @@ func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer
 		return err
 	}
 	defer unlock()
+	return ensureLocked(dir, o, force, progress)
+}
+
+// EnsureForSearchNoWait is EnsureForSearch for a caller that must answer inside
+// somebody's tool call: it takes the lock or reports that another process holds
+// it, in one attempt. Checking RebuildInProgress and then calling the blocking
+// Ensure asked the same question twice, a lock acquisition apart, and a rebuild
+// starting in that window was waited out inside the call (#1804).
+func EnsureForSearchNoWait(dir string, o query.Options, progress io.Writer) (busy bool, err error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	unlock, ok, err := tryLockDir(dir)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		// tryLockDir reports "no lock" for two different things: someone else
+		// holds it, and this machine cannot write the lock file at all. Only
+		// the first is a refresh to wait for. A read-only index — a container
+		// mount, a locked-down machine — answers every question asked of it,
+		// and telling the caller to come back later would be a wait that never
+		// ends.
+		if lockUnwritable(dir) && HasManifest(dir) {
+			return false, nil
+		}
+		return true, nil
+	}
+	defer unlock()
+	return false, ensureLocked(dir, o, false, progress)
+}
+
+// lockUnwritable reports an index whose lock file cannot be created or opened
+// for writing, which is how a read-only store presents itself.
+func lockUnwritable(dir string) bool {
+	f, err := os.OpenFile(dir+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return errors.Is(err, fs.ErrPermission)
+	}
+	_ = f.Close()
+	return false
+}
+
+// ensureLocked is the body of an Ensure, with the lock already held.
+func ensureLocked(dir string, o query.Options, force bool, progress io.Writer) error {
 	sweepStaleTmp(dir)
 	prior, priorErr := readManifest(dir)
 	want := currentFilesReusing("", priorFiles(prior, priorErr))
@@ -303,6 +355,12 @@ func rebuild(dir string, harness string, scope string, files map[string]FileStat
 }
 
 func rebuildWithTombstones(dir string, harness string, scope string, files map[string]FileState, progress io.Writer, dead map[string]bool) error {
+	// This build's counts, not the process's: see writeSessionsWithSync (#1850).
+	emptied.Store(0)
+	collisions.Store(0)
+	// A rebuild evicts nothing, but a number left by an earlier build must not
+	// outlive it (#1861).
+	evicted.Store(0)
 	lastIngestFiles = len(files)
 	initialBuild := !HasManifest(dir)
 	writtenMessages := 0
@@ -330,7 +388,8 @@ func rebuildWithTombstones(dir string, harness string, scope string, files map[s
 	// for a rebuild rather than quietly declaring the new list in force (#1307).
 	m := Manifest{Version: version, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imported.watermarks, ExportBoundary: imported.boundary, ImportedRecords: imported.dedupe,
-		ExcludeFingerprint: sources.ExclusionFingerprint()}
+		ExcludeFingerprint: sources.ExclusionFingerprint(),
+		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir))}
 	recPath := filepath.Join(tmp, "records.bin")
 	rf, err := os.OpenFile(recPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -567,19 +626,32 @@ func loadProgress(h string, progress io.Writer) []model.Session {
 		}
 		ss = append(ss, r.ss...)
 		if progress != nil && !SuppressHarnessNarration {
-			msgs := 0
-			for _, s := range r.ss {
-				msgs += len(s.Messages)
-			}
-			// "deja" is the notes pseudo-source; it narrates as "notes".
-			label := r.name
-			if label == "deja" {
-				label = "notes"
-			}
-			fmt.Fprintf(progress, "deja: %s: %d session%s, %d message%s\n", label, len(r.ss), pluralS(len(r.ss)), msgs, pluralS(msgs))
+			fmt.Fprintln(progress, harnessNarration(r.name, r.ss, sources.SkipReason(r.name)))
 		}
 	}
 	return ss
+}
+
+// harnessNarration is the line an index run prints for one store. A store can
+// be half-readable — cursor keeps CLI transcripts as JSONL and its IDE sessions
+// in SQLite — and the count alone then reads as the whole story while half of
+// it is missing from recall. The skip reason was printed only for a store that
+// yielded nothing at all (#1758, the shape of #794).
+func harnessNarration(name string, ss []model.Session, skipped string) string {
+	msgs := 0
+	for _, s := range ss {
+		msgs += len(s.Messages)
+	}
+	// "deja" is the notes pseudo-source; it narrates as "notes".
+	label := name
+	if label == "deja" {
+		label = "notes"
+	}
+	line := fmt.Sprintf("deja: %s: %d session%s, %d message%s", label, len(ss), pluralS(len(ss)), msgs, pluralS(msgs))
+	if skipped != "" {
+		line += " — part of this store could not be read: " + skipped
+	}
+	return line
 }
 
 // ReportCollisions returns how many transcripts shared an id with another since
@@ -638,8 +710,10 @@ func dropEmptySessions(m *Manifest, wrote map[string]bool) {
 	}
 }
 
-// ReportEmptySessions returns how many transcripts held nothing to index since
-// the last build, and clears the counter. The parse count and the indexed
+// ReportEmptySessions returns how many transcripts held nothing to index in the
+// last build, and clears the counter. The build zeroes it as it starts writing,
+// so a caller reads that build's number whether or not anyone read the one
+// before (#1850). The parse count and the indexed
 // count differ by exactly this, and the run is where someone is looking at
 // both numbers.
 func ReportEmptySessions() int {
@@ -651,12 +725,21 @@ func writeSessions(tmp, dir string, ss []model.Session, files map[string]FileSta
 }
 
 func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string]FileState, scope string, imp importedState) error {
+	// The counters belong to this build. Draining them only on read made
+	// "since the last build" true only when the last read was the last build:
+	// a second build in one process reported its own empty transcripts plus
+	// whatever an earlier one left behind (#1850), and the collision counter
+	// beside it did the same. One process is one build for the CLI, which is
+	// why it showed in the test binary first.
+	emptied.Store(0)
+	collisions.Store(0)
 	initialBuild := !HasManifest(dir)
 	writtenMessages := 0
 	lastIngestFiles = len(files)
 	m := Manifest{Version: version, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imp.watermarks, ExportBoundary: imp.boundary, ImportedRecords: imp.dedupe,
-		ExcludeFingerprint: sources.ExclusionFingerprint()}
+		ExcludeFingerprint: sources.ExclusionFingerprint(),
+		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir))}
 	recPath := filepath.Join(tmp, "records.bin")
 	rf, err := os.OpenFile(recPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
@@ -1544,6 +1627,18 @@ func sortedKeys[V any](m map[string]V) []string {
 var collisions atomic.Int64
 var emptied atomic.Int64
 
+// evicted counts the indexed files that left because their store went away —
+// a disk unmounted, a directory deleted. The command layer needs it to tell a
+// machine deja has never seen history from ("nothing to index yet") from one
+// whose history has just gone (#1762).
+var evicted atomic.Int64
+
+// ReportEvictedFiles returns how many indexed files were dropped for having
+// disappeared since the last build, and clears the counter.
+func ReportEvictedFiles() int {
+	return int(evicted.Swap(0))
+}
+
 // attributeSession decides which of two transcripts sharing an id owns the
 // manifest row, and whether they collided at all. Lexicographically smallest
 // path wins, so the answer does not depend on which file was read first.
@@ -1818,6 +1913,11 @@ func carryRedactions(m *Manifest, old Manifest, skip map[string]bool) {
 }
 
 func updateIndex(dir, harness, scope string, files map[string]FileState, force bool, progress io.Writer) error {
+	// Cleared here rather than beside the other two: this build counts what
+	// went away further down, before the incremental paths reset theirs, so a
+	// reset down there would zero the number this build is about to report
+	// (#1861).
+	evicted.Store(0)
 	old, err := readManifest(dir)
 	if err == nil && !recordsIntact(dir, old) {
 		force = true // records.bin lost its tail to a crash; only a rebuild is safe
@@ -1871,6 +1971,9 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 			}
 		}
 	}
+	// Counted after the keep-back above: records that came off an unmounted
+	// volume are still in the index, so they did not go away.
+	evicted.Add(int64(len(removed)))
 	if progress != nil {
 		for _, g := range gone {
 			verb := "is"
@@ -1911,6 +2014,9 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		return nil
 	}
 	var replacements []model.Session
+	// This pass's counts, like every other build path (#1850).
+	emptied.Store(0)
+	collisions.Store(0)
 	lastIngestFiles = len(changed)
 	for p, f := range changed {
 		ss, err := parseChangedFile(harness, p, old.Files[p])
@@ -1966,7 +2072,8 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		// Kept from the old index: this build reuses records written under
 		// those patterns, so claiming today's set would be a lie the reader
 		// cannot check.
-		ExcludeFingerprint: old.ExcludeFingerprint}
+		ExcludeFingerprint: old.ExcludeFingerprint,
+		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir))}
 	skipRedactions := map[string]bool{}
 	for p := range changed {
 		skipRedactions[p] = true
@@ -2196,6 +2303,11 @@ func canAppendIncremental(changed map[string]FileState, old map[string]FileState
 }
 
 func appendIncremental(dir, harness, scope string, old Manifest, files map[string]FileState, changed map[string]FileState) (int, int, error) {
+	// This pass's counts, like the two full paths: an incremental that nobody
+	// read between builds otherwise reported its own colliding ids plus the
+	// ones before it (#1850).
+	emptied.Store(0)
+	collisions.Store(0)
 	lastIngestFiles = len(changed)
 	rf, err := os.OpenFile(filepath.Join(dir, "records.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,6 +22,19 @@ import (
 type installResult struct{ Path, Action string }
 
 func runInstall(dir string, args []string, uninstall bool) error {
+	// Every path deja writes hangs off the home directory, and homeDir()
+	// answers "" when it cannot find one. filepath.Join("", ".claude") is
+	// ".claude", so with HOME unset install wrote .claude/, .claude.json and
+	// .config/deja/wiring.json into whatever directory it was run from — a
+	// repository, usually — and reported success (#1690). A config directory
+	// only means anything at an absolute location.
+	if homeDir() == "" {
+		verb := "install"
+		if uninstall {
+			verb = "uninstall"
+		}
+		return fmt.Errorf("%s cannot find your home directory — set HOME to the account deja should wire", verb)
+	}
 	removingWiring = uninstall
 	defer func() { removingWiring = false }()
 	guidance := true
@@ -49,12 +64,13 @@ func runInstall(dir string, args []string, uninstall bool) error {
 	}
 	// A flag deja does not know is named plainly by every other command; here
 	// it fell into the target list, and the refusal then said the target was
-	// missing while printing the target it had been given (#1078).
-	if len(targetArgs) > 1 {
-		for _, a := range targetArgs {
-			if strings.HasPrefix(a, "--") && a != "--all" && a != "--auto" {
-				return fmt.Errorf("%s: unknown flag %q — it takes a target plus --no-guidance, --no-index or --force", verb, a)
-			}
+	// missing while printing the target it had been given (#1078). At one
+	// argument it fell through anyway and `deja install --nosuch` was reported
+	// as an unknown target, with thirty-eight harness names for a remedy
+	// (#1680). No target begins with a dash, so the shape alone settles it.
+	for _, a := range targetArgs {
+		if strings.HasPrefix(a, "-") && a != "--all" && a != "--auto" {
+			return fmt.Errorf("%s: unknown flag %q — it takes a target plus --no-guidance, --no-index or --force", verb, a)
 		}
 	}
 	if len(targetArgs) != 1 {
@@ -99,6 +115,13 @@ func runInstall(dir string, args []string, uninstall bool) error {
 	exe, _ = filepath.Abs(exe)
 	// Remembered so a later upgrade can refresh exactly these and nothing
 	// else: the generators change, the files on disk do not.
+	if uninstall {
+		removingTargets = make(map[string]bool, len(targets))
+		for _, t := range targets {
+			removingTargets[guidanceHarness(t)] = true
+		}
+		defer func() { removingTargets = nil }()
+	}
 	defer recordWiring(targets, uninstall)
 	banner := !uninstall && (targetArgs[0] == "--auto" || targetArgs[0] == "--all") && logoWanted(os.Stdout)
 	type lineItem struct{ target, action, path string }
@@ -112,8 +135,10 @@ func runInstall(dir string, args []string, uninstall bool) error {
 	// choose. Everything else is still done, and what could not be is named at
 	// the end (#902).
 	var refused []string
+	var refusedErrs []error
 	note := func(t string, err error) {
 		refused = append(refused, fmt.Sprintf("%s: %v", t, err))
+		refusedErrs = append(refusedErrs, err)
 	}
 	for _, t := range targets {
 		r, err := installTarget(t, exe, uninstall)
@@ -189,8 +214,8 @@ func runInstall(dir string, args []string, uninstall bool) error {
 		if uninstall {
 			verb = "uninstall"
 		}
-		return fmt.Errorf("%s finished what it could; %d target%s refused: %s — check those paths' permissions and run it again",
-			verb, len(refused), pluralS(len(refused)), strings.Join(refused, "; "))
+		return fmt.Errorf("%s finished what it could; %d target%s refused: %s — %s",
+			verb, len(refused), pluralS(len(refused)), strings.Join(refused, "; "), refusalRemedy(refusedErrs))
 	}
 	// Every install builds, not only --auto and --all. Installing is the one
 	// moment a person has already accepted a wait — they just ran an installer
@@ -414,6 +439,31 @@ func installIndexHint(dir string) string {
 		}
 	}
 	return fmt.Sprintf("next: run `deja index` to index %d agent stores", detected)
+}
+
+// refusalRemedy picks the sentence that closes an install summary. It was one
+// hardcoded line telling the reader to check permissions, which is the wrong
+// place to send someone whose config merely has a comment in it: five JSON
+// targets refused for a syntax error and every one was blamed on file
+// permissions (#1663). Same shape as #808, #931, #907 and #1116 — an error
+// wearing a permissions label it had not earned.
+func refusalRemedy(errs []error) string {
+	perms := 0
+	for _, err := range errs {
+		if errors.Is(err, fs.ErrPermission) {
+			perms++
+		}
+	}
+	if perms > 0 && perms == len(errs) {
+		if len(errs) == 1 {
+			return "check that path's permissions and run it again"
+		}
+		return "check those paths' permissions and run it again"
+	}
+	if len(errs) == 1 {
+		return "fix what it reports and run it again"
+	}
+	return "fix what each one reports and run it again"
 }
 
 func existingTargets() []string {
@@ -688,6 +738,15 @@ func backupOnce(path string) (bool, error) {
 // because the command is: one run, one direction.
 var removingWiring bool
 
+// removingTargets names the targets the current uninstall run is removing.
+// The shared-skill guard asks whether any other harness still reads
+// ~/.agents/skills/deja-history/SKILL.md, and answers from the wiring record —
+// which still lists every harness during `uninstall --all`, because
+// recordWiring runs at the end. So each target in turn found another "still
+// wanting" reader and the file was kept every time (#1683). A harness being
+// removed in this same run is not a reader.
+var removingTargets map[string]bool
+
 // forceGuidance is set by `deja install --force`: replace a skill deja can see
 // has been edited since it wrote it.
 var forceGuidance bool
@@ -709,7 +768,47 @@ func mentionsDeja(b []byte) bool {
 	return false
 }
 
+// lfText is the text of a config normalised to LF, for the writers that splice
+// blocks by counting newlines. They then work in one convention and
+// writeIfChanged puts the file's own endings back (#1668).
+func lfText(b []byte) string {
+	return strings.ReplaceAll(string(b), "\r\n", "\n")
+}
+
+// matchLineEndings writes back the line endings the file already had. A
+// Windows user's configs are CRLF, and install rewrote the JSON ones LF-only
+// while leaving the TOML and YAML ones half and half — deja's appended block in
+// LF inside a CRLF file (#1668). install_goose.go and guidance.go already did
+// this for their own two files; every other writer comes through here.
+//
+// Only a file whose endings are *all* CRLF is treated as a CRLF file. A mixed
+// one is left alone: converting it whole would rewrite lines deja never touched,
+// which is the thing this exists to avoid.
+func matchLineEndings(old, next []byte) []byte {
+	if len(old) == 0 || !bytes.Contains(old, []byte("\r\n")) {
+		return next
+	}
+	if bytes.Count(old, []byte("\n")) != bytes.Count(old, []byte("\r\n")) {
+		return next
+	}
+	// Only the newlines that are not already CRLF, so a writer that converted
+	// its own output first is not given a second carriage return.
+	var b bytes.Buffer
+	b.Grow(len(next) + bytes.Count(next, []byte("\n")))
+	for i := 0; i < len(next); i++ {
+		if next[i] == '\n' && (i == 0 || next[i-1] != '\r') {
+			b.WriteByte('\r')
+		}
+		b.WriteByte(next[i])
+	}
+	return b.Bytes()
+}
+
 func writeIfChanged(path string, old, next []byte) (string, error) {
+	// Before the comparison, not after: a CRLF config converted afterwards
+	// would differ from `old` on every run, so each repeat install would
+	// rewrite the file and report it changed.
+	next = matchLineEndings(old, next)
 	if bytes.Equal(old, next) {
 		return "unchanged", nil
 	}
@@ -768,6 +867,22 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 	}
 	tmp, terr := os.CreateTemp(filepath.Dir(path), ".deja-tmp-")
 	if terr != nil {
+		// The scratch file is deja's business; the reader's is the config it
+		// could not write. A read-only ~/.codex was reported as a permission
+		// error on ~/.codex/.deja-tmp-4168817699, which cannot be looked at,
+		// chmod-ed or found (#1686, the shape of #865). Rewriting the path in
+		// place keeps the error a *PathError, so errors.Is still sees the
+		// permission underneath and the remedy still names permissions.
+		//
+		// Only for a permission denial: the destination is the right thing to
+		// name when the directory refuses us, and the wrong thing when the
+		// failure is about the scratch file itself — "config.toml: no such
+		// file or directory" would send the reader after a directory that is
+		// the actual problem.
+		var pe *os.PathError
+		if errors.Is(terr, fs.ErrPermission) && errors.As(terr, &pe) {
+			pe.Path = path
+		}
 		return "", terr
 	}
 	tmpName := tmp.Name()
@@ -1067,7 +1182,10 @@ func installGrok(exe string, uninstall bool) (installResult, error) {
 
 func installTOML(path, block string, uninstall bool) (installResult, error) {
 	old, _ := os.ReadFile(path)
-	s := removeCodexDejaBlock(string(old))
+	// The splicing below counts newlines, so it works in LF and writeIfChanged
+	// puts the file's own endings back. Left as read, a CRLF file grew a blank
+	// line per install: TrimRight("\n") leaves the carriage return behind.
+	s := removeCodexDejaBlock(lfText(old))
 	s = strings.TrimRight(s, "\n")
 	if !uninstall {
 		if s != "" {
@@ -1286,6 +1404,63 @@ func updateOpencodeJSON(old []byte, exe string, uninstall bool) ([]byte, error) 
 	return append(next, '\n'), nil
 }
 
+// jsoncLastCodeLine finds the last line of a .jsonc block that a parser would
+// read as code, and where that code ends on it. It returns -1 when the block
+// holds nothing but comments and blank lines.
+//
+// The comma that joins deja's entry to the previous one has to land at the end
+// of the code, not the end of the line. Appended after a trailing // comment it
+// is stripped with the comment and the two entries lose their separator;
+// appended inside a /* … */ block it either vanishes with the block or is left
+// behind as a comma of its own (#1695).
+func jsoncLastCodeLine(body []string) (idx, end int, code string) {
+	idx = -1
+	inBlock := false
+	for i, line := range body {
+		c, nextBlock, e := jsoncCodeOf(line, inBlock)
+		if c != "" {
+			idx, end, code = i, e, c
+		}
+		inBlock = nextBlock
+	}
+	return idx, end, code
+}
+
+// jsoncCodeOf returns the code a parser reads on one line, whether the line
+// leaves a /* … */ block open, and the offset where that code ends.
+func jsoncCodeOf(line string, inBlock bool) (code string, stillInBlock bool, end int) {
+	var b strings.Builder
+	inString, escaped := false, false
+	end = 0
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if inBlock {
+			if c == '*' && i+1 < len(line) && line[i+1] == '/' {
+				inBlock, i = false, i+1
+			}
+			continue
+		}
+		switch {
+		case escaped:
+			escaped = false
+		case c == '\\' && inString:
+			escaped = true
+		case c == '"':
+			inString = !inString
+		case !inString && c == '/' && i+1 < len(line) && line[i+1] == '/':
+			return strings.TrimSpace(b.String()), false, end
+		case !inString && c == '/' && i+1 < len(line) && line[i+1] == '*':
+			inBlock, i = true, i+1
+			continue
+		}
+		b.WriteByte(c)
+		if c != ' ' && c != '\t' {
+			end = i + 1
+		}
+	}
+	return strings.TrimSpace(b.String()), inBlock, end
+}
+
 func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, error) {
 	line := fmt.Sprintf(`    "deja": {"type":"local","command":[%q,"mcp"]}`, exe)
 	s := string(old)
@@ -1319,12 +1494,15 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, error)
 			}
 		}
 		if !uninstall {
-			for i := len(body) - 1; i >= 0; i-- {
-				trim := strings.TrimSpace(body[i])
-				if trim != "" && !strings.HasPrefix(trim, "//") && !strings.HasSuffix(trim, ",") {
-					body[i] += ","
-					break
-				}
+			// Only the last line that carries content decides whether a comma
+			// is needed. Walking on past it — which is what looking for the
+			// first line not ending in a comma did — runs through an entry
+			// whose every line ends in one, which is what a .jsonc written
+			// with trailing commas looks like, and puts the comma on the line
+			// that opens the entry: `"mine": {,` (#1695).
+			if i, code, trim := jsoncLastCodeLine(body); i >= 0 &&
+				!strings.HasSuffix(trim, ",") && !strings.HasSuffix(trim, "{") && !strings.HasSuffix(trim, "[") {
+				body[i] = body[i][:code] + "," + body[i][code:]
 			}
 			body = append(body, line)
 		}

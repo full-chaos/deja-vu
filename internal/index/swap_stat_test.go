@@ -3,6 +3,7 @@ package index
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,17 +76,27 @@ func TestDamagedRereadsAPairThatDisagreed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(5 * time.Millisecond)
-		_ = os.WriteFile(path, body, 0o600)
-	}()
+	// The store agrees with its manifest again by the time the second read
+	// happens. Standing where the wait is rather than racing a goroutine
+	// against it: on a loaded runner a 5 ms sleep can land after the 20 ms
+	// window and the test failed on a store that behaved exactly as designed
+	// (#1782).
+	restored := false
+	old := waitOutSwapWindow
+	waitOutSwapWindow = func() {
+		restored = true
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Error(err)
+		}
+	}
+	defer func() { waitOutSwapWindow = old }()
+
 	if Damaged(dir) {
 		t.Error("a store that agrees with its manifest a moment later was called damaged")
 	}
-	wg.Wait()
+	if !restored {
+		t.Error("the second read never happened, so this proved nothing")
+	}
 }
 
 // And a store that is really short stays damaged: the second read is a second
@@ -130,4 +141,24 @@ func damagedFixture(t *testing.T) (dir string, records []byte) {
 		t.Fatal(err)
 	}
 	return dir, body
+}
+
+// Both retry loops take the same pause by the same name: a test that stands
+// where the wait is has to see every path that waits, or the next one to grow a
+// direct time.Sleep is the one that goes back to racing the scheduler (#1782).
+func TestEveryRetryLoopTakesTheSamePause(t *testing.T) {
+	src, err := os.ReadFile("swap_window.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The definition of the pause is allowed to sleep; nothing else is.
+	for i, line := range strings.Split(string(src), "\n") {
+		if !strings.Contains(line, "time.Sleep(swapWindowWait)") {
+			continue
+		}
+		if strings.Contains(line, "var waitOutSwapWindow") {
+			continue
+		}
+		t.Errorf("swap_window.go:%d sleeps directly instead of going through waitOutSwapWindow: %s", i+1, strings.TrimSpace(line))
+	}
 }

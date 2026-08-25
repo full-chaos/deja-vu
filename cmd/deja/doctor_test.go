@@ -252,18 +252,18 @@ func TestDoctorIndexStates(t *testing.T) {
 
 func TestDoctorIndexFreshnessOutput(t *testing.T) {
 	var out bytes.Buffer
-	doctorIndex(&out, doctorComponent{State: "ok", Path: "/tmp/index"}, index.DefaultDir())
+	doctorIndex(&out, doctorIndexReport{State: "ok", Path: "/tmp/index"}, index.DefaultDir())
 	if !strings.Contains(out.String(), "freshness up to date") {
 		t.Fatalf("fresh output = %q", out.String())
 	}
 	out.Reset()
-	doctorIndex(&out, doctorComponent{State: "stale", Path: "/tmp/index", StaleStores: 3}, index.DefaultDir())
+	doctorIndex(&out, doctorIndexReport{State: "stale", Path: "/tmp/index", StaleStores: 3}, index.DefaultDir())
 	got := out.String()
 	if !strings.Contains(got, "freshness 3 stores changed since last build") {
 		t.Fatalf("stale output = %q", got)
 	}
 	out.Reset()
-	doctorIndex(&out, doctorComponent{State: "stale", Path: "/tmp/index", StaleStores: 1}, index.DefaultDir())
+	doctorIndex(&out, doctorIndexReport{State: "stale", Path: "/tmp/index", StaleStores: 1}, index.DefaultDir())
 	if !strings.Contains(out.String(), "freshness 1 store changed since last build") {
 		t.Fatalf("singular stale output = %q", out.String())
 	}
@@ -480,7 +480,7 @@ func TestDoctorDeepCleanAndDrift(t *testing.T) {
 		t.Fatalf("clean deep doctor must exit 0: %v\n%s", err, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "Deep verification:") || !strings.Contains(got, "index matches sources") {
+	if !strings.Contains(got, "Deep verification:") || !strings.Contains(got, "message count matches its source") {
 		t.Fatalf("missing clean deep section:\n%s", got)
 	}
 

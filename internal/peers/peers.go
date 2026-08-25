@@ -9,12 +9,15 @@ package peers
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/vshulcz/deja-vu/internal/atomicfile"
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
@@ -29,6 +32,14 @@ type Peer struct {
 	// succeeds. A peer that has been failing for a week is the thing this file
 	// exists to make visible.
 	LastError string `json:"last_error,omitempty"`
+	// Machine is what the host calls itself, learned from the records that
+	// arrived from it. Host is an ssh alias someone typed, and an imported
+	// session is stamped with the sender's own hostname, so counting what came
+	// from a machine by its alias found nothing whenever the two differ — the
+	// normal case for anyone with an ssh config (#1887). Absent until a pull
+	// has something to learn from, so a file written before this reads
+	// unchanged.
+	Machine string `json:"machine,omitempty"`
 }
 
 // Last is the more recent of the two directions.
@@ -61,22 +72,119 @@ func Path() string {
 // not break because a config file is malformed, and doctor is where that gets
 // reported.
 func Load() []Peer {
+	list, _ := Snapshot()
+	return list
+}
+
+// Snapshot is Load and Problem from one read of the file, for a caller that
+// reports both. Asking twice re-read a file that a sync may be rewriting
+// between the two calls, so the list and the reason could describe different
+// states of it.
+func Snapshot() ([]Peer, string) {
 	var f file
 	b, err := os.ReadFile(Path())
 	if err != nil {
-		return nil
+		if errors.Is(err, fs.ErrNotExist) {
+			// Never synced is not a fault.
+			return nil, ""
+		}
+		return nil, err.Error()
 	}
-	if json.Unmarshal(b, &f) != nil {
-		return nil
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, err.Error()
 	}
 	out := f.Peers[:0:0]
+	seen := map[string]int{}
 	for _, p := range f.Peers {
 		if p.Host = strings.TrimSpace(p.Host); p.Host == "" {
 			continue
 		}
+		// One machine named twice was two rows, and Record only ever updated
+		// the first: the other showed a months-old failure beside the same
+		// machine reporting a sync this morning, and a bare `deja sync` opened
+		// two connections to it (#1853). A file can hold the same host twice
+		// through a hand-edit or a restored backup, and — until #1867 — through
+		// deja's own writes, when the two syncs spelled the host differently.
+		// The row keeps the spelling it was written with: that is what the
+		// report prints and what sessions_from_there is counted against.
+		if at, ok := seen[identity(p.Host)]; ok {
+			out[at] = mergePeers(out[at], p)
+			continue
+		}
+		seen[identity(p.Host)] = len(out)
 		out = append(out, p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Host < out[j].Host })
+	return out, ""
+}
+
+// Problem reports why the file could not be read, and "" when there is nothing
+// wrong — including when there is no file at all, which is a machine that has
+// never synced rather than a fault.
+//
+// Load deliberately treats every failure as "no peers", so that a malformed
+// config cannot stop a sync; its comment says doctor is where that surfaces.
+// This is the half that lets doctor say it (#1840). A caller that wants both
+// takes Snapshot, which reads the file once.
+func Problem() string {
+	_, why := Snapshot()
+	return why
+}
+
+// identity is what makes two names one machine. ssh lowercases a host before
+// it matches it and a DNS name is case-insensitive (RFC 4343), so `Laptop` and
+// `laptop` are one machine — comparing byte for byte gave it two rows, two
+// connections from a bare `deja sync`, and a watermark each, so the second
+// pushed everything the first had already delivered (#1867).
+//
+// Only the part after the last @: the half before it is an account name, and
+// `Root@box` and `root@box` are two logins.
+func identity(host string) string {
+	at := strings.LastIndex(host, "@")
+	return host[:at+1] + strings.ToLower(host[at+1:])
+}
+
+// Identity is that rule for a caller outside this package: anything keyed by a
+// machine name has to agree with the list about which names are one machine.
+// `deja doctor` counts imported sessions by the name the sending machine calls
+// itself, which is a hostname — capitalised on macOS — against an ssh alias
+// that usually is not (#1876).
+func Identity(host string) string {
+	return identity(strings.TrimSpace(host))
+}
+
+// Canonical is how a host named on the command line should be spelled for the
+// rest of a run: the spelling deja already stored for that machine, if it knows
+// it. Watermarks are namespaced by the peer string, so `deja sync ssh laptop`
+// against a row written `Laptop` had a watermark of its own and pushed
+// everything the machine already had (#1867).
+func Canonical(host string) string {
+	host = strings.TrimSpace(host)
+	for _, p := range Load() {
+		if identity(p.Host) == identity(host) {
+			return p.Host
+		}
+	}
+	return host
+}
+
+// mergePeers folds two rows for one machine. Each direction keeps its newest
+// timestamp, and the error belongs to whichever exchange happened last: an old
+// failure is not news about a machine that has synced since.
+func mergePeers(a, b Peer) Peer {
+	out := a
+	if b.LastPush.After(out.LastPush) {
+		out.LastPush = b.LastPush
+	}
+	if b.LastPull.After(out.LastPull) {
+		out.LastPull = b.LastPull
+	}
+	if b.Last().After(a.Last()) {
+		out.LastError = b.LastError
+	}
+	if out.Machine == "" {
+		out.Machine = b.Machine
+	}
 	return out
 }
 
@@ -88,10 +196,19 @@ func Record(host string, pulled bool, when time.Time, err error) error {
 	if host == "" {
 		return nil
 	}
+	// Locked around the read, the edit and the write: without it two syncs
+	// finishing at once each wrote back the list they had read, and the second
+	// one dropped the first one's machine (#1883).
+	return withLock(func() error {
+		return recordLocked(host, pulled, when, err)
+	})
+}
+
+func recordLocked(host string, pulled bool, when time.Time, err error) error {
 	list := Load()
 	i := -1
 	for k := range list {
-		if list[k].Host == host {
+		if identity(list[k].Host) == identity(host) {
 			i = k
 			break
 		}
@@ -104,6 +221,10 @@ func Record(host string, pulled bool, when time.Time, err error) error {
 		// The failure is recorded, the timestamp is not: "last exchanged
 		// tuesday" has to mean memory actually moved.
 		list[i].LastError = trimError(err.Error())
+	} else if when.IsZero() {
+		// A caller with nothing to report — a push that found nothing to send,
+		// so no connection was opened. The host is remembered; what it did
+		// last time is not overwritten with a zero (#1780).
 	} else {
 		list[i].LastError = ""
 		if pulled {
@@ -115,14 +236,59 @@ func Record(host string, pulled bool, when time.Time, err error) error {
 	return save(list)
 }
 
+// machineNameMax bounds a learned name. A hostname's own limit is 253 bytes;
+// this is the same figure deja bounds an exported field to.
+const machineNameMax = 120
+
+// Learn notes what a host calls itself, so what arrived from it can be counted
+// against its row. Nothing is written when the name is empty or already there.
+func Learn(host, machine string) error {
+	host, machine = strings.TrimSpace(host), strings.TrimSpace(machine)
+	if host == "" || machine == "" {
+		return nil
+	}
+	// The name is another machine's word for itself. Import already bounds it,
+	// but this file outlives any one index and is read by every sync, so the
+	// bound is applied where the value is written rather than trusted from
+	// upstream. A name longer than this is not one.
+	if r := []rune(machine); len(r) > machineNameMax {
+		machine = string(r[:machineNameMax])
+	}
+	return withLock(func() error {
+		list := Load()
+		for i := range list {
+			if identity(list[i].Host) != identity(host) {
+				continue
+			}
+			if list[i].Machine == machine {
+				return nil
+			}
+			list[i].Machine = machine
+			return save(list)
+		}
+		return nil
+	})
+}
+
 // Forget drops a host from the list. Reports whether it was there.
 func Forget(host string) (bool, error) {
 	host = strings.TrimSpace(host)
+	var found bool
+	err := withLock(func() error {
+		var ferr error
+		found, ferr = forgetLocked(host)
+		return ferr
+	})
+	return found, err
+}
+
+// forgetLocked is Forget with the list already held.
+func forgetLocked(host string) (bool, error) {
 	list := Load()
 	out := list[:0:0]
 	found := false
 	for _, p := range list {
-		if p.Host == host {
+		if identity(p.Host) == identity(host) {
 			found = true
 			continue
 		}
@@ -146,11 +312,11 @@ func save(list []Peer) error {
 	}
 	// Written whole through a temp file: a sync interrupted midway must not
 	// leave a half-written list that Load then silently reads as no peers.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(b, '\n'), 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// atomicfile rather than a temp of our own, because ours was named for the
+	// file rather than for the writer — two syncs wrote into the one temp and
+	// renamed it in turn, so one of them could publish a list holding half of
+	// each, or fail outright on a temp the other had already renamed (#1883).
+	return atomicfile.Write(path, append(b, '\n'), 0o600)
 }
 
 // trimError keeps a failure short enough to sit on one line of a report. The

@@ -7,8 +7,11 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -118,13 +121,18 @@ type bm25Document struct {
 // countIn scores one message against the query the way the exact tier does:
 // a parts match first, then either a whole-query substring count for a single
 // bare token or a per-token count, plus any quoted phrases.
-func countIn(text, low string, qtoks, phrases []string, qlow string, variants map[string][]string) int {
+func countIn(text, low string, qtoks, phrases []string, variants map[string][]string) int {
 	if !MatchesParts(text, qtoks, phrases, variants) {
 		return 0
 	}
-	if len(qtoks) <= 1 && len(phrases) == 0 && variants == nil {
-		if strings.Contains(low, qlow) {
-			return strings.Count(low, qlow)
+	if len(qtoks) == 1 && len(phrases) == 0 && variants == nil {
+		// The token, not the raw query: the query string still carries whatever
+		// punctuation the reader typed, and counting that scored zero for
+		// "retry?" — the shape of a pasted question — on a session
+		// MatchesParts had already accepted (#1603).
+		needle := qtoks[0]
+		if strings.Contains(low, needle) {
+			return strings.Count(low, needle)
 		}
 		return 0
 	}
@@ -142,11 +150,9 @@ func countIn(text, low string, qtoks, phrases []string, qlow string, variants ma
 
 func runScored(ss []model.Session, o Options) ([]Hit, error) {
 	var re *regexp.Regexp
-	qlow := strings.ToLower(o.Query)
 	qtoks, phrases := QueryParts(o.Query)
 	// Cross-script CJK: prepared once, used only when a raw match scores zero.
 	queryCJK := cjkfold.HasCJK(o.Query)
-	qlowFolded := cjkfold.String(qlow)
 	qtoksFolded, phrasesFolded := QueryParts(cjkfold.String(o.Query))
 	if o.Regex {
 		var err error
@@ -196,10 +202,10 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 		if !cut.IsZero() && s.Updated.Before(cut) {
 			continue
 		}
-		tier := o.Tier
-		if tier == "" {
-			tier = TierExact
-		}
+		// The same name the envelope carries: docs/json-output.md calls them the
+		// same idea at two scopes, and an agent reading a hit gets the tier from
+		// here (#1616).
+		tier := setTier(o)
 		doc := bm25Document{hit: Hit{Session: s, Tier: tier}, termCount: make([]int, len(qtoks)), userCount: make([]int, len(qtoks))}
 		if s.Title != "" && len(qtoks) > 0 {
 			titleLow := strings.ToLower(s.Title)
@@ -226,9 +232,9 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 			// genuine match as words that never meet.
 			windowText, windowToks := low, qtoks
 			if re != nil {
-				c = len(re.FindAllStringIndex(m.Text, -1))
+				c = countRegex(re, m.Text)
 			} else {
-				c = countIn(m.Text, low, qtoks, phrases, qlow, o.FuzzyVariants)
+				c = countIn(m.Text, low, qtoks, phrases, o.FuzzyVariants)
 				// Postings are keyed on Traditional-folded CJK, so a query in
 				// one script legitimately reaches a record in the other. This
 				// counting pass works on surface text and would score that
@@ -237,7 +243,7 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 				if c == 0 && queryCJK {
 					foldedLow := cjkfold.String(low)
 					c = countIn(cjkfold.String(m.Text), foldedLow, qtoksFolded,
-						phrasesFolded, qlowFolded, o.FuzzyVariants)
+						phrasesFolded, o.FuzzyVariants)
 					if c > 0 {
 						windowText, windowToks = foldedLow, qtoksFolded
 					}
@@ -245,7 +251,7 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 			}
 			if c > 0 {
 				doc.hit.Count += c
-				if doc.hit.Tier == TierClose && doc.hit.TierDetail == "" {
+				if (doc.hit.Tier == TierClose || doc.hit.Tier == TierStemmed) && doc.hit.TierDetail == "" {
 					doc.hit.TierDetail = variantDetail(m.Text, qtoks, o.FuzzyVariants)
 				}
 				// Collect every matching message with its match count; the
@@ -259,8 +265,14 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 				}
 			}
 			doc.length += countDocumentWords(low, qtoks, o.FuzzyVariants, doc.termCount, doc.userCount, m.Role == "user")
-			if len(qtoks) == 1 && doc.termCount[0] == 0 && strings.Contains(low, qlow) {
-				n := strings.Count(low, qlow)
+			// The token, not the raw query — the same rule as countIn. This
+			// path is what scores `retry` inside `retry-backoff`, which
+			// countDocumentWords cannot match because it counts whole words
+			// and treats the hyphen as one. Comparing the raw query here left
+			// a punctuated query with a session that matched three times and
+			// scored zero, ranked below one that matched once (#1603).
+			if len(qtoks) == 1 && doc.termCount[0] == 0 && strings.Contains(low, qtoks[0]) {
+				n := strings.Count(low, qtoks[0])
 				doc.termCount[0] += n
 				if m.Role == "user" {
 					doc.userCount[0] += n
@@ -366,6 +378,12 @@ func setTier(o Options) string {
 	switch {
 	case o.Semantic:
 		return TierSemantic
+	// Retrieval reports the coarse "close" for everything below exact and marks
+	// stemming with its own flag. Taking its word overwrote the finer name, so
+	// a word form and a misspelling — two rungs deja narrates differently —
+	// arrived at a consumer as the same tier (#1616).
+	case o.Stemmed && (o.Tier == "" || o.Tier == TierClose):
+		return TierStemmed
 	case o.Tier != "":
 		return o.Tier
 	case o.Stemmed:
@@ -840,7 +858,7 @@ func lifecycleSummary(h Hit) string {
 		head += " (" + SafeLine(h.LifecycleAt) + ")"
 	}
 	if h.LifecycleNote != "" {
-		head += ": " + SafeLine(h.LifecycleNote)
+		head += ": " + SafeNote(h.LifecycleNote)
 	}
 	return head
 }
@@ -1248,6 +1266,28 @@ func FindByPrefix(ss []model.Session, p string) (model.Session, bool) {
 	return model.Session{}, false
 }
 
+// repeatedStamps names the minutes this session renders more than once from
+// different instants — what the fall-back hour does twice a year. Nothing else
+// is affected: an ordinary transcript keeps its narrower column.
+func repeatedStamps(ms []model.Message) map[string]bool {
+	seen := map[string]time.Time{}
+	repeated := map[string]bool{}
+	for _, m := range ms {
+		if m.Time.IsZero() {
+			continue
+		}
+		stamp := m.Time.Format("2006-01-02 15:04")
+		if first, ok := seen[stamp]; ok {
+			if !first.Equal(m.Time) {
+				repeated[stamp] = true
+			}
+			continue
+		}
+		seen[stamp] = m.Time
+	}
+	return repeated
+}
+
 func PrintSession(w io.Writer, s model.Session) {
 	// Project and id are transcript text a harness wrote, and this is one
 	// line: an escape byte in either recolours the transcript that follows, a
@@ -1255,6 +1295,7 @@ func PrintSession(w io.Writer, s model.Session) {
 	// lines of what reads as deja's own output. PrintContext below has said
 	// this since #1090; this header was missed by it.
 	fmt.Fprintf(w, "# %s · %s · %s\n", s.Harness, SafeLine(s.Project), SafeLine(s.ID))
+	repeated := repeatedStamps(s.Messages)
 	for _, m := range s.Messages {
 		txt := redact.SafeForDisplay(collapseTool(m.Text))
 		if strings.TrimSpace(txt) == "" {
@@ -1262,7 +1303,14 @@ func PrintSession(w io.Writer, s model.Session) {
 		}
 		t := ""
 		if !m.Time.IsZero() {
-			t = m.Time.Format("2006-01-02 15:04") + " "
+			stamp := m.Time.Format("2006-01-02 15:04")
+			if repeated[stamp] {
+				// The clocks went back and this minute happened twice. Both
+				// stamps are right, which is why an hour of conversation reads
+				// as a duplicated message without the offset (#1788).
+				stamp = m.Time.Format("2006-01-02 15:04 -07:00")
+			}
+			t = stamp + " "
 		}
 		fmt.Fprintf(w, "\n%s%s:\n%s\n", t, m.Role, SafeText(txt))
 	}
@@ -1326,7 +1374,7 @@ func PrintContext(w io.Writer, s model.Session, query string) {
 			// How much of the query the turn carries, counted the way the hit
 			// snippets already rank passages: a turn that says the word once in
 			// passing must not outrank the exchange that keeps returning to it.
-			weight = countIn(m.Text, low, terms, phrases, qlow, nil)
+			weight = countIn(m.Text, low, terms, phrases, nil)
 			if weight == 0 && strings.Contains(low, qlow) {
 				weight = 1
 			}
@@ -1346,6 +1394,52 @@ func PrintContext(w io.Writer, s model.Session, query string) {
 	printContextChunks(w, s, budget, func(m model.Message) (bool, int) { return true, 0 })
 }
 
+// contextTurn is a turn the digest keeps, before it is rendered.
+type contextTurn struct {
+	role   string
+	raw    string
+	weight int
+}
+
+// renderContextTurnsWorkers is how many turns render at once. One worker per
+// core; a session small enough that the goroutines cost more than the work
+// renders in place.
+var renderContextTurnsWorkers = runtime.NumCPU
+
+// renderContextTurns renders each kept turn, in parallel when there are enough
+// of them to pay for it. Results are written by index, so the digest is the
+// same bytes in the same order however many cores run it.
+func renderContextTurns(turns []contextTurn) []string {
+	out := make([]string, len(turns))
+	workers := renderContextTurnsWorkers()
+	if workers > len(turns) {
+		workers = len(turns)
+	}
+	if workers < 2 || len(turns) < 32 {
+		for i, t := range turns {
+			out[i] = SafeText(contextText(t.raw, t.weight > 0))
+		}
+		return out
+	}
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(turns) {
+					return
+				}
+				out[i] = SafeText(contextText(turns[i].raw, turns[i].weight > 0))
+			}
+		}()
+	}
+	wg.Wait()
+	return out
+}
+
 func printContextChunks(w io.Writer, s model.Session, budget int, include func(m model.Message) (ok bool, weight int)) int {
 	// A digest is what someone pipes into a prompt, so it carries the
 	// conversation. The work records — tool output, the files a turn touched, the
@@ -1360,7 +1454,15 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		// sit where the matches are rather than where the first one is.
 		weight int
 	}
-	var chunks []chunk
+	// The include callback carries state from turn to turn (prevKept), so which
+	// turns are kept is decided in one ordered pass. Rendering them is not:
+	// redaction and prose collapsing are the bulk of the command's time — 3.5 s
+	// of a 4.5 s run on a 30001-message session — and every turn is rendered
+	// before the 8 KB window can say which ones get printed (#1790). Rendering
+	// only the window was tried and reverted (#1742): collapsed sizes differ
+	// from predicted ones and the window moves. Spreading the same renders
+	// across cores keeps the output identical by construction.
+	var kept []contextTurn
 	for _, m := range s.Messages {
 		if isWorkRecord(m.Role) {
 			continue
@@ -1369,11 +1471,16 @@ func printContextChunks(w io.Writer, s model.Session, budget int, include func(m
 		if !ok {
 			continue
 		}
-		text := SafeText(contextText(m.Text, weight > 0))
+		kept = append(kept, contextTurn{role: m.Role, raw: m.Text, weight: weight})
+	}
+	rendered := renderContextTurns(kept)
+	var chunks []chunk
+	for i, k := range kept {
+		text := rendered[i]
 		if strings.TrimSpace(text) == "" {
 			continue
 		}
-		chunks = append(chunks, chunk{fmt.Sprintf("\n## %s\n\n%s\n", m.Role, text), weight})
+		chunks = append(chunks, chunk{fmt.Sprintf("\n## %s\n\n%s\n", k.role, text), k.weight})
 	}
 	if len(chunks) == 0 {
 		return 0
@@ -1434,14 +1541,32 @@ func Recent(ss []model.Session, n int) []model.Session {
 	return out
 }
 
+// A pattern that can match the empty string — `x*`, `foo?`, `(a|)` — matches
+// between every pair of characters. Counting those reported 88 matches in a
+// session that held none of the pattern's characters at all (#1606); a match
+// with no width is not a match.
+func countRegex(re *regexp.Regexp, s string) int {
+	n := 0
+	for _, loc := range re.FindAllStringIndex(s, -1) {
+		if loc[1] > loc[0] {
+			n++
+		}
+	}
+	return n
+}
+
 func snippet(s, q string, re *regexp.Regexp) string {
 	s = proseForSnippet(s)
 	r := []rune(s)
 	idx := 0
 	if re != nil {
-		loc := re.FindStringIndex(s)
-		if loc != nil {
-			idx = utf8.RuneCountInString(s[:loc[0]])
+		// Anchor on the first match that has width; a zero-width one points at
+		// no passage in particular (#1606).
+		for _, loc := range re.FindAllStringIndex(s, -1) {
+			if loc[1] > loc[0] {
+				idx = utf8.RuneCountInString(s[:loc[0]])
+				break
+			}
 		}
 	} else {
 		low := strings.ToLower(s)
@@ -1622,7 +1747,14 @@ func highlight(s, q string, isRe bool, color bool) string {
 	if isRe {
 		re, err := regexp.Compile("(?i)" + q)
 		if err == nil {
-			return re.ReplaceAllStringFunc(s, func(x string) string { return cMatch + x + cReset })
+			return re.ReplaceAllStringFunc(s, func(x string) string {
+				// Zero-width match: colouring it wraps an escape pair around
+				// nothing, once per character (#1606).
+				if x == "" {
+					return x
+				}
+				return cMatch + x + cReset
+			})
 		}
 	}
 	if strings.Contains(strings.ToLower(s), strings.ToLower(q)) {
@@ -1753,14 +1885,105 @@ func collapseTool(s string) string {
 var (
 	lineNumberRE = regexp.MustCompile(`^\s*\d{1,5}[:|]\s+`)
 	toolDumpRE   = regexp.MustCompile(`(?i)(tool_use|tool_result|<local-command|netcat|npm ERR!|panic:|goroutine \d+)`)
+	// The literal each alternative of toolDumpRE begins with, in the same
+	// order. A line holding none of them cannot match, and looksToolDump uses
+	// that to skip the engine entirely.
+	toolDumpLiterals = []string{"tool_use", "tool_result", "<local-command", "netcat", "npm err!", "panic:", "goroutine "}
 )
+
+// containsFold is strings.Contains for a lowercase ASCII needle, without
+// allocating a lowercased copy of the line.
+func containsFold(hay, lowerNeedle string) bool {
+	if len(lowerNeedle) == 0 || len(hay) < len(lowerNeedle) {
+		return len(lowerNeedle) == 0
+	}
+	last := len(hay) - len(lowerNeedle)
+	for i := 0; i <= last; i++ {
+		k := 0
+		for k < len(lowerNeedle) {
+			c := hay[i+k]
+			if c >= 'A' && c <= 'Z' {
+				c += 'a' - 'A'
+			}
+			if c != lowerNeedle[k] {
+				break
+			}
+			k++
+		}
+		if k == len(lowerNeedle) {
+			return true
+		}
+	}
+	return false
+}
+
+// toolDumpEngineCalls counts the lines that reach the regexp engine. The point
+// of the prefilter is that ordinary prose does not, and a counter says so in a
+// test without timing anything (#1742).
+var toolDumpEngineCalls atomic.Int64
+
+// looksToolDump is toolDumpRE with the scan the regexp engine spends most of
+// its time on done by hand: every alternative starts with a literal, so a line
+// holding none of them cannot match. Rendering a digest ran this per line over
+// the whole session — 16.5 s of the 17 s a 240 MB render took (#1742).
+func looksToolDump(line string) bool {
+	for i := 0; i < len(line); i++ {
+		if line[i] >= 0x80 {
+			// Case folding is Unicode-wide in the engine (ſ folds to s), and
+			// this prefilter is ASCII. A line with any byte outside ASCII goes
+			// to the engine rather than being decided here.
+			toolDumpEngineCalls.Add(1)
+			return toolDumpRE.MatchString(line)
+		}
+	}
+	for _, lit := range toolDumpLiterals {
+		if containsFold(line, lit) {
+			toolDumpEngineCalls.Add(1)
+			return toolDumpRE.MatchString(line)
+		}
+	}
+	return false
+}
+
+// looksNumbered is lineNumberRE — `^\s*\d{1,5}[:|]\s+` — read directly. It
+// anchors at the start, so the whole line never needs scanning.
+func looksNumbered(line string) bool {
+	i := 0
+	for i < len(line) && isRegexSpace(line[i]) {
+		i++
+	}
+	digits := 0
+	for i < len(line) && line[i] >= '0' && line[i] <= '9' && digits < 6 {
+		i++
+		digits++
+	}
+	if digits == 0 || digits > 5 || i >= len(line) {
+		return false
+	}
+	if line[i] != ':' && line[i] != '|' {
+		return false
+	}
+	i++
+	return i < len(line) && isRegexSpace(line[i])
+}
+
+// isRegexSpace is \s as the regexp engine reads it: [\t\n\f\r ]. Leaving out
+// the ones a caller usually trims is how a fast path drifts from the pattern it
+// stands in for.
+func isRegexSpace(c byte) bool {
+	switch c {
+	case ' ', '\t', '\n', '\f', '\r':
+		return true
+	}
+	return false
+}
 
 func proseForSnippet(s string) string {
 	s = redact.SafeForDisplay(s)
 	var keep []string
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || lineNumberRE.MatchString(line) || toolDumpRE.MatchString(line) {
+		if line == "" || looksNumbered(line) || looksToolDump(line) {
 			continue
 		}
 		keep = append(keep, line)
@@ -1974,6 +2197,16 @@ func SafeText(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// SafeNote is SafeLine bounded to the length of an answer, for the one string
+// on these screens that a person wrote at whatever length they liked. Printed
+// whole, a 4000-character promote note came out as a 4051-column line on a
+// screen budgeted to 80, and as 4074 of the 4347 bytes an agent got back
+// (#1645). The full note stays readable where a whole note belongs: `deja show`
+// on the promoted note prints it as a message.
+func SafeNote(s string) string {
+	return clip(SafeLine(s))
 }
 
 // SafeLine is SafeText confined to a single line, for the places that print
