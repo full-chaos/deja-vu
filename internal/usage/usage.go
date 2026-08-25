@@ -583,6 +583,14 @@ func Impact(indexDir string) ImpactReport {
 			// the environment block, and that event is logged empty. Counting
 			// it made "N session starts began with project memory" claim
 			// memory that was not there.
+			//
+			// The bytes go with the count, which is the part that looks like
+			// an oversight and is not. The block is a summary of what this
+			// machine keeps hitting, not a digest of transcripts, so it is
+			// recorded with no raw size behind it. Adding it to ServedBytes
+			// alone divides a real numerator by an unchanged denominator:
+			// measured on three recalls and ten blocks, a tenfold saving reads
+			// as fourfold, understating what deja did. Both stay out.
 			if e.Empty {
 				continue
 			}
