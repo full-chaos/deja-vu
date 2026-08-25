@@ -248,7 +248,7 @@ func runHookContext(dir string, plain bool) error {
 		// does not depend on the digest having found anything.
 		if env := environmentBlock(dir, policy.ActivationAuto); env != "" {
 			out := frameRecall(env)
-			usage.RecordDigestPolicy(dir, usage.KindHook, out, 0, 0, policy.Load().Describe(policy.ActivationAuto))
+			usage.RecordDigestPolicyInto(dir, usage.KindHook, out, input.SessionID, 0, 0, policy.Load().Describe(policy.ActivationAuto))
 			if plain {
 				fmt.Fprintln(os.Stdout, out)
 				return nil
@@ -320,7 +320,7 @@ func runHookContext(dir string, plain bool) error {
 	}
 	digest = frameRecall(digest)
 	polName := policy.Load().Describe(policy.ActivationAuto)
-	usage.RecordDigestPolicy(dir, usage.KindHook, digest, sessions, raw, polName)
+	usage.RecordDigestPolicyInto(dir, usage.KindHook, digest, input.SessionID, sessions, raw, polName)
 	if plain {
 		fmt.Fprintln(os.Stdout, digest)
 		return nil
