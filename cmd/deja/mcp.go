@@ -41,6 +41,43 @@ func isNotification(id json.RawMessage) bool {
 	return len(id) == 0 || string(id) == "null"
 }
 
+// parseBatch reports whether a frame is an array of requests, and returns them.
+// A frame that only starts like one — a truncated `[` — is not a batch and
+// keeps its parse error.
+func parseBatch(frame string) ([]json.RawMessage, bool) {
+	if !strings.HasPrefix(frame, "[") {
+		return nil, false
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal([]byte(frame), &elems); err != nil {
+		return nil, false
+	}
+	return elems, true
+}
+
+// batchReply says whether a batch is owed an answer and which id to put on it.
+// The id is the first request in the array that carries one, so the refusal can
+// be matched to something the client sent. A batch of nothing but notifications
+// is owed no answer — the spec forbids replying to one, inside a batch or out
+// of it — while an empty or malformed array is an invalid request like any
+// other and gets the refusal with a null id.
+func batchReply(elems []json.RawMessage) (json.RawMessage, bool) {
+	notificationsOnly := len(elems) > 0
+	for _, elem := range elems {
+		var req rpcRequest
+		if !bytes.HasPrefix(bytes.TrimSpace(elem), []byte("{")) || json.Unmarshal(elem, &req) != nil {
+			// Not a request object at all, so it asked for nothing and is not
+			// a notification either: the array is malformed and says so.
+			notificationsOnly = false
+			continue
+		}
+		if !isNotification(req.ID) {
+			return req.ID, true
+		}
+	}
+	return nil, !notificationsOnly
+}
+
 const mcpMaxFrame = 10 * 1024 * 1024
 
 func serveMCP(dir string, r io.Reader, w io.Writer) error {
@@ -54,8 +91,25 @@ func serveMCP(dir string, r io.Reader, w io.Writer) error {
 			writeRPCError(enc, nil, -32700, "parse error")
 		} else if trimmed := strings.TrimSpace(string(line)); trimmed != "" {
 			var req rpcRequest
-			if uerr := json.Unmarshal([]byte(trimmed), &req); uerr != nil {
+			if batch, isBatch := parseBatch(trimmed); isBatch {
+				// A batch is valid JSON, and answering -32700 told a client its
+				// bytes were corrupt when they were not — with a null id, so it
+				// could not tell which of its requests died either. deja serves
+				// one request per frame; the refusal says so (#1795). A batch
+				// carrying nothing but notifications gets no reply at all, as a
+				// notification does on its own line: the spec forbids answering
+				// one, inside a batch or out of it.
+				if id, answer := batchReply(batch); answer {
+					writeRPCError(enc, id, -32600, "batch requests are not supported — send one request per line")
+				}
+			} else if uerr := json.Unmarshal([]byte(trimmed), &req); uerr != nil {
 				writeRPCError(enc, nil, -32700, "parse error")
+			} else if req.JSONRPC != "" && req.JSONRPC != "2.0" {
+				// The member that says which protocol the frame speaks. An
+				// absent one is still served — clients in the wild omit it and
+				// the request is unambiguous — but "1.0" asks for a protocol
+				// this server does not speak and used to be answered anyway.
+				writeRPCError(enc, req.ID, -32600, "unsupported jsonrpc version "+req.JSONRPC+" — this server speaks 2.0")
 			} else if !isNotification(req.ID) {
 				result, code, msg := handleMCP(dir, req)
 				if code != 0 {
