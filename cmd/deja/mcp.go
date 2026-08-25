@@ -1086,7 +1086,18 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 		if len(more) >= budget {
 			more = ""
 		}
-		out = trimUTF8(out, budget-len(more))
+		// Every excerpt shortened on its own ends with the marker; the one the
+		// page budget cut ended mid-word saying nothing, so the last line an
+		// agent reads was the one line it could not tell was a fragment
+		// (#1799). Reserved before the trim, like the paging line above.
+		room := budget - len(more)
+		if room <= len(cutMarker) {
+			// No room to say it was cut without eating what was cut from:
+			// keep the bytes, drop the marker.
+			out = trimUTF8(out, room)
+		} else {
+			out = markCut(trimUTF8(out, room-len(cutMarker)))
+		}
 	}
 	out += more
 	var raw int64
@@ -1101,6 +1112,25 @@ func recallTextResult(dir, q, harness string, limit, offset, budget int) (string
 		}
 	}
 	return out, served, raw, ids, nil
+}
+
+// cutMarker ends a line the page budget cut, matching what an excerpt
+// shortened on its own already carries.
+const cutMarker = " …\n"
+
+// markCut ends a trimmed page with the marker, on its own line. A trim landing
+// exactly on a line break needs no marker inside the line, only the newline it
+// already has.
+func markCut(s string) string {
+	if strings.HasSuffix(s, "\n") {
+		return s
+	}
+	// A trim landing between an excerpt's own ellipsis and its newline already
+	// says the line was shortened; a second one reads as "… …".
+	if strings.HasSuffix(strings.TrimRight(s, " "), "…") {
+		return s + "\n"
+	}
+	return s + cutMarker
 }
 
 func trimUTF8(s string, budget int) string {
