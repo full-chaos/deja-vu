@@ -355,6 +355,9 @@ func rebuild(dir string, harness string, scope string, files map[string]FileStat
 }
 
 func rebuildWithTombstones(dir string, harness string, scope string, files map[string]FileState, progress io.Writer, dead map[string]bool) error {
+	// This build's counts, not the process's: see writeSessionsWithSync (#1850).
+	emptied.Store(0)
+	collisions.Store(0)
 	lastIngestFiles = len(files)
 	initialBuild := !HasManifest(dir)
 	writtenMessages := 0
@@ -704,8 +707,10 @@ func dropEmptySessions(m *Manifest, wrote map[string]bool) {
 	}
 }
 
-// ReportEmptySessions returns how many transcripts held nothing to index since
-// the last build, and clears the counter. The parse count and the indexed
+// ReportEmptySessions returns how many transcripts held nothing to index in the
+// last build, and clears the counter. The build zeroes it as it starts writing,
+// so a caller reads that build's number whether or not anyone read the one
+// before (#1850). The parse count and the indexed
 // count differ by exactly this, and the run is where someone is looking at
 // both numbers.
 func ReportEmptySessions() int {
@@ -717,6 +722,14 @@ func writeSessions(tmp, dir string, ss []model.Session, files map[string]FileSta
 }
 
 func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string]FileState, scope string, imp importedState) error {
+	// The counters belong to this build. Draining them only on read made
+	// "since the last build" true only when the last read was the last build:
+	// a second build in one process reported its own empty transcripts plus
+	// whatever an earlier one left behind (#1850), and the collision counter
+	// beside it did the same. One process is one build for the CLI, which is
+	// why it showed in the test binary first.
+	emptied.Store(0)
+	collisions.Store(0)
 	initialBuild := !HasManifest(dir)
 	writtenMessages := 0
 	lastIngestFiles = len(files)
@@ -1993,6 +2006,9 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		return nil
 	}
 	var replacements []model.Session
+	// This pass's counts, like every other build path (#1850).
+	emptied.Store(0)
+	collisions.Store(0)
 	lastIngestFiles = len(changed)
 	for p, f := range changed {
 		ss, err := parseChangedFile(harness, p, old.Files[p])
@@ -2279,6 +2295,11 @@ func canAppendIncremental(changed map[string]FileState, old map[string]FileState
 }
 
 func appendIncremental(dir, harness, scope string, old Manifest, files map[string]FileState, changed map[string]FileState) (int, int, error) {
+	// This pass's counts, like the two full paths: an incremental that nobody
+	// read between builds otherwise reported its own colliding ids plus the
+	// ones before it (#1850).
+	emptied.Store(0)
+	collisions.Store(0)
 	lastIngestFiles = len(changed)
 	rf, err := os.OpenFile(filepath.Join(dir, "records.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
