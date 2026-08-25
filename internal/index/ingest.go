@@ -213,6 +213,51 @@ func EnsureForSearch(dir string, o query.Options, force bool, progress io.Writer
 		return err
 	}
 	defer unlock()
+	return ensureLocked(dir, o, force, progress)
+}
+
+// EnsureForSearchNoWait is EnsureForSearch for a caller that must answer inside
+// somebody's tool call: it takes the lock or reports that another process holds
+// it, in one attempt. Checking RebuildInProgress and then calling the blocking
+// Ensure asked the same question twice, a lock acquisition apart, and a rebuild
+// starting in that window was waited out inside the call (#1804).
+func EnsureForSearchNoWait(dir string, o query.Options, progress io.Writer) (busy bool, err error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	unlock, ok, err := tryLockDir(dir)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		// tryLockDir reports "no lock" for two different things: someone else
+		// holds it, and this machine cannot write the lock file at all. Only
+		// the first is a refresh to wait for. A read-only index — a container
+		// mount, a locked-down machine — answers every question asked of it,
+		// and telling the caller to come back later would be a wait that never
+		// ends.
+		if lockUnwritable(dir) && HasManifest(dir) {
+			return false, nil
+		}
+		return true, nil
+	}
+	defer unlock()
+	return false, ensureLocked(dir, o, false, progress)
+}
+
+// lockUnwritable reports an index whose lock file cannot be created or opened
+// for writing, which is how a read-only store presents itself.
+func lockUnwritable(dir string) bool {
+	f, err := os.OpenFile(dir+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return errors.Is(err, fs.ErrPermission)
+	}
+	_ = f.Close()
+	return false
+}
+
+// ensureLocked is the body of an Ensure, with the lock already held.
+func ensureLocked(dir string, o query.Options, force bool, progress io.Writer) error {
 	sweepStaleTmp(dir)
 	prior, priorErr := readManifest(dir)
 	want := currentFilesReusing("", priorFiles(prior, priorErr))
