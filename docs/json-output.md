@@ -351,7 +351,12 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
 ```
 
 `embed`, `ingest_health` and `deep` (present only under `--deep`) are omitted
-when unavailable; `policy` is always present. `index.path` points at the index
+when unavailable; `policy` is always present. `embed.state` is the endpoint's,
+`unavailable` or `reachable`. `sidecar` is the file's own state and appears only
+when it is `unreadable` — the sidecar is on disk and deja cannot parse it —
+with an `error` saying why. A sidecar fault is reported whether or not an
+endpoint is configured, so `embed` is present in that case even with no
+endpoint. `index.path` points at the index
 directory; `index.db` is that directory's name, not a file. Store `state`
 values are `ok`, `missing`, `unreadable`, `parsed-zero`, `denied` (which adds a
 `denied` field naming the unreadable path), `needs-sqlite3` and `needs-zstd`
