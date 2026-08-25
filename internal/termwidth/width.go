@@ -7,11 +7,20 @@
 // rather than reflowed.
 package termwidth
 
+import "github.com/vshulcz/deja-vu/internal/nfcfold"
+
 // Columns is how wide a string prints. A CJK character is one rune and two
 // columns.
+//
+// The string is composed first, so the same name measures the same however it
+// was typed: macOS hands paths back decomposed and project names come from
+// paths, so "über-server" measured 12 columns there and 11 everywhere else, and
+// every aligned screen padded it a column short (#1824). Composing is a scan
+// and no allocation for text with no combining mark in it, which is nearly all
+// of what these screens print.
 func Columns(s string) int {
 	n := 0
-	for _, r := range s {
+	for _, r := range nfcfold.Compose(s) {
 		n += RuneColumns(r)
 	}
 	return n
@@ -184,6 +193,11 @@ var wideRanges = [...]struct{ lo, hi rune }{
 
 // Cut keeps as much of s as fits in width columns.
 func Cut(s string, width int) string {
+	// Composed for the same reason Columns is, and for one more: cutting a
+	// decomposed string by raw runes can separate a mark from the character it
+	// belongs to, and CutRight then starts a line with an orphan that draws on
+	// whatever precedes it (#1824).
+	s = nfcfold.Compose(s)
 	n := 0
 	for i, r := range s {
 		w := RuneColumns(r)
@@ -199,6 +213,7 @@ func Cut(s string, width int) string {
 // identified by its tail — "…/消费者重平衡" says which project this is, where
 // the first characters of a long prefix rarely do.
 func CutRight(s string, width int) string {
+	s = nfcfold.Compose(s)
 	n := 0
 	runes := []rune(s)
 	for i := len(runes) - 1; i >= 0; i-- {
