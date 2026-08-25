@@ -328,7 +328,7 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		}
 		text, sessions, raw, ids, err := recallContextResult(dir, a.Query, a.Harness)
 		if err == nil {
-			text = frameRecall(text)
+			text = frameRecall(fitContextDigest(text, a.Query, contextMCPBudget-recallFrameOverhead))
 			usage.RecordServedSessions(dir, usage.KindContext, len(text), sessions, sessions == 0, raw, ids)
 			usage.SnapshotPolicy(dir, usage.KindContext, text, sessions, policy.Load().Describe(policy.ActivationMCP))
 		}
@@ -553,6 +553,58 @@ func blameTextResult(dir string, o search.BlameOptions, path string, limit int) 
 	}
 	return string(body), len(hits), nil
 }
+
+// contextDigestCut is the line that admits a digest was cut. Without it the
+// reply ends mid-word and reads as the whole session, which is what an agent
+// then tells the user it saw.
+const contextDigestCut = "\n[digest trimmed to fit the ~8KB budget — call recall_context again for another session, or deja ctx <id> for the whole one]\n"
+
+// fitContextDigest trims a digest to budget, cutting at a line boundary where
+// one is near enough and saying that it cut. The marker is reserved before the
+// trim, the way recall reserves its paging line (#1726), so the thing that
+// explains the cut is not itself the thing that gets cut.
+func fitContextDigest(text, query string, budget int) string {
+	if len(text) <= budget {
+		return text
+	}
+	if budget <= len(contextDigestCut) {
+		return trimUTF8(text, budget)
+	}
+	body := trimUTF8(text, budget-len(contextDigestCut))
+	// Back up to the last line break if one is close, so the digest does not
+	// end in the middle of a sentence it will not finish — but never at the
+	// cost of the words the digest was asked for. A match sitting in that last
+	// line is the answer; ending mid-word is only untidy.
+	if i := strings.LastIndexByte(body, '\n'); i > len(body)-400 && i > 0 {
+		if shorter := body[:i]; keepsQuery(shorter, body, query) {
+			body = shorter
+		}
+	}
+	return body + contextDigestCut
+}
+
+// keepsQuery reports whether the shorter body still carries a query word that
+// the longer one did. A query whose words are nowhere in either is no reason to
+// keep the ragged ending.
+func keepsQuery(shorter, longer, query string) bool {
+	for _, word := range strings.Fields(strings.ToLower(query)) {
+		if len(word) < 3 {
+			continue
+		}
+		if strings.Contains(strings.ToLower(longer), word) && !strings.Contains(strings.ToLower(shorter), word) {
+			return false
+		}
+	}
+	return true
+}
+
+// contextMCPBudget is the whole framed recall_context reply, matching the
+// "~8KB" its tool description promises an agent. recall has been exact since it
+// passed 4096-recallFrameOverhead; this path passed no budget at all, so the
+// digest header — which carries a project name and a session id, neither of
+// them bounded — pushed an ordinary reply to 8221 bytes and a long-named one to
+// 8335 (#1797).
+const contextMCPBudget = 8192
 
 // blameMCPBudget bounds one blame answer. Higher than recall's ~4 KB because a
 // hit is a whole session rather than a snippet, and well under what an agent
