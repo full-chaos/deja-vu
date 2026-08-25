@@ -15,6 +15,8 @@ a `schema_version` field so consumers can detect breaking changes.
 - **`deja blame --json`** and **`deja log --json`** return a top-level JSON
   array rather than an envelope, so neither carries `schema_version`. Their
   element shapes are stable; only additive fields inside them are permitted.
+- **`deja stats --impact --json`** returns one flat object of counters and
+  carries no `schema_version` either, on the same terms.
 
 ### What changed in version 2
 
@@ -378,6 +380,42 @@ ahead counts: a peers file is written by deja itself, so a copy
 from a machine a moment ahead — or an NTP step landing between the write and the
 read — is not a clock worth reporting, while a session's stamp comes from a
 transcript deja did not write.
+
+## `deja stats --impact --json`
+
+What deja has actually served on this machine, measured from the usage log:
+
+```json
+{
+  "recalls": 30,
+  "injections": 4,
+  "served_bytes": 15000,
+  "raw_bytes": 150000,
+  "reused_twice": 2,
+  "dejavu_moments": 1,
+  "since": "2026-07-27T14:33:13Z",
+  "credited_aloud": 3
+}
+```
+
+No envelope and no `schema_version`, for the same reason as `blame` and `log`:
+the shape is one flat object of counters, and a consumer reads the keys it knows.
+Additive fields are permitted; a rename is a breaking change and would be called
+one.
+
+`recalls` counts agent-initiated recalls that returned matches, `injections`
+session starts that began with project memory. `served_bytes` is what the
+digests actually returned and `raw_bytes` the source transcripts they were
+distilled from, so the ratio is how much reading deja saved. `reused_twice` is
+sessions agents recalled two or more times, `dejavu_moments` prompts matched to
+prior work, and `credited_aloud` the recalls an agent said out loud.
+
+`since` is the oldest event still in the usage log, so no count above covers
+more than the period from then to now. On a quiet machine that is every event
+there has ever been; once the log grows past 1MB it is rewritten keeping the
+last 14 days, and from then on the figures are a window whose start moves. Read
+`since` rather than assuming either. It is absent when the log holds nothing,
+which is the one case where the counts are all zero anyway.
 
 ## `deja blame <path> --json`
 
