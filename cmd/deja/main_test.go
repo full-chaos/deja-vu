@@ -346,9 +346,11 @@ func TestLastParserAndSourceFilters(t *testing.T) {
 	if raw != "7d" {
 		t.Fatalf("sinceRaw = %q, want the flag as typed", raw)
 	}
-	n, o, raw, err = parseLast([]string{"bad"})
-	if err != nil || n != 10 || o.Harness != "" || o.Project != "" || raw != "" {
-		t.Fatalf("parseLast compatibility = n:%d options:%#v raw:%q err:%v", n, o, raw, err)
+	// The count is the only bare argument last takes. Ignoring anything else
+	// left the reader with the default ten from every project and no sign that
+	// the word they typed did nothing (#1618).
+	if _, _, _, err := parseLast([]string{"bad"}); err == nil || !strings.Contains(err.Error(), "is not a count") {
+		t.Fatalf("parseLast bad count err=%v", err)
 	}
 	if _, _, _, err := parseLast([]string{"--unknown"}); err == nil || !strings.Contains(err.Error(), "unknown flag") {
 		t.Fatalf("parseLast unknown flag err=%v", err)
@@ -672,9 +674,10 @@ func TestActiveFiltersNamesWhatEmptiedTheResult(t *testing.T) {
 	if strings.Contains(got, "168h") {
 		t.Errorf("echoed the parsed duration instead of the flag: %q", got)
 	}
-	// parseDur accepts a negative, and filterRecentSources applies no time
-	// filter for one — so naming it would report a filter that never ran and
-	// suppress the empty-store advice, which is the right answer there.
+	// parseDur refuses a negative now (#1610), so this can no longer arrive
+	// from the command line. It stays here because filterRecentSources applies
+	// no time filter for one, and naming it would report a filter that never
+	// ran and suppress the empty-store advice.
 	if got := activeFilters(search.Options{Since: -time.Hour}, "-1h"); got != "" {
 		t.Errorf("named a filter that was never applied: %q", got)
 	}

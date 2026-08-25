@@ -1,6 +1,8 @@
 package sources
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/vshulcz/deja-vu/internal/atomicfile"
 	"github.com/vshulcz/deja-vu/internal/cjkfold"
@@ -55,13 +58,33 @@ func NotesFile() string {
 	return filepath.Join(Home(), ".local", "share", "deja", "notes.jsonl")
 }
 
+// cleanTag removes what a tag cannot carry and cuts it to maxTagLen. A control
+// byte in a tag reached notes.jsonl and every surface reading it, and an escape
+// sequence is not something anyone meant to file a note under.
+func cleanTag(t string) string {
+	t = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return ' '
+		}
+		return r
+	}, t)
+	t = strings.Join(strings.Fields(t), "-")
+	return truncateRunes(t, maxTagLen)
+}
+
+// maxTagLen bounds one tag. The count has been capped at 8 since tags landed;
+// one tag's length was not bounded at all, so a 400-character tag was stored
+// and printed whole (#1810). A handle someone types and searches for is short,
+// and 64 bytes is well past anything anyone writes by hand.
+const maxTagLen = 64
+
 // NormalizeTags lowercases, trims a leading '#', drops empties/dupes and
 // caps the count — tags are navigation handles, not prose.
 func NormalizeTags(tags []string) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, t := range tags {
-		t = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(t), "#"))
+		t = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(cleanTag(t)), "#"))
 		if t == "" || seen[t] || len(out) >= 8 {
 			continue
 		}
@@ -75,6 +98,83 @@ func AppendNote(project, text string, now time.Time) error {
 	return AppendNoteTagged(project, text, nil, now)
 }
 
+// maxNoteLine bounds one line of the scan below. A note longer than this is
+// not compared — it is written, and the duplicate check simply does not claim
+// to cover it.
+const maxNoteLine = 4 << 20
+
+// ErrNoteExists says the note is already on file: same project, same text.
+// Appending it again cost the agent a line of every later recall for one fact
+// (#1736), so the write is refused and the caller says so.
+var ErrNoteExists = errors.New("note already remembered")
+
+// noteAlreadyStored reports whether this exact note is on file already. The
+// answer is advisory: two processes checking at once can both write, and a
+// read error reads as "not a duplicate" so a save is never lost to one. A
+// duplicate that slips through costs a repeated line, a refused save costs the
+// fact.
+// It
+// reads the file rather than an index: a note written a second ago has not
+// been indexed yet, and back-to-back saves are exactly the case this exists
+// for. Promoted notes are skipped — those carry provenance and a lifecycle,
+// and a `remember` is not a correction to one.
+func noteAlreadyStored(path, project, text string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = f.Close() }()
+	br := bufio.NewReaderSize(f, 64*1024)
+	for {
+		line, tooLong, err := readNoteLine(br, maxNoteLine)
+		if tooLong {
+			// A note past the cap is not compared — that is what the cap says
+			// — but it used to end the scan, so every note after it went
+			// uncompared too and one oversized note turned the check off for
+			// the whole store (#1812). notes.jsonl is append-only, so that
+			// oversized line sits in front of everything written later.
+			if err != nil {
+				return false
+			}
+			continue
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 {
+			var n note
+			if json.Unmarshal(line, &n) == nil && n.Kind == "" &&
+				n.Project == project && strings.TrimSpace(n.Text) == text {
+				return true
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// readNoteLine reads one line, reporting a line past max rather than buffering
+// it: the caller skips it and carries on down the file.
+func readNoteLine(br *bufio.Reader, max int) (line []byte, tooLong bool, err error) {
+	var buf []byte
+	for {
+		chunk, e := br.ReadSlice('\n')
+		// The cap is on the line's content; the newline that ends it is not
+		// part of the note, and counting it made a line of exactly max bytes
+		// look one byte too long.
+		if len(buf)+len(bytes.TrimSuffix(chunk, []byte("\n"))) > max {
+			tooLong = true
+			buf = nil
+		}
+		if !tooLong {
+			buf = append(buf, chunk...)
+		}
+		if e == bufio.ErrBufferFull {
+			continue
+		}
+		return buf, tooLong, e
+	}
+}
+
 func AppendNoteTagged(project, text string, tags []string, now time.Time) error {
 	project = strings.TrimSpace(project)
 	if project == "" {
@@ -86,6 +186,9 @@ func AppendNoteTagged(project, text string, tags []string, now time.Time) error 
 	path := NotesFile()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
+	}
+	if noteAlreadyStored(path, project, strings.TrimSpace(text)) {
+		return ErrNoteExists
 	}
 	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("notes file is a symlink")

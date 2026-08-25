@@ -165,6 +165,24 @@
       "indexed_sessions": 0
     },
     {
+      "name": "deepseek",
+      "state": "missing",
+      "paths": [
+        "<tmp>/home/.dsh/sessions"
+      ],
+      "files": 0,
+      "indexed_sessions": 0
+    },
+    {
+      "name": "zed",
+      "state": "unplugged",
+      "paths": [
+        "<tmp>/zed/threads/threads.db"
+      ],
+      "files": 0,
+      "indexed_sessions": 0
+    },
+    {
       "name": "deja",
       "state": "missing",
       "paths": [
@@ -176,7 +194,8 @@
   ],
   "index": {
     "state": "missing",
-    "path": "<tmp>/index.db"
+    "path": "<tmp>/index.db",
+    "stale_stores": 0
   },
   "mcp": [
     {
@@ -291,5 +310,9 @@
         "withheld": 0
       }
     }
+  },
+  "sync": {
+    "state": "ok",
+    "peers": []
   }
 }

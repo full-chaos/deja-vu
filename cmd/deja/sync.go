@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/vshulcz/deja-vu/internal/peers"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -49,6 +50,23 @@ func runSync(dir string, args []string) error {
 	switch args[0] {
 	case "ssh":
 		return runSyncSSH(dir, args[1:])
+	case "forget":
+		// A machine deja knows is retried by every bare `deja sync`, and a
+		// typo'd hostname is one of those forever — at the cost of the connect
+		// timeout each time. peers.Forget did the work already and nothing
+		// reached it (#1780).
+		// Under the spelling deja stored, not the one typed: the line reports
+		// which row is gone, and "LAPTOP forgotten" names no row (#1867).
+		host := peers.Canonical(args[1])
+		found, err := peers.Forget(host)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("deja does not know a machine called %q — `deja doctor` lists the ones it does", host)
+		}
+		fmt.Fprintf(os.Stdout, "deja: %s forgotten — bare `deja sync` will not try it again\n", hostForEcho(host))
+		return nil
 	case "export":
 		full := false
 		rest := args[1:]
@@ -96,7 +114,11 @@ func runSync(dir string, args []string) error {
 		if full {
 			n, err = index.ExportFull(dir, out)
 		} else {
-			n, err = index.ExportTo(dir, out, peer)
+			// Folded, so one machine settles under one watermark whichever way
+			// the name was spelled — a pull runs this on the remote with that
+			// machine's hostname, capitalised on macOS, while the alias someone
+			// types by hand usually is not (#1878).
+			n, err = index.ExportTo(dir, out, peers.Identity(peer))
 		}
 		if err != nil {
 			// `open …/deja-sync-b9849e838232-1785639771368128000.jsonl:
@@ -111,21 +133,21 @@ func runSync(dir string, args []string) error {
 			if p := deniedPath(err); p != "" && !strings.HasPrefix(p, out) &&
 				(errors.Is(err, fs.ErrPermission) || writeFailureReason(err) != err.Error()) {
 				if n > 0 {
-					return fmt.Errorf("%d records are written into %s, but deja could not record that they went: %w; the next export sends them again", n, out, ensureError(dir, err))
+					return fmt.Errorf("%d records are written into %s, but deja could not record that they went: %w; the next export sends them again", n, search.SafeLine(out), ensureError(dir, err))
 				}
 				return ensureError(dir, err)
 			}
 			if parent := filepath.Dir(out); !dirExists(out) && !dirExists(parent) {
-				return fmt.Errorf("cannot write the export into %s — %s is not there; the disk it lives on may have been unmounted", out, parent)
+				return fmt.Errorf("cannot write the export into %s — %s is not there; the disk it lives on may have been unmounted", search.SafeLine(out), search.SafeLine(parent))
 			}
 			if errors.Is(err, fs.ErrPermission) {
-				return fmt.Errorf("cannot write the export into %s — check that directory's permissions, or choose one you can write", out)
+				return fmt.Errorf("cannot write the export into %s — check that directory's permissions, or choose one you can write", search.SafeLine(out))
 			}
 			// A full or vanished disk in the same words as everywhere else
 			// (#906); anything deja does not recognise still comes through
 			// whole rather than being guessed at.
 			if reason := writeFailureReason(err); reason != err.Error() {
-				return fmt.Errorf("cannot write the export into %s — %s", out, reason)
+				return fmt.Errorf("cannot write the export into %s — %s", search.SafeLine(out), reason)
 			}
 			return err
 		}
@@ -133,6 +155,9 @@ func runSync(dir string, args []string) error {
 		// A watermark is per machine, not per destination: the second peer you
 		// hand memory to gets an empty folder and the same "exported 0
 		// records" that means "you are up to date" at the first one (#982).
+		// The path stays as written in the next line: it hands over a command
+		// to paste, and a collapsed path names no directory. Same tension as
+		// the recovery sentence in #1820 and the tombstone id in #1794.
 		if n == 0 && !full && !hasSyncBatches(out) {
 			fmt.Fprintf(os.Stdout, "deja: nothing has changed since the last export, and this folder holds no batch from this machine — `deja sync export %s --full` sends everything\n", out)
 		}

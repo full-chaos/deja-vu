@@ -136,6 +136,10 @@ func (s *warmupStatus) phaseName() string {
 // progress is the bare "phase 42%" fragment, for callers that supply their
 // own sentence.
 func (s *warmupStatus) progress() string {
+	// The status file exists before the first phase is written to it, and every
+	// caller drops this into parentheses or a sentence — so that window read
+	// "indexing this machine's history ()" and, with a count already known,
+	// "( 30%)". The word line() has always used for the same gap (#1731).
 	if s.Total <= 0 {
 		return s.phaseName()
 	}

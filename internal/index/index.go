@@ -57,7 +57,12 @@ import (
 // line written in Russian or Chinese is held to the same length as an English
 // one. A store built before this holds fewer friction signatures, and nothing
 // re-derives them without the bump — the same shape as 22 and 23 (#1319).
-const version = 28
+// 29: the prefixes a runner stamps on a line it did not write — pytest's `E `
+// and a leading timestamp — are stripped before a line is hashed, so one error
+// is one wall however it was printed. A store built before this holds both
+// spellings under different signatures, and nothing re-derives them without
+// the bump — the same shape as 27 and 28 (#1637).
+const version = 29
 const maxIndexedText = 64 * 1024
 
 // maxRecordSize bounds a single serialized record. A record is one message
@@ -277,6 +282,14 @@ type Manifest struct {
 	// it decodes with it empty, and an empty one means "not recorded", which
 	// says nothing rather than guessing.
 	ExcludeFingerprint string `json:"exclude_fingerprint,omitempty"`
+	// ToolFingerprint records which external CLIs were available when this
+	// index was built. A store deja could not read for want of sqlite3 or zstd
+	// is not stale by its file state — the transcripts did not change — so
+	// installing the tool and running `deja index`, which is what doctor tells
+	// the reader to do, reported "index is up to date" and left the store out
+	// of recall (#1760). Additive like the field above: empty means "not
+	// recorded", which is what an index from an older deja carries.
+	ToolFingerprint string `json:"tool_fingerprint,omitempty"`
 }
 
 // HarnessIngest is one harness's ingestion health from its last indexing pass.
@@ -306,8 +319,9 @@ type manifestCore struct {
 	RecordsSize      int64
 	BucketFiles      int
 	IngestHealth     map[string]HarnessIngest
-	// ExcludeFingerprint: see Manifest.
+	// ExcludeFingerprint, ToolFingerprint: see Manifest.
 	ExcludeFingerprint string
+	ToolFingerprint    string
 }
 
 type RedactionStats struct {
@@ -345,8 +359,13 @@ type SearchResult struct {
 	Sessions []model.Session
 	Fuzzy    bool
 	Stemmed  bool
-	Variants map[string][]string
-	Tier     string
+	// Neighbour says the swap came from the co-occurrence map rather than from
+	// a word form: "login" answered by "jwks" is not a spelling of it, and
+	// calling it a word form reads as a typo correction the reader did not
+	// make (#1786).
+	Neighbour bool
+	Variants  map[string][]string
+	Tier      string
 	// Total is how many sessions the tier matched before its own window
 	// trimmed them, and Capped whether that trimming withheld any. The
 	// relevance tier is the one that needs them: it ranks and truncates

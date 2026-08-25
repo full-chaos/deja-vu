@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,9 +25,26 @@ var sshRunner = func(name string, args ...string) (string, error) {
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil && strings.TrimSpace(stderr.String()) != "" {
-		return stdout.String(), fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		// The comment above says what stderr holds — host-key notices and
+		// server banners — which is text the machine at the other end writes.
+		// It reaches this terminal through the error, so it takes the same
+		// bound as the remote's stdout (#1833).
+		return stdout.String(), fmt.Errorf("%w: %s", err, remoteOutputForEcho(strings.TrimSpace(stderr.String())))
 	}
 	return stdout.String(), err
+}
+
+// sshConnectTimeout is how long deja waits for a machine to answer. A laptop
+// that is asleep neither answers nor refuses, and ssh's own default left one
+// host waiting 446 seconds with nothing on screen — while `deja sync` walks
+// every machine it knows (#1772).
+const sshConnectTimeout = "10"
+
+// sshOpts are the options every ssh and scp call carries: a connect timeout,
+// and BatchMode so a host that wants a password fails instead of blocking on a
+// prompt nothing is reading.
+func sshOpts() []string {
+	return []string{"-o", "ConnectTimeout=" + sshConnectTimeout, "-o", "BatchMode=yes"}
 }
 
 func runSyncSSH(dir string, args []string) error {
@@ -60,6 +78,11 @@ func runSyncSSH(dir string, args []string) error {
 // syncSSHHost runs one exchange and records it, so the next `deja sync` knows
 // this host without being told again.
 func syncSSHHost(dir, host string, pull, full, both bool) error {
+	// One machine, one spelling, for the whole run: the watermark is keyed by
+	// this string, and a second spelling of a known host pushed it everything
+	// it already had (#1867). ssh matches a host without regard to case, so
+	// this connects to the same machine either way.
+	host = peers.Canonical(host)
 	if both {
 		if err := syncOneWay(dir, host, false, full); err != nil {
 			return err
@@ -67,6 +90,22 @@ func syncSSHHost(dir, host string, pull, full, both bool) error {
 		return syncOneWay(dir, host, true, full)
 	}
 	return syncOneWay(dir, host, pull, full)
+}
+
+// errNothingToSend says the push had nothing to send, so no connection was
+// opened. It is not a failure and it is not an exchange: stamping it made
+// doctor report a machine deja never contacted as reached a moment ago (#1780).
+var errNothingToSend = errors.New("nothing new to push")
+
+// recordExchange writes what happened to the peer list, which is where doctor
+// and the bare `deja sync` read a machine's history from.
+func recordExchange(host string, pull bool, when time.Time, err error) error {
+	if errors.Is(err, errNothingToSend) {
+		// Remember the machine — it is one deja knows about now — without
+		// claiming an exchange or a failure.
+		return peers.Record(host, pull, time.Time{}, nil)
+	}
+	return peers.Record(host, pull, when, err)
 }
 
 func syncOneWay(dir, host string, pull, full bool) error {
@@ -79,8 +118,13 @@ func syncOneWay(dir, host string, pull, full bool) error {
 	// Recorded either way: a peer that has been failing for a week is exactly
 	// what the report exists to show, and it is invisible if only successes
 	// are written down.
-	if rerr := peers.Record(host, pull, time.Now(), err); rerr != nil && err == nil {
-		fmt.Fprintf(os.Stderr, "deja: synced with %s, but could not record it: %v\n", host, rerr)
+	if rerr := recordExchange(host, pull, time.Now(), err); rerr != nil && err == nil {
+		fmt.Fprintf(os.Stderr, "deja: synced with %s, but could not record it: %v\n", hostForEcho(host), rerr)
+	}
+	if errors.Is(err, errNothingToSend) {
+		// Nothing to send is a quiet success for the caller: a machine with no
+		// new work is not a machine that could not be reached.
+		return nil
 	}
 	return err
 }
@@ -91,17 +135,23 @@ func syncOneWay(dir, host string, pull, full bool) error {
 // travel through a third machine — an export never forwards what arrived by
 // sync — so every pair has to meet directly, and that is what this does.
 func runSyncAll(dir string, full bool) error {
-	list := peers.Load()
+	list, why := peers.Snapshot()
 	if len(list) == 0 {
+		// Load reports a malformed file as no peers, so without this the
+		// sentence below tells someone whose file is broken to name their
+		// first machine — which they already did (#1840).
+		if why != "" {
+			return fmt.Errorf("%s could not be read — %s", peers.Path(), remoteOutputForEcho(why))
+		}
 		return fmt.Errorf("no machines to sync with yet — name one once with `deja sync ssh <host>` and deja will remember it")
 	}
 	var failed int
 	for _, p := range list {
-		fmt.Fprintf(os.Stdout, "deja: %s\n", p.Host)
+		fmt.Fprintf(os.Stdout, "deja: %s\n", hostForEcho(p.Host))
 		if err := syncSSHHost(dir, p.Host, false, full, true); err != nil {
 			// One unreachable laptop must not stop the server from getting
 			// what the desktop did.
-			fmt.Fprintf(os.Stderr, "deja: %s: %v\n", p.Host, err)
+			fmt.Fprintf(os.Stderr, "deja: %s: %s\n", hostForEcho(p.Host), safeForStatusline(err.Error(), 200))
 			failed++
 		}
 	}
@@ -132,7 +182,10 @@ func syncSSHPush(dir, host string, full bool) error {
 		n, err = index.ExportFull(dir, tmp)
 		commit = func() error { return nil }
 	} else {
-		n, commit, err = index.ExportDeferred(dir, tmp, host)
+		// The connection takes the host as stored; the watermark takes the
+		// folded name, so a push and a hand-run `sync export --peer` settle the
+		// same machine rather than two (#1878).
+		n, commit, err = index.ExportDeferred(dir, tmp, peers.Identity(host))
 	}
 	if err != nil {
 		return err
@@ -140,7 +193,7 @@ func syncSSHPush(dir, host string, full bool) error {
 	fmt.Fprintf(os.Stdout, "deja: exported %d records\n", n)
 	if n == 0 {
 		fmt.Fprintln(os.Stdout, "deja: nothing new to push")
-		return nil
+		return errNothingToSend
 	}
 	batches, err := filepath.Glob(filepath.Join(tmp, "*.jsonl"))
 	if err != nil || len(batches) == 0 {
@@ -150,23 +203,23 @@ func syncSSHPush(dir, host string, full bool) error {
 	if err != nil {
 		return err
 	}
-	scpArgs := append([]string{"-q"}, batches...)
+	scpArgs := append(append(sshOpts(), "-q"), batches...)
 	scpArgs = append(scpArgs, host+":"+rtmp+"/")
 	if out, err := sshRunner("scp", scpArgs...); err != nil {
-		return fmt.Errorf("scp: %v: %s", err, strings.TrimSpace(out))
+		return fmt.Errorf("scp: %v: %s", err, remoteOutputForEcho(out))
 	}
 	remote := fmt.Sprintf(`d=$(command -v deja || echo "$HOME/.local/bin/deja"); "$d" sync import %s; rc=$?; rm -rf %s; exit $rc`,
 		shellQuote(rtmp), shellQuote(rtmp))
-	out, err := sshRunner("ssh", host, "sh -lc "+shellQuote(remote))
+	out, err := sshRunner("ssh", append(sshOpts(), host, "sh -lc "+shellQuote(remote))...)
 	out = strings.TrimSpace(out)
 	if err != nil {
-		return fmt.Errorf("remote import: %v: %s", err, out)
+		return fmt.Errorf("remote import: %v: %s", err, remoteOutputForEcho(out))
 	}
 	if err := commit(); err != nil {
 		return fmt.Errorf("delivered, but recording watermarks failed (next push may resend; harmless — import dedupes): %w", err)
 	}
 	if out != "" {
-		fmt.Fprintf(os.Stdout, "%s: %s\n", host, out)
+		fmt.Fprintf(os.Stdout, "%s: %s\n", hostForEcho(host), remoteOutputForEcho(out))
 	}
 	return nil
 }
@@ -191,24 +244,24 @@ func syncSSHPull(dir, host string, full bool) error {
 	remoteCmd := func(c string) string {
 		return fmt.Sprintf(`d=$(command -v deja || echo "$HOME/.local/bin/deja"); "$d" %s %s`, c, shellQuote(rtmp))
 	}
-	out, err := sshRunner("ssh", host, "sh -lc "+shellQuote(remoteCmd(pullCmd)))
+	out, err := sshRunner("ssh", append(sshOpts(), host, "sh -lc "+shellQuote(remoteCmd(pullCmd)))...)
 	out = strings.TrimSpace(out)
 	// A deja too old to know --peer refuses the flag rather than ignoring it,
 	// which is the behaviour that stops a typo from exporting nothing (#745).
 	// Upgrading both machines at once is not something a person does, so fall
 	// back to the shared watermark rather than failing the pull.
 	if err != nil && strings.Contains(out, "unknown flag") && pullCmd != exportCmd {
-		out, err = sshRunner("ssh", host, "sh -lc "+shellQuote(remoteCmd(exportCmd)))
+		out, err = sshRunner("ssh", append(sshOpts(), host, "sh -lc "+shellQuote(remoteCmd(exportCmd)))...)
 		out = strings.TrimSpace(out)
 	}
 	if err != nil {
-		return fmt.Errorf("remote export: %v: %s", err, out)
+		return fmt.Errorf("remote export: %v: %s", err, remoteOutputForEcho(out))
 	}
 	if out != "" {
-		fmt.Fprintf(os.Stdout, "%s: %s\n", host, out)
+		fmt.Fprintf(os.Stdout, "%s: %s\n", hostForEcho(host), remoteOutputForEcho(out))
 	}
 	cleanup := func() {
-		_, _ = sshRunner("ssh", host, "sh -lc "+shellQuote("rm -rf "+shellQuote(rtmp)))
+		_, _ = sshRunner("ssh", append(sshOpts(), host, "sh -lc "+shellQuote("rm -rf "+shellQuote(rtmp)))...)
 	}
 	if strings.Contains(out, "exported 0 records") {
 		cleanup()
@@ -221,31 +274,31 @@ func syncSSHPull(dir, host string, full bool) error {
 		return err
 	}
 	defer os.RemoveAll(ltmp)
-	if out, err := sshRunner("scp", "-q", host+":"+rtmp+"/*.jsonl", ltmp+"/"); err != nil {
+	if out, err := sshRunner("scp", append(sshOpts(), "-q", host+":"+rtmp+"/*.jsonl", ltmp+"/")...); err != nil {
 		cleanup()
-		return fmt.Errorf("scp: %v: %s — the remote already advanced its watermark for this batch; recover it with `deja sync ssh %s --pull --full`", err, strings.TrimSpace(out), host)
+		// The host stays as written here: the sentence hands over a command to
+		// paste, and a bounded name would name no machine. Same tension as the
+		// tombstone id in #1794.
+		return fmt.Errorf("scp: %v: %s — the remote already advanced its watermark for this batch; recover it with `deja sync ssh %s --pull --full`", err, remoteOutputForEcho(out), host)
 	}
 	cleanup()
+	// Taken before the import so only what this exchange brings is attributed
+	// to this host (#1887).
+	before := importsByPeerName(dir)
 	n, err := index.Import(dir, ltmp)
 	if err != nil {
 		return fmt.Errorf("%w — the remote already advanced its watermark for this batch; recover it with `deja sync ssh %s --pull --full`", err, host)
 	}
+	learnPeerMachine(dir, host, before)
 	fmt.Fprintf(os.Stdout, "deja: imported %d records\n", n)
 	return nil
 }
 
-func exportBatches(dir, out string, full bool) (int, error) {
-	if full {
-		return index.ExportFull(dir, out)
-	}
-	return index.Export(dir, out)
-}
-
 func sshCapture(host, cmd string) (string, error) {
-	out, err := sshRunner("ssh", host, cmd)
+	out, err := sshRunner("ssh", append(sshOpts(), host, cmd)...)
 	s := strings.TrimSpace(out)
 	if err != nil {
-		return "", fmt.Errorf("ssh %s: %v: %s", host, err, s)
+		return "", fmt.Errorf("ssh %s: %v: %s", hostForEcho(host), err, remoteOutputForEcho(s))
 	}
 	// A remote that still prints something conversational on stdout (motd,
 	// profile chatter) leaves the useful value on the last line.
@@ -257,10 +310,10 @@ func sshCapture(host, cmd string) (string, error) {
 	// it bare is safe for a path with shell metacharacters. Reject it with a
 	// message that points at the cause instead of failing obscurely later.
 	if s == "" || strings.ContainsAny(s, "'\"\n") {
-		return "", fmt.Errorf("ssh %s: unexpected output %q", host, s)
+		return "", fmt.Errorf("ssh %s: unexpected output %q", hostForEcho(host), s)
 	}
 	if strings.ContainsAny(s, " \t*?$;`&|<>()") {
-		return "", fmt.Errorf("ssh %s: remote temp path %q contains characters scp cannot carry — set TMPDIR on %s to a plain path", host, s, host)
+		return "", fmt.Errorf("ssh %s: remote temp path %q contains characters scp cannot carry — set TMPDIR on %s to a plain path", hostForEcho(host), s, hostForEcho(host))
 	}
 	return s, nil
 }

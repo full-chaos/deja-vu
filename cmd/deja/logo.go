@@ -28,6 +28,25 @@ func visibleLen(s string) int { return len([]rune(ansiRE.ReplaceAllString(s, "")
 
 var logoWanted = defaultLogoWanted
 
+// briefWanted answers a narrower question than logoWanted: can this reader take
+// a screen at all? The brief is text — a label, a count, a title — and prints
+// without colour when colour is off. Gating it on the drawing predicate meant
+// NO_COLOR and TERM=dumb got the usage screen instead of their own history,
+// which is not what either variable asks for (#1596).
+func briefWanted(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	if fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	// Same exclusion as the drawing predicate, and for the same reason: the
+	// null device is a character device, so `deja >/dev/null` would otherwise
+	// take the interactive branch.
+	return !isNullDevice(fi)
+}
+
 func defaultLogoWanted(f *os.File) bool {
 	// TERM=dumb is a terminal that cannot do any of this: emacs shell-mode, a
 	// CI shell, an editor's built-in console. NO_COLOR was honoured and this
@@ -215,12 +234,18 @@ func firstIndexInfo(b index.BuildSummary, tryLine string) []string {
 		if h.Messages == 0 {
 			continue
 		}
-		info = append(info, fmt.Sprintf("%-*s  %s%6d%s messages · %d session%s",
-			nameW, h.Name, logoBold, h.Messages, logoReset, h.Sessions, pluralS(h.Sessions)))
+		// One session and one message is what a first run on a fresh machine
+		// looks like, and this line used to greet it with "1 messages" three
+		// words from a brief that said "1 session" (#1598).
+		// The noun is padded as well as the number: with one harness at 1 and
+		// another at 1000, a bare plural moved the separator a column left.
+		info = append(info, fmt.Sprintf("%-*s  %s%6d%s message%-2s · %d session%s",
+			nameW, h.Name, logoBold, h.Messages, logoReset, pluralS(h.Messages), h.Sessions, pluralS(h.Sessions)))
 	}
 	return append(info,
 		"",
-		fmt.Sprintf("indexed %s%d%s messages across %s%d%s agents", logoBold, b.Messages, logoReset, logoBold, b.Harnesses, logoReset),
+		fmt.Sprintf("indexed %s%d%s message%s across %s%d%s agent%s",
+			logoBold, b.Messages, logoReset, pluralS(b.Messages), logoBold, b.Harnesses, logoReset, pluralS(b.Harnesses)),
 		tryLine,
 	)
 }

@@ -5,7 +5,6 @@ import (
 	"io"
 	"os"
 	"regexp"
-	"strings"
 	"testing"
 )
 
@@ -13,15 +12,19 @@ import (
 // completions and from the same cause: it comes from the switch in run(), not
 // from the commands map, so lists built from that map miss it (#753).
 func TestHelpNamesEveryDispatchedCommand(t *testing.T) {
-	// Plumbing invoked by harnesses, and the wrappers whose bare form is a
-	// search rather than a command.
+	// The wrappers whose bare form is a search rather than a command, and the
+	// flag spellings.
 	internal := map[string]bool{
-		"warmup-status": true, "help": true, "aider": true, "goose": true,
+		"aider": true, "goose": true,
 		"--help": true, "-h": true, "--version": true, "-version": true,
 	}
 	var names []string
 	for name := range commands {
-		if strings.HasPrefix(name, "hook-") || internal[name] {
+		// helpHidden rather than a blanket `hook-` skip: the skip let help
+		// document five hook commands and hide five, including hook-context,
+		// with nothing to notice (#1654). A hook is now either documented or
+		// named in helpHidden, where the reason lives.
+		if helpHidden[name] || internal[name] {
 			continue
 		}
 		names = append(names, name)
@@ -37,6 +40,17 @@ func TestHelpNamesEveryDispatchedCommand(t *testing.T) {
 	for _, name := range names {
 		if !documented[name] {
 			t.Errorf("deja help does not name %q", name)
+		}
+	}
+	// A hidden name must still be a real command, or helpHidden is excusing a
+	// ghost — the way a stale entry would quietly re-open the gap it was added
+	// to close (#1654).
+	for name := range helpHidden {
+		if name == "help" {
+			continue // answered before dispatch, so it is not in the map
+		}
+		if _, ok := commands[name]; !ok {
+			t.Errorf("helpHidden excuses %q, which is not a command", name)
 		}
 	}
 	// And the reverse: help must not teach a command that no longer exists.

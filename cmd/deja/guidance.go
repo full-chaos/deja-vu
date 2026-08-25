@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -229,7 +230,10 @@ func dropRetiredGuidance(harness string) error {
 			}
 			continue
 		}
-		next := updateGuidanceBlock(string(old), true)
+		next, uerr := updateGuidanceBlock(string(old), true)
+		if uerr != nil {
+			return uerr
+		}
 		// A file that held nothing but our block was ours to begin with, so
 		// leaving it behind empty would be litter rather than someone's content.
 		if strings.TrimSpace(next) == "" {
@@ -258,7 +262,10 @@ func sharedSkillStillWanted(leaving string) bool {
 	}
 	for _, t := range targets {
 		other := guidanceHarness(t)
-		if other != leaving && sharedSkillHarnesses[other] {
+		if other == leaving || removingTargets[other] {
+			continue
+		}
+		if sharedSkillHarnesses[other] {
 			return true
 		}
 	}
@@ -297,9 +304,29 @@ func writeGuidanceFile(path string, old, next []byte) (string, error) {
 		fmt.Printf("skill: kept your edited %s — `deja install --force` to take deja's version\n", shortHome(path))
 		return "kept", nil
 	}
+	// deja cannot tell its own pre-marks copy from a file someone else wrote at
+	// the same path, and treating every unmarked file as a stranger's would
+	// freeze the skill on every machine installed before marks existed
+	// (skill_marks.go). What it can do is say what it replaced, rather than
+	// calling it an update and leaving the backup unmentioned (#1703).
+	replacing := len(old) > 0 && !bytes.Equal(old, next) && !skillIsMarked(path)
+	if replacing {
+		// backupOnce keeps the first .bak it ever made and skips the rest, so
+		// the promise below would have named a copy of some older file while
+		// the one being destroyed went unsaved. This copy is of the content
+		// deja is about to replace, which is the only one the message can
+		// honestly point at (#1703).
+		if err := os.WriteFile(path+".bak", old, 0o600); err != nil {
+			return "", err
+		}
+	}
 	action, err := writeIfChanged(path, old, next)
 	if err != nil {
 		return action, err
+	}
+	if replacing && action != "unchanged" {
+		fmt.Printf("skill: replaced %s, which deja has no record of writing — your copy is at %s\n",
+			shortHome(path), shortHome(path+".bak"))
 	}
 	rememberSkill(path, next)
 	return action, nil
@@ -365,7 +392,22 @@ func installGuidance(harness string, uninstall bool) (installResult, error) {
 			}
 		}
 	} else {
-		next = []byte(updateGuidanceBlock(string(old), uninstall))
+		// grok writes a twin below; check its markers before touching this
+		// file, or a refusal there leaves this one already rewritten (#1705).
+		if harness == "grok" {
+			b, rerr := os.ReadFile(filepath.Join(sources.GrokHome(), "AGENTS.md"))
+			if rerr != nil && !os.IsNotExist(rerr) {
+				return installResult{}, rerr
+			}
+			if cerr := checkGuidanceMarkers(string(b)); cerr != nil {
+				return installResult{}, cerr
+			}
+		}
+		updated, uerr := updateGuidanceBlock(string(old), uninstall)
+		if uerr != nil {
+			return installResult{}, uerr
+		}
+		next = []byte(updated)
 	}
 	a, err := writeGuidanceFile(path, old, next)
 	if err != nil {
@@ -383,30 +425,75 @@ func installGuidance(harness string, uninstall bool) (installResult, error) {
 		if rerr != nil && !os.IsNotExist(rerr) {
 			return installResult{}, rerr
 		}
-		if _, werr := writeIfChanged(alt, oldAlt, []byte(updateGuidanceBlock(string(oldAlt), uninstall))); werr != nil {
+		updatedAlt, uerr := updateGuidanceBlock(string(oldAlt), uninstall)
+		if uerr != nil {
+			return installResult{}, uerr
+		}
+		if _, werr := writeIfChanged(alt, oldAlt, []byte(updatedAlt)); werr != nil {
 			return installResult{}, werr
 		}
 	}
 	return installResult{Path: path, Action: a}, nil
 }
 
-func updateGuidanceBlock(old string, uninstall bool) string {
+func updateGuidanceBlock(old string, uninstall bool) (string, error) {
 	newline := "\n"
 	if strings.Contains(old, "\r\n") {
 		newline = "\r\n"
 	}
-	start, end := guidanceMarkerLines(old)
-	if start >= 0 && end >= 0 {
+	// A marker without its pair means the block cannot be bounded. Appending a
+	// fresh one left the file with two starts and one end, and the uninstall
+	// after that cut from the first start to the only end — across the user's
+	// own text — and deleted the file, because what was left was empty (#1705).
+	if err := checkGuidanceMarkers(old); err != nil {
+		return "", err
+	}
+	// Every complete block, not just the first: a file carrying two kept both
+	// for ever, since the install removed one and appended one.
+	for {
+		start, end := guidanceMarkerLines(old)
+		if start < 0 || end < 0 {
+			break
+		}
 		old = old[:start] + old[end:]
 	}
 	if uninstall {
-		return old
+		return old, nil
 	}
 	old = strings.TrimRight(old, "\r\n")
 	if old != "" {
 		old += newline + newline
 	}
-	return old + strings.ReplaceAll(guidanceText("append"), "\n", newline)
+	return old + strings.ReplaceAll(guidanceText("append"), "\n", newline), nil
+}
+
+// checkGuidanceMarkers reports whether every start marker has an end marker
+// after it. Only whole-line markers count, which is what guidanceMarkerLines
+// pairs — a marker written inline in a sentence is prose, and deja appends its
+// own block below such a file rather than claiming that text.
+//
+// A lone end marker is left alone for the same reason: it is what an inline
+// start looks like to a line scanner, and appending below it costs nobody
+// anything. A start with no end is different — the block cannot be bounded,
+// and cutting from it to the next end takes whatever the user wrote in
+// between, which is how an uninstall came to delete the file (#1705).
+func checkGuidanceMarkers(doc string) error {
+	open := false
+	for _, line := range strings.Split(doc, "\n") {
+		switch strings.TrimSuffix(line, "\r") {
+		case guidanceStart:
+			if open {
+				return fmt.Errorf("deja's guidance block has a start marker with no end marker after it — put the pair back, or delete the block entirely")
+			}
+			open = true
+		case guidanceEnd:
+			open = false
+		}
+	}
+	if open {
+		return fmt.Errorf("deja's guidance block has no end marker — put it back, or delete the block entirely")
+	}
+	return nil
 }
 
 func guidanceMarkerLines(s string) (start, end int) {

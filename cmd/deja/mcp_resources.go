@@ -79,25 +79,30 @@ func mcpResourceRead(dir, uri string) (any, int, string) {
 	if !ok {
 		return nil, -32602, "unknown resource uri"
 	}
+	// The first colon separates the harness from the id, the way the listing
+	// writes it. No harness name carries one, so the first is always the right
+	// one; an id that does keeps everything after it.
 	id := ref
 	if i := strings.IndexByte(ref, ':'); i >= 0 {
 		id = ref[i+1:]
 	}
-	// Every id has the empty string as a prefix, so an empty ref would make
-	// FindByPrefix return whichever session it reaches first — a whole
-	// transcript the agent never asked for, echoed back under the URI it did
-	// send. `deja://session/` and `deja://session/claude:` both land here.
-	// resources/list only ever emits full URIs, so nothing legitimate
-	// arrives empty; refuse it exactly the way an unknown id is refused.
-	if id == "" {
-		return nil, -32602, fmt.Sprintf("no session matches %q", id)
+	// Every id has the empty string as a prefix, so a URI carrying no id at all
+	// matched the first session and handed back a transcript nobody asked for —
+	// with the requested URI echoed back, so nothing said which one it was
+	// (#1728). `deja://session/` and `deja://session/claude:` both land here,
+	// and resources/list only ever emits a full URI.
+	if strings.TrimSpace(id) == "" {
+		return nil, -32602, "resource uri carries no session id"
 	}
 	s, found, err := index.FindByPrefix(dir, id)
 	if err != nil {
 		return nil, -32603, err.Error()
 	}
 	if !found {
-		return nil, -32602, fmt.Sprintf("no session matches %q", id)
+		// The id came from outside and this text lands in the model's context
+		// beside deja's own, so it is bounded and defanged like the listing
+		// entries above (#1729).
+		return nil, -32602, fmt.Sprintf("no session matches %q", neutralizeFrameMarkers(safeForStatusline(id, mcpResourceNameMax)))
 	}
 	if !policy.Load().Allows(policy.ActivationMCP, s.Project) {
 		return nil, -32602, "blocked by trust policy"

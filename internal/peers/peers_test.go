@@ -160,3 +160,60 @@ func TestSaveReplacesTheFileWhole(t *testing.T) {
 		t.Errorf("a second write lost the first host: %+v", list)
 	}
 }
+
+// A push with nothing to send opens no connection: the host is remembered, and
+// what it did last time is left alone rather than overwritten with a zero
+// (#1780).
+func TestRecordingNothingKeepsWhatWasThere(t *testing.T) {
+	// The package's own convention: XDG_CONFIG_HOME decides this path on Linux,
+	// so setting HOME alone leaves every test in the package sharing one real
+	// file — which is how this one first failed on CI and passed here.
+	t.Setenv("DEJA_PEERS_FILE", filepath.Join(t.TempDir(), "peers.json"))
+	when := time.Now().Add(-time.Hour)
+	if err := Record("mini", false, when, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := Record("mini", false, time.Time{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	list := Load()
+	if len(list) != 1 {
+		t.Fatalf("peers = %v", list)
+	}
+	if got := list[0].LastPush; got.Sub(when.UTC()).Abs() > time.Second {
+		t.Errorf("the earlier exchange was overwritten: %v", got)
+	}
+	// A host deja has never reached is remembered with nothing claimed.
+	if err := Record("fresh", false, time.Time{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range Load() {
+		if p.Host == "fresh" && (!p.LastPush.IsZero() || p.LastError != "") {
+			t.Errorf("a host that was never contacted reads as %+v", p)
+		}
+	}
+}
+
+// A push with nothing to send tells us nothing about the machine, so the last
+// failure stands: clearing it would say the host is fine when deja never
+// contacted it (#1780).
+func TestNothingToSendLeavesAnEarlierFailureStanding(t *testing.T) {
+	t.Setenv("DEJA_PEERS_FILE", filepath.Join(t.TempDir(), "peers.json"))
+	if err := Record("mini", false, time.Now(), errors.New("connection refused")); err != nil {
+		t.Fatal(err)
+	}
+	if err := Record("mini", false, time.Time{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	list := Load()
+	if len(list) != 1 || list[0].LastError == "" {
+		t.Errorf("the failure was cleared by a push that never opened a connection: %+v", list)
+	}
+	// A real exchange is what clears it.
+	if err := Record("mini", false, time.Now(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := Load()[0].LastError; got != "" {
+		t.Errorf("a successful exchange left the old failure: %q", got)
+	}
+}

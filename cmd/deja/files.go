@@ -48,21 +48,35 @@ func runFiles(dir string, args []string, stdout io.Writer) error {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--limit":
-			if i+1 < len(args) {
-				i++
-				n, err := strconv.Atoi(args[i])
-				if err != nil || n <= 0 {
-					return fmt.Errorf("files: --limit wants a positive number, got %q", args[i])
-				}
-				limit = n
+			// A flag typed with nothing after it used to be dropped in silence,
+			// and so did an unknown one and an empty --project: the answer came
+			// back looking like an answer to what was asked (#1628).
+			if i+1 >= len(args) {
+				return fmt.Errorf("files: --limit needs value")
 			}
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n <= 0 {
+				return fmt.Errorf("files: --limit wants a positive number, got %q", args[i])
+			}
+			limit = n
 		case "--project":
-			if i+1 < len(args) {
-				i++
-				project = args[i]
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return fmt.Errorf("files: --project needs value")
 			}
+			i++
+			project = args[i]
+		case "--":
+			// The escape `parseSearch` already offers: everything after it is
+			// the topic, dashes and all. Without it, refusing unknown flags
+			// left `--feature-flag` with no way to be asked about.
+			terms = append(terms, args[i+1:]...)
+			i = len(args)
 		default:
-			if !strings.HasPrefix(args[i], "-") {
+			if strings.HasPrefix(args[i], "-") {
+				return fmt.Errorf("files: unknown flag %q", args[i])
+			}
+			if strings.TrimSpace(args[i]) != "" {
 				terms = append(terms, args[i])
 			}
 		}
@@ -242,7 +256,9 @@ func runFiles(dir string, args []string, stdout io.Writer) error {
 		}
 		return rows[i].score > rows[j].score
 	})
+	cut := 0
 	if len(rows) > limit {
+		cut = len(rows)
 		rows = rows[:limit]
 	}
 	fmt.Fprintf(stdout, "files touched while working on %q — %d session%s%s\n", q, scanned, plural(scanned), filesReadNote(matched))
@@ -262,6 +278,11 @@ func runFiles(dir string, args []string, stdout io.Writer) error {
 		// counts stopped lining up in a column of their own.
 		path := filesRowPath(r.path, col)
 		fmt.Fprintf(stdout, "  %s%s %d\n", path, strings.Repeat(" ", max(0, col-termwidth.Columns(path))), r.n)
+	}
+	// Same as `how`: a list cut at the limit without a word reads as the whole
+	// list, and the line goes where search puts it (#1632).
+	if cut > 0 {
+		fmt.Fprintf(os.Stderr, "deja: showing %d of %d — raise --limit for the rest\n", len(rows), cut)
 	}
 	return nil
 }

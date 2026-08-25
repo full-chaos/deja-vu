@@ -41,7 +41,7 @@ func TestDoctorJSONKeysMatchTheDocumentedContract(t *testing.T) {
 		// doctorStore
 		"name": true, "state": true, "paths": true, "files": true,
 		"indexed_sessions": true, "indexed_from_elsewhere": true,
-		"denied": true, "partial": true, "unchecked": true,
+		"denied": true, "skipped": true, "partial": true, "unchecked": true,
 		// doctorComponent
 		"path": true, "stale_stores": true,
 		// doctorVersionReport
@@ -51,6 +51,10 @@ func TestDoctorJSONKeysMatchTheDocumentedContract(t *testing.T) {
 		// doctorPolicyReport / doctorPolicyRule
 		"error": true, "activations": true, "ignored": true, "inert": true,
 		"rule": true, "withheld": true,
+		// doctorSyncReport / doctorPeerReport
+		"sync": true, "peers": true, "host": true,
+		"last_push": true, "last_pull": true, "sessions_from_there": true,
+		"stamped_ahead": true,
 		// index.HarnessIngest
 		"malformed_lines": true, "clipped_messages": true,
 		"failed_files": true, "last_error": true,

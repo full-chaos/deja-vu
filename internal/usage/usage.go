@@ -48,6 +48,33 @@ const (
 	KindTool = "tool"
 )
 
+// servedKinds are the events that hand an agent memory it asked for: the two
+// recall tools, a blame — "the largest thing the server hands over", which is
+// why #682 gave it a kind of its own — and a read of deja://session/…, which
+// hands over a whole session in the same frame recall_context uses.
+//
+// Named once because the counters drifted: #1569 aligned five of them and left
+// Impact behind, so a blame was a recall on `deja stats` and nothing on
+// `deja stats --impact`, whose distilled ratio was then short by its bytes
+// (#1907).
+func servedKind(kind string) bool {
+	switch kind {
+	case KindRecall, KindContext, KindBlame, KindResource:
+		return true
+	}
+	return false
+}
+
+// injectedKinds are the events where deja offers memory unasked: the
+// session-start hook, the per-prompt recall and the PreToolUse line.
+func injectedKind(kind string) bool {
+	switch kind {
+	case KindHook, KindDejaVu, KindTool:
+		return true
+	}
+	return false
+}
+
 type Event struct {
 	Time     time.Time `json:"t"`
 	Kind     string    `json:"kind"`
@@ -80,7 +107,23 @@ type Summary struct {
 	// 1MB keeping the last 14 days, so a count with no period attached reads
 	// as a lifetime total and then falls by orders of magnitude when that
 	// happens (#763).
-	Since time.Time `json:"since,omitempty"`
+	Since time.Time `json:"-"`
+}
+
+// MarshalJSON writes Since only when there is one. `omitempty` does nothing to
+// a struct, and time.Time is one, so the tag alone wrote January of year 1 on
+// every store that had served no recall — a date a reader subtracts from, and
+// one the document says is not there at all (#1874).
+func (s Summary) MarshalJSON() ([]byte, error) {
+	type plain Summary
+	out := struct {
+		plain
+		Since *time.Time `json:"since,omitempty"`
+	}{plain: plain(s)}
+	if !s.Since.IsZero() {
+		out.Since = &s.Since
+	}
+	return json.Marshal(out)
 }
 
 const (
@@ -138,7 +181,17 @@ func recordFull(indexDir, kind string, bytes, sessions int, empty bool, raw int6
 		return
 	}
 	rotate(p)
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// The call above is not a guard: another process can rotate between this
+	// open and the write below, leaving this descriptor on the file that was
+	// just retired, and the event goes with it. Accepted, measured — it needs a
+	// log past 1MB and a rotation inside the open, the stat and the write, tens
+	// of microseconds here and more under load. Closing it means locking a file
+	// this package appends to without one by design (#1319). One event is the
+	// cost, and one event is what this file already risks on a crash.
+	//
+	// O_RDWR rather than O_WRONLY: the append needs to read the last byte to
+	// know whether the previous record finished (#1901).
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return
 	}
@@ -147,7 +200,30 @@ func recordFull(indexDir, kind string, bytes, sessions int, empty bool, raw int6
 	if err != nil {
 		return
 	}
+	// A process killed between a record and its newline costs that record, which
+	// is the trade this log makes for writing without a lock. It cost the next
+	// one too: appended onto the partial line, so that line no longer parsed
+	// either and a recall deja had just served went missing from every count
+	// (#1901). One byte of reading closes the line first.
+	if endsMidLine(f) {
+		b = append([]byte{'\n'}, b...)
+	}
 	_, _ = f.Write(append(b, '\n'))
+}
+
+// endsMidLine reports whether the log's last byte is anything but a newline.
+// A file that cannot be read is treated as ending cleanly: a usage event must
+// never be the reason a recall fails.
+func endsMidLine(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return false
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], fi.Size()-1); err != nil {
+		return false
+	}
+	return last[0] != '\n'
 }
 
 // InjectedToday returns session-start context bytes injected since local midnight.
@@ -165,11 +241,11 @@ func TodayWithInjections(indexDir string) (recalls, bytes, injected int) {
 		if e.Time.Before(midnight) || ahead(e.Time, now) {
 			continue
 		}
-		switch e.Kind {
-		case KindRecall, KindContext, KindBlame:
+		switch {
+		case servedKind(e.Kind):
 			recalls++
 			bytes += e.Bytes
-		case KindHook, KindDejaVu, KindTool:
+		case injectedKind(e.Kind):
 			recalls++
 			bytes += e.Bytes
 			injected += e.Bytes
@@ -193,11 +269,11 @@ func TodayDemand(indexDir string) (recalls, bytes, injected int) {
 		if e.Time.Before(midnight) || ahead(e.Time, now) || e.Empty {
 			continue
 		}
-		switch e.Kind {
-		case KindRecall, KindContext, KindBlame:
+		switch {
+		case servedKind(e.Kind):
 			recalls++
 			bytes += e.Bytes
-		case KindHook, KindDejaVu, KindTool:
+		case injectedKind(e.Kind):
 			injected += e.Bytes
 		}
 	}
@@ -227,8 +303,7 @@ func TodayRaw(indexDir string) int64 {
 		if e.Time.Before(midnight) || ahead(e.Time, now) {
 			continue
 		}
-		switch e.Kind {
-		case KindRecall, KindContext, KindBlame, KindHook, KindDejaVu, KindTool:
+		if servedKind(e.Kind) || injectedKind(e.Kind) {
 			raw += e.RawBytes
 		}
 	}
@@ -243,8 +318,8 @@ func Totals(indexDir string) Summary {
 		if out.Since.IsZero() || (!e.Time.IsZero() && e.Time.Before(out.Since)) {
 			out.Since = e.Time
 		}
-		switch e.Kind {
-		case KindRecall, KindContext, KindBlame:
+		switch {
+		case servedKind(e.Kind):
 			out.Recalls++
 			out.RecallSessions += e.Sessions
 			out.Bytes += e.Bytes
@@ -252,7 +327,7 @@ func Totals(indexDir string) Summary {
 			if e.Empty {
 				empty++
 			}
-		case KindHook, KindDejaVu, KindTool:
+		case injectedKind(e.Kind):
 			out.Injections++
 			out.InjectedSessions += e.Sessions
 			out.InjectedBytes += e.Bytes
@@ -280,11 +355,11 @@ func Week(indexDir string) (recalls, bytes, injected, injectedBytes int) {
 		if e.Time.Before(cut) || ahead(e.Time, now) || e.Empty {
 			continue
 		}
-		switch e.Kind {
-		case KindRecall, KindContext, KindBlame:
+		switch {
+		case servedKind(e.Kind):
 			recalls++
 			bytes += e.Bytes
-		case KindHook, KindDejaVu, KindTool:
+		case injectedKind(e.Kind):
 			injected++
 			injectedBytes += e.Bytes
 		}
@@ -398,7 +473,27 @@ type ImpactReport struct {
 	ServedBytes   int   `json:"served_bytes"`   // digest bytes actually returned
 	RawBytes      int64 `json:"raw_bytes"`      // source transcripts those digests distilled
 	ReusedTwice   int   `json:"reused_twice"`   // sessions agents recalled 2+ times
-	DejaVuMoments int   `json:"dejavu_moments"` // prompts matched to prior work, all time
+	DejaVuMoments int   `json:"dejavu_moments"` // prompts matched to prior work
+	// Since is the oldest event still in the log. The log is rewritten past
+	// 1MB keeping the last 14 days, so every count above is a window and not a
+	// lifetime — one rotation over a 30-day log halved them (#1889). The same
+	// fact `deja stats` has carried since #763.
+	Since time.Time `json:"-"`
+}
+
+// MarshalJSON writes Since only when there is one, for the reason Summary's
+// does: `omitempty` does nothing to a struct, so the tag alone would print
+// January of year 1 on a machine with no recall history (#1874).
+func (r ImpactReport) MarshalJSON() ([]byte, error) {
+	type plain ImpactReport
+	out := struct {
+		plain
+		Since *time.Time `json:"since,omitempty"`
+	}{plain: plain(r)}
+	if !r.Since.IsZero() {
+		out.Since = &r.Since
+	}
+	return json.Marshal(out)
 }
 
 // Impact counts across the whole usage log.
@@ -406,8 +501,11 @@ func Impact(indexDir string) ImpactReport {
 	var r ImpactReport
 	worn := map[string]int{}
 	for _, e := range read(Path(indexDir)) {
-		switch e.Kind {
-		case KindRecall, KindContext:
+		if r.Since.IsZero() || e.Time.Before(r.Since) {
+			r.Since = e.Time
+		}
+		switch {
+		case servedKind(e.Kind):
 			if e.Empty {
 				continue
 			}
@@ -417,7 +515,7 @@ func Impact(indexDir string) ImpactReport {
 			for _, id := range e.SessionIDs {
 				worn[id]++
 			}
-		case KindHook:
+		case e.Kind == KindHook:
 			// A session start with no project session to show still injects
 			// the environment block, and that event is logged empty. Counting
 			// it made "N session starts began with project memory" claim
@@ -428,7 +526,7 @@ func Impact(indexDir string) ImpactReport {
 			r.Injections++
 			r.ServedBytes += e.Bytes
 			r.RawBytes += e.RawBytes
-		case KindDejaVu:
+		case e.Kind == KindDejaVu:
 			r.DejaVuMoments++
 		}
 	}

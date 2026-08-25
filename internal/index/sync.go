@@ -133,7 +133,7 @@ func exportRecordsDeferred(dir, outDir, peer string, full bool) (int, func() err
 		// The import side of the same mistake is worded; this one handed back
 		// `mkdir /…/file: not a directory` (#1112).
 		if fi, statErr := os.Stat(outDir); statErr == nil && !fi.IsDir() {
-			return 0, nil, fmt.Errorf("%s is a file; sync export wants a directory to write the batch into", outDir)
+			return 0, nil, fmt.Errorf("%s is a file; sync export wants a directory to write the batch into", search.SafeLine(outDir))
 		}
 		return 0, nil, err
 	}
@@ -372,14 +372,14 @@ func Import(dir, inDir string) (int, error) {
 		return 0, fmt.Errorf("cannot read %s: %s", search.SafeLine(inDir), search.SafeLine(err.Error()))
 	}
 	if !fi.IsDir() {
-		return 0, fmt.Errorf("%s is a file; sync import wants the directory a `sync export` wrote", inDir)
+		return 0, fmt.Errorf("%s is a file; sync import wants the directory a `sync export` wrote", search.SafeLine(inDir))
 	}
 	// Glob swallows a directory it cannot open, so a locked source imported
 	// "0 records" — the same words an already-imported batch prints, and the
 	// records were there the whole time (#1042).
 	if f, oerr := os.Open(inDir); oerr != nil {
 		if os.IsPermission(oerr) {
-			return 0, fmt.Errorf("cannot read %s — permission denied; check that directory's permissions (on macOS, also Full Disk Access for your terminal)", inDir)
+			return 0, fmt.Errorf("cannot read %s — permission denied; check that directory's permissions (on macOS, also Full Disk Access for your terminal)", search.SafeLine(inDir))
 		}
 		return 0, oerr
 	} else {
@@ -709,6 +709,16 @@ func restoreMap[V any](live, saved map[string]V) {
 	}
 }
 
+// batchName is how a batch file is named on screen. The name comes from the
+// machine that sent it — scp copies whatever matched over there — and these
+// sentences reach a terminal through main, which prints an error as it is, so
+// an escape byte in a name rewrote the line of whoever was watching a sync
+// fail (#1847). The directory beside it has been sanitised since it was first
+// printed; the file was not.
+func batchName(path string) string {
+	return search.SafeLine(filepath.Base(path))
+}
+
 // skippedError reports the files an import could not read, after the ones it
 // could are already in. Callers print the count they imported and this
 // alongside it.
@@ -717,9 +727,9 @@ func skippedError(skipped []string) error {
 		return nil
 	}
 	if len(skipped) == 1 {
-		return fmt.Errorf("nothing was imported from 1 file: %s", skipped[0])
+		return fmt.Errorf("nothing was imported from 1 file: %s", search.SafeLine(skipped[0]))
 	}
-	return fmt.Errorf("nothing was imported from %d files: %s", len(skipped), strings.Join(skipped, "; "))
+	return fmt.Errorf("nothing was imported from %d files: %s", len(skipped), search.SafeLine(strings.Join(skipped, "; ")))
 }
 
 func initEmptyIndex(dir string) error {
@@ -743,8 +753,12 @@ func initEmptyIndex(dir string) error {
 	// An empty index holds nothing, so whatever the patterns are now, they are
 	// applied to all of it. Leaving this blank would read as "written before
 	// deja recorded this" and keep `deja index` quiet forever after (#1307).
+	// Same reasoning for the tools this build could use: blank reads as "an
+	// older deja wrote this", and a store skipped for a missing CLI would then
+	// never be re-read once it was installed (#1760).
 	m := Manifest{Version: version, Files: map[string]FileState{}, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), ExportWatermarks: map[string]int64{}, ImportedRecords: map[string]bool{},
-		ExcludeFingerprint: sources.ExclusionFingerprint()}
+		ExcludeFingerprint: sources.ExclusionFingerprint(),
+		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir))}
 	return writeManifest(dir, m)
 }
 
@@ -790,9 +804,9 @@ func readSyncFile(path string, fn func(SyncRecord) error) error {
 			// file is still refused whole: a half-imported transfer is worse
 			// than one the reader can retry (#891).
 			if !next && torn {
-				return fmt.Errorf("%s looks truncated at line %d — the transfer may have been cut off; fetch the batch again", filepath.Base(path), line)
+				return fmt.Errorf("%q looks truncated at line %d — the transfer may have been cut off; fetch the batch again", batchName(path), line)
 			}
-			return fmt.Errorf("%s line %d is not a record deja wrote: %w", filepath.Base(path), line, err)
+			return fmt.Errorf("%q line %d is not a record deja wrote: %w", batchName(path), line, err)
 		}
 		// Metadata from a batch is another machine's text: it lands in the
 		// project label and the harness tag, which are rendered into result

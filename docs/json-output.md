@@ -15,6 +15,8 @@ a `schema_version` field so consumers can detect breaking changes.
 - **`deja blame --json`** and **`deja log --json`** return a top-level JSON
   array rather than an envelope, so neither carries `schema_version`. Their
   element shapes are stable; only additive fields inside them are permitted.
+- **`deja stats --impact --json`** returns one flat object of counters and
+  carries no `schema_version` either, on the same terms.
 
 ### What changed in version 2
 
@@ -304,7 +306,7 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
   },
   "policy": {
     "state": "active",
-    "path": "/home/user/.config/deja/policy.toml",
+    "path": "/home/user/.config/deja/policy.json",
     "indexed_sessions": 240,
     "activations": {
       "search": {"rule": "allow all", "withheld": 0},
@@ -314,6 +316,23 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
   },
   "ingest_health": {
     "claude": {"malformed_lines": 0, "failed_files": 0}
+  },
+  "sync": {
+    "state": "ok",
+    "peers": [
+      {
+        "host": "laptop",
+        "last_push": "2026-08-22T10:00:00Z",
+        "last_pull": "2026-08-22T10:00:00Z",
+        "sessions_from_there": 12
+      },
+      {
+        "host": "build-box",
+        "last_push": "2026-08-20T10:00:00Z",
+        "sessions_from_there": 0,
+        "last_error": "ssh build-box: exit status 255"
+      }
+    ]
   }
 }
 ```
@@ -322,8 +341,9 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
 when unavailable; `policy` is always present. `index.path` points at the index
 directory; `index.db` is that directory's name, not a file. Store `state`
 values are `ok`, `missing`, `unreadable`, `parsed-zero`, `denied` (which adds a
-`denied` field naming the unreadable path), and `needs-sqlite3`; an existing but
-empty store directory reports `missing`. A store also carries `indexed_sessions`
+`denied` field naming the unreadable path), `needs-sqlite3` and `needs-zstd`
+(both of which add a `skipped` field saying which CLI is missing); an existing
+but empty store directory reports `missing`. A store also carries `indexed_sessions`
 and, when it holds peer-synced work, `indexed_from_elsewhere`; a store whose
 permission walk was cut short or blocked carries `partial` or `unchecked`.
 Version `state` is `ok`, `update-available`, `ahead`, `dev`, `offline` (under
@@ -332,6 +352,70 @@ Version `state` is `ok`, `update-available`, `ahead`, `dev`, `offline` (under
 `auto`, each with the rule in force and how many sessions it withheld;
 `ignored` and `inert` list policy lines that matched no harness or no import.
 Per-harness `ingest_health` may also carry `clipped_messages` and `last_error`.
+
+`sync.state` is `ok` or `unreadable`; `unreadable` adds an `error` saying why the peers file could not be parsed, and its `peers` list is empty because deja could read nothing from it — a sync is never stopped by a malformed config, so the report is the only place that failure shows. `sync.peers` is every machine this one knows, and it is always present — an
+empty list means no machines are configured, which a script can tell apart from
+a deja too old to report. Each row carries `host`, `sessions_from_there` (how
+much of this index arrived from it — matched by the name the machine calls
+itself, which deja learns from the records a pull brings, since `host` is
+whatever ssh alias was typed), and `last_push` / `last_pull` as RFC 3339
+timestamps, each omitted when that direction has never happened: the two fail
+apart, and a machine that takes what this one sends while sending nothing back
+is a broken sync that reads as a working one. A row carrying neither is a
+machine named once and never reached — the text report says "never exchanged"
+for it — and it is still a row, which is what distinguishes it from a deja too
+old to report peers at all: that one has no `sync` key. `last_error` is why the most
+recent exchange failed and is absent once one succeeds. `last_error` is written by
+another machine and can be made arbitrarily long, so it is bounded before it is
+reported. `host` is not: it is a name to act on — `deja sync ssh <host>` — and a
+bounded name names no machine, so it is reported exactly as the config file
+spells it, however long. Neither can carry a raw control byte into a terminal:
+the JSON encoder escapes those in any string.
+`stamped_ahead` appears when the newer of the two timestamps is more than a
+minute later than this machine's clock: the age would be negative and the row
+would otherwise read as a sync that just happened, so a consumer should treat
+that peer's dates as unusable for "how long since" rather than as healthy. The
+minute is what makes this different from the rule for a session, where anything
+ahead counts: a peers file is written by deja itself, so a copy
+from a machine a moment ahead — or an NTP step landing between the write and the
+read — is not a clock worth reporting, while a session's stamp comes from a
+transcript deja did not write.
+
+## `deja stats --impact --json`
+
+What deja has actually served on this machine, measured from the usage log:
+
+```json
+{
+  "recalls": 30,
+  "injections": 4,
+  "served_bytes": 15000,
+  "raw_bytes": 150000,
+  "reused_twice": 2,
+  "dejavu_moments": 1,
+  "since": "2026-07-27T14:33:13Z",
+  "credited_aloud": 3
+}
+```
+
+No envelope and no `schema_version`, for the same reason as `blame` and `log`:
+the shape is one flat object of counters, and a consumer reads the keys it knows.
+Additive fields are permitted; a rename is a breaking change and would be called
+one.
+
+`recalls` counts agent-initiated recalls that returned matches, `injections`
+session starts that began with project memory. `served_bytes` is what the
+digests actually returned and `raw_bytes` the source transcripts they were
+distilled from, so the ratio is how much reading deja saved. `reused_twice` is
+sessions agents recalled two or more times, `dejavu_moments` prompts matched to
+prior work, and `credited_aloud` the recalls an agent said out loud.
+
+`since` is the oldest event still in the usage log, so no count above covers
+more than the period from then to now. On a quiet machine that is every event
+there has ever been; once the log grows past 1MB it is rewritten keeping the
+last 14 days, and from then on the figures are a window whose start moves. Read
+`since` rather than assuming either. It is absent when the log holds nothing,
+which is the one case where the counts are all zero anyway.
 
 ## `deja blame <path> --json`
 

@@ -27,6 +27,38 @@ import (
 // config.yaml is edited textually rather than through a YAML round-trip: it
 // holds provider settings a user wrote by hand, and re-serialising drops the
 // comments and ordering they left there.
+// inlineYAMLValue returns the value written on the same line as a top-level
+// key, or "" when the key is absent or opens a block.
+func inlineYAMLValue(doc, key string) string {
+	for _, line := range strings.Split(doc, "\n") {
+		if !strings.HasPrefix(line, key) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(line, key))
+		if rest == "" || strings.HasPrefix(rest, "#") {
+			return ""
+		}
+		return rest
+	}
+	return ""
+}
+
+// yamlBlockIsSequence reports whether the block that follows a key opens with
+// a sequence item rather than a mapping entry, skipping blank lines and
+// comments. A block that is empty, or holds mapping entries, is not one.
+func yamlBlockIsSequence(block string) bool {
+	for _, line := range strings.Split(block, "\n") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		if !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			return false
+		}
+		return strings.HasPrefix(strings.TrimSpace(line), "- ")
+	}
+	return false
+}
+
 func installGoose(exe string, uninstall bool) (installResult, error) {
 	path := filepath.Join(gooseConfigDir(), "config.yaml")
 	old, err := os.ReadFile(path)
@@ -60,8 +92,24 @@ func installGoose(exe string, uninstall bool) (installResult, error) {
 		}
 		b.WriteString("    timeout: 60\n")
 		entry := b.String()
+		// An inline value — `extensions: [a, b]` or `extensions: {…}` — is not
+		// followed by a block, so the insert below missed it and appended a
+		// second `extensions:` key. A parser takes the last of two, which is
+		// deja's, and the user's extensions were gone without a word (#1697).
+		if v := inlineYAMLValue(next, "extensions:"); v != "" {
+			return installResult{}, fmt.Errorf("%s: extensions: %s is on one line, and deja edits the block form — move it to a block and run this again", path, v)
+		}
 		if i := strings.Index("\n"+next, "\nextensions:\n"); i >= 0 {
 			at := i + len("\nextensions:\n") - 1
+			// goose keys extensions by name. Writing our mapping entry under a
+			// key whose value is a sequence leaves a mapping and a sequence
+			// under one key, which no parser accepts — a config that was
+			// merely wrong for goose became one nothing can read, reported as
+			// "updated" (#1697). Refuse instead, as the opencode writer does
+			// when it cannot bound the block it was asked to edit.
+			if yamlBlockIsSequence(next[at:]) {
+				return installResult{}, fmt.Errorf("%s: extensions: holds a list, and goose keys extensions by name — deja cannot add itself to it", path)
+			}
 			next = next[:at] + entry + next[at:]
 		} else {
 			if next != "" && !strings.HasSuffix(next, "\n") {

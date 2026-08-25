@@ -390,7 +390,9 @@ func TestRunDispatchAdditionalCommands(t *testing.T) {
 	if out, err := captureRun(t, "ctx", "claude"); err != nil || !strings.Contains(out, "# deja context:") {
 		t.Fatalf("ctx prefix out=%q err=%v", out, err)
 	}
-	if out, err := captureRun(t, "last", "bad"); err != nil || !strings.Contains(out, "claude") {
+	// A bare argument that is not a count used to be dropped in silence, which
+	// answered `deja last api-gateway` with every project (#1618).
+	if out, err := captureRun(t, "last", "bad"); err == nil || !strings.Contains(err.Error(), "is not a count") {
 		t.Fatalf("last bad n out=%q err=%v", out, err)
 	}
 	if err := run([]string{"show", "no-such-prefix"}); err == nil || !strings.Contains(err.Error(), "no session matches") {
@@ -448,7 +450,7 @@ func TestSyncSSHErrorBranches(t *testing.T) {
 		t.Fatalf("sshCapture quote err=%v", err)
 	}
 	sshRunner = func(name string, args ...string) (string, error) {
-		if name == "ssh" && args[1] == "mktemp -d" {
+		if name == "ssh" && args[len(args)-1] == "mktemp -d" {
 			return "/tmp/remote", nil
 		}
 		return "boom", os.ErrPermission
@@ -669,7 +671,7 @@ func TestSyncSSHPushMoreErrorBranches(t *testing.T) {
 	old := sshRunner
 	defer func() { sshRunner = old }()
 	sshRunner = func(name string, args ...string) (string, error) {
-		if name == "ssh" && args[1] == "mktemp -d" {
+		if name == "ssh" && args[len(args)-1] == "mktemp -d" {
 			return "", errors.New("mktemp failed")
 		}
 		return "", nil
@@ -680,7 +682,7 @@ func TestSyncSSHPushMoreErrorBranches(t *testing.T) {
 	// Mark exported so a new fixture is available for the remote-import branch.
 	setupLocalIndex(t)
 	sshRunner = func(name string, args ...string) (string, error) {
-		if name == "ssh" && args[1] == "mktemp -d" {
+		if name == "ssh" && args[len(args)-1] == "mktemp -d" {
 			return "/tmp/remote", nil
 		}
 		if name == "ssh" {
@@ -847,13 +849,13 @@ func TestSyncSSHAdditionalBranches(t *testing.T) {
 	defer func() { sshRunner = old }()
 	var cleaned bool
 	sshRunner = func(name string, args ...string) (string, error) {
-		if name == "ssh" && args[1] == "mktemp -d" {
+		if name == "ssh" && args[len(args)-1] == "mktemp -d" {
 			return "/tmp/remote-zero", nil
 		}
-		if name == "ssh" && strings.Contains(args[1], "sync export") {
+		if name == "ssh" && strings.Contains(args[len(args)-1], "sync export") {
 			return "deja: exported 0 records", nil
 		}
-		if name == "ssh" && strings.Contains(args[1], "rm -rf") {
+		if name == "ssh" && strings.Contains(args[len(args)-1], "rm -rf") {
 			cleaned = true
 		}
 		return "", nil
@@ -867,11 +869,11 @@ func TestSyncSSHAdditionalBranches(t *testing.T) {
 	if err := index.EnsureForSearch(index.DefaultDir(), search.Options{All: true}, false, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := exportBatches(index.DefaultDir(), t.TempDir(), true); err != nil {
+	if _, err := index.ExportFull(index.DefaultDir(), t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
 	sshRunner = func(name string, args ...string) (string, error) {
-		if name == "ssh" && args[1] == "mktemp -d" {
+		if name == "ssh" && args[len(args)-1] == "mktemp -d" {
 			return "/tmp/remote", nil
 		}
 		if name == "scp" {
