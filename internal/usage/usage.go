@@ -181,6 +181,14 @@ func recordFull(indexDir, kind string, bytes, sessions int, empty bool, raw int6
 		return
 	}
 	rotate(p)
+	// The call above is not a guard: another process can rotate between this
+	// open and the write below, leaving this descriptor on the file that was
+	// just retired, and the event goes with it. Accepted, measured — it needs a
+	// log past 1MB and a rotation inside the open, the stat and the write, tens
+	// of microseconds here and more under load. Closing it means locking a file
+	// this package appends to without one by design (#1319). One event is the
+	// cost, and one event is what this file already risks on a crash.
+	//
 	// O_RDWR rather than O_WRONLY: the append needs to read the last byte to
 	// know whether the previous record finished (#1901).
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
