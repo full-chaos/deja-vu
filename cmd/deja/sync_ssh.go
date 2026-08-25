@@ -25,7 +25,11 @@ var sshRunner = func(name string, args ...string) (string, error) {
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil && strings.TrimSpace(stderr.String()) != "" {
-		return stdout.String(), fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+		// The comment above says what stderr holds — host-key notices and
+		// server banners — which is text the machine at the other end writes.
+		// It reaches this terminal through the error, so it takes the same
+		// bound as the remote's stdout (#1833).
+		return stdout.String(), fmt.Errorf("%w: %s", err, remoteOutputForEcho(strings.TrimSpace(stderr.String())))
 	}
 	return stdout.String(), err
 }
@@ -283,7 +287,7 @@ func sshCapture(host, cmd string) (string, error) {
 	out, err := sshRunner("ssh", append(sshOpts(), host, cmd)...)
 	s := strings.TrimSpace(out)
 	if err != nil {
-		return "", fmt.Errorf("ssh %s: %v: %s", host, err, s)
+		return "", fmt.Errorf("ssh %s: %v: %s", hostForEcho(host), err, remoteOutputForEcho(s))
 	}
 	// A remote that still prints something conversational on stdout (motd,
 	// profile chatter) leaves the useful value on the last line.
@@ -295,10 +299,10 @@ func sshCapture(host, cmd string) (string, error) {
 	// it bare is safe for a path with shell metacharacters. Reject it with a
 	// message that points at the cause instead of failing obscurely later.
 	if s == "" || strings.ContainsAny(s, "'\"\n") {
-		return "", fmt.Errorf("ssh %s: unexpected output %q", host, s)
+		return "", fmt.Errorf("ssh %s: unexpected output %q", hostForEcho(host), s)
 	}
 	if strings.ContainsAny(s, " \t*?$;`&|<>()") {
-		return "", fmt.Errorf("ssh %s: remote temp path %q contains characters scp cannot carry — set TMPDIR on %s to a plain path", host, s, host)
+		return "", fmt.Errorf("ssh %s: remote temp path %q contains characters scp cannot carry — set TMPDIR on %s to a plain path", hostForEcho(host), s, hostForEcho(host))
 	}
 	return s, nil
 }
