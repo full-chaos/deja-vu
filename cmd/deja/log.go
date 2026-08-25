@@ -78,7 +78,7 @@ func runLogTo(w io.Writer, dir string, args []string) error {
 	}
 	for _, e := range events {
 		mark := ""
-		if e.Empty {
+		if e.FoundNothing() {
 			mark = "  (empty result)"
 		}
 		sess := ""

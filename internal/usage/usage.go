@@ -76,12 +76,24 @@ func injectedKind(kind string) bool {
 	return false
 }
 
+// FoundNothing reports whether a lookup came back with nothing, which is what
+// `deja log` marks. Not the same as the Empty flag: on an injection the flag
+// says no project session went in, and a session start on a checkout with no
+// sessions of its own still injects the environment block — bytes and all
+// (#1954). On a lookup the flag does mean the answer found nothing, which is
+// why an empty recall still serves the sentence that says so.
+func (e Event) FoundNothing() bool { return e.Empty && !injectedKind(e.Kind) }
+
 type Event struct {
 	Time     time.Time `json:"t"`
 	Kind     string    `json:"kind"`
 	Bytes    int       `json:"bytes"`
 	Sessions int       `json:"sessions,omitempty"`
-	Empty    bool      `json:"empty,omitempty"`
+	// Empty means no session went into the event, which is not the same as
+	// serving nothing: a session start on a checkout with no sessions of its
+	// own still injects the environment block, and that event carries its
+	// bytes (#1954).
+	Empty bool `json:"empty,omitempty"`
 	// RawBytes is the size of the source transcripts the served digest was
 	// distilled from — what the agent would have had to replay without deja.
 	RawBytes int64 `json:"raw,omitempty"`
