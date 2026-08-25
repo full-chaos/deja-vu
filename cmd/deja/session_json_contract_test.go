@@ -11,19 +11,59 @@ import (
 	"github.com/vshulcz/deja-vu/internal/index"
 )
 
-// docSection is one heading's text, up to the next heading of the same level.
+// docSection is one heading's text, up to the next heading of the same or a
+// shallower level — a subsection ends where its parent does. That is what makes
+// these tests a check on where a key is documented rather than on the document
+// as a whole: cutting at the same level only, the last `###` in a file ran to
+// the end of it (#1951).
 func docSection(t *testing.T, doc, heading string) string {
 	t.Helper()
-	i := strings.Index(doc, heading)
+	// A heading is a whole line. Matching anywhere would let prose that names a
+	// heading — a pointer to it, a sentence about the format — start the
+	// section somewhere in the middle of a paragraph, and matching only its
+	// start would take a sentence that opens with one.
+	i := -1
+	for at := 0; ; {
+		k := strings.Index(doc[at:], heading)
+		if k < 0 {
+			break
+		}
+		k += at
+		at = k + len(heading)
+		startsLine := k == 0 || doc[k-1] == '\n'
+		endsLine := at == len(doc) || doc[at] == '\n'
+		if startsLine && endsLine {
+			i = k
+			break
+		}
+	}
 	if i < 0 {
-		t.Fatalf("docs/json-output.md has no %q", heading)
+		t.Fatalf("docs/json-output.md has no line %q", heading)
 	}
 	rest := doc[i+len(heading):]
-	level := strings.Repeat("#", strings.Count(strings.SplitN(heading, " ", 2)[0], "#"))
-	if end := strings.Index(rest, "\n"+level+" "); end > 0 {
-		rest = rest[:end]
+	level := strings.Count(strings.SplitN(heading, " ", 2)[0], "#")
+	fenced := false
+	for at := 0; ; {
+		nl := strings.IndexByte(rest[at:], '\n')
+		if nl < 0 {
+			return rest
+		}
+		at += nl + 1
+		line := rest[at:]
+		// A `#` inside an example is a comment, not a heading — `deja log`
+		// output starts its rows with one. Sections here end on headings only.
+		if strings.HasPrefix(line, "```") {
+			fenced = !fenced
+			continue
+		}
+		if fenced {
+			continue
+		}
+		hashes := len(line) - len(strings.TrimLeft(line, "#"))
+		if hashes > 0 && hashes <= level && strings.HasPrefix(line[hashes:], " ") {
+			return rest[:at-1]
+		}
 	}
-	return rest
 }
 
 // jsonKeys is every key a value emits, nested ones included, once each.
