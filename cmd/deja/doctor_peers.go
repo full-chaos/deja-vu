@@ -19,8 +19,16 @@ import (
 // laptop that has not been opened in a fortnight look exactly like a week with
 // nothing to send. This is the screen where that shows.
 func doctorPeers(w io.Writer, dir string, now time.Time) {
-	list := peers.Load()
+	list, why := peers.Snapshot()
 	fmt.Fprintln(w, "Sync:")
+	if why != "" {
+		// Load treats a malformed file as "no peers" so a sync cannot be
+		// stopped by one, and says doctor is where that surfaces. Without this
+		// line it surfaced nowhere, and a broken file read as a machine that
+		// simply has no peers (#1840).
+		fmt.Fprintf(w, "  %-12s %s could not be read — %s\n", "peers", peers.Path(), safeForStatusline(why, 200))
+		return
+	}
 	if len(list) == 0 {
 		fmt.Fprintf(w, "  %-12s no other machines yet — `deja sync ssh <host>` once, then `deja sync` keeps them all in step\n", "peers")
 		return
