@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -129,6 +130,12 @@ func (s Summary) MarshalJSON() ([]byte, error) {
 const (
 	rotateAt   = 1 << 20 // rewrite the log when it grows past 1MB
 	keepWindow = 14 * 24 * time.Hour
+	// keepAtLeast is how many events survive when every one of them is older
+	// than the window. Without it, a fortnight away emptied the log on the
+	// first recall back and the impact screen said no recall had ever happened
+	// (#1922). Measured at 59.8 KB, against the megabyte that triggers a
+	// rewrite.
+	keepAtLeast = 200
 )
 
 // ahead reports a timestamp past the end of the reader's day — a clock that
@@ -449,6 +456,19 @@ func rotate(p string) {
 	}
 	if len(keep) == len(all) {
 		return
+	}
+	if len(keep) == 0 && len(all) > 0 {
+		// Newest first, then back into the order the file is read in.
+		// Stable, so two events written in the same second keep the order they
+		// were written in — that order is the only thing separating them, and
+		// `deja log` prints it.
+		byTime := append([]Event(nil), all...)
+		sort.SliceStable(byTime, func(i, j int) bool { return byTime[i].Time.After(byTime[j].Time) })
+		if len(byTime) > keepAtLeast {
+			byTime = byTime[:keepAtLeast]
+		}
+		sort.SliceStable(byTime, func(i, j int) bool { return byTime[i].Time.Before(byTime[j].Time) })
+		keep = byTime
 	}
 	// One buffer, then one atomic replace. The temp name used to be derived
 	// from the log's own path, and this is the one writer in deja with no lock
