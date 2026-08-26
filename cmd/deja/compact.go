@@ -6,6 +6,7 @@ import (
 
 	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/model"
+	"github.com/vshulcz/deja-vu/internal/search"
 )
 
 // What a compaction actually costs, measured on 58 transcripts and 43
@@ -45,8 +46,12 @@ func compactEvidence(dir, sessionID string) string {
 	if err != nil || !ok {
 		return ""
 	}
+	// Both lists come from the session's own records, and a record can be a path
+	// or a command the parser lifted out of a tool call — whatever the harness
+	// wrote into the payload, escape bytes included (#2000).
 	files := lastDistinct(s.Messages, "files", compactEvidenceFiles,
-		func(text string) []string { return strings.Split(text, "\n") }, trimPath)
+		func(text string) []string { return strings.Split(text, "\n") },
+		func(p string) string { return search.SafeLine(trimPath(p)) })
 	commands := lastDistinct(s.Messages, "command", compactEvidenceCommands,
 		func(text string) []string {
 			// A multi-line command is a heredoc or a pasted script. Truncated to
@@ -55,7 +60,7 @@ func compactEvidence(dir, sessionID string) string {
 				return nil
 			}
 			return []string{text}
-		}, func(c string) string { return c })
+		}, search.SafeLine)
 	if len(files) == 0 && len(commands) == 0 {
 		return ""
 	}
@@ -87,11 +92,18 @@ func lastDistinct(ms []model.Message, role string, limit int, split func(string)
 		}
 		for _, p := range split(ms[i].Text) {
 			p = strings.TrimSpace(p)
-			if p == "" || seen[p] || isScratch(p) {
+			if p == "" || isScratch(p) {
 				continue
 			}
-			seen[p] = true
-			out = append(out, format(p))
+			// Distinct as printed, not as stored: format trims a path to its
+			// last segments and strips control bytes, so two records that
+			// differ only in what it removes are one row, printed twice.
+			f := format(p)
+			if f == "" || seen[f] {
+				continue
+			}
+			seen[f] = true
+			out = append(out, f)
 			if len(out) >= limit {
 				break
 			}

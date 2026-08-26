@@ -301,11 +301,22 @@ func hookEventWired(hooks map[string]any, event, command string) bool {
 
 func doctorEmbed(w io.Writer, r doctorEmbedReport) {
 	fmt.Fprintln(w, "Embedding:")
+	// The sidecar's own line, not the endpoint's: the endpoint may be fine and
+	// the file still unparseable, and saying "endpoint unreadable" would send
+	// the reader after the wrong thing. Both lines print, because whether an
+	// endpoint is configured is what decides if re-running `deja embed` fixes
+	// it (#1960).
+	if r.Sidecar == "unreadable" {
+		fmt.Fprintf(w, "  sidecar    unreadable — %s\n", r.Error)
+	}
 	if r.Model == "" {
 		fmt.Fprintf(w, "  endpoint   %s\n", r.State)
 		return
 	}
 	fmt.Fprintf(w, "  endpoint   %s/model=%s/dim=%d\n", r.State, r.Model, r.Dim)
+	if r.Sidecar == "unreadable" {
+		return
+	}
 	fmt.Fprintf(w, "  sidecar    coverage=%.1f%%\n", r.Coverage)
 }
 

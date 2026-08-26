@@ -52,3 +52,47 @@ func TestSnapshotWithoutAReceiverOmitsTheField(t *testing.T) {
 		t.Errorf("empty receiver was written out: %s", strings.TrimSpace(string(b)))
 	}
 }
+
+// The déjà-vu hook recorded the receiver and the session-start hook did not,
+// though it holds the id and uses it two lines away — so the same field meant
+// two different things depending on which path wrote it (#1949).
+func TestASessionStartDigestRecordsWhoItWentTo(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DEJA_INDEX_DIR", dir)
+
+	RecordDigestPolicyInto(dir, KindHook, "a digest of earlier work", "agent-session-1", 2, 4000, "local-only")
+
+	got := Snapshots(dir, 0)
+	if len(got) != 1 {
+		t.Fatalf("wrote one snapshot, read %d", len(got))
+	}
+	if got[0].Into != "agent-session-1" {
+		t.Errorf("the snapshot does not say where it went: %#v", got[0])
+	}
+	// And it still records the counting event, as the policy form always has.
+	if tot := Totals(dir); tot.Injections != 1 || tot.Bytes == 0 {
+		t.Errorf("the counting half was lost: %#v", tot)
+	}
+}
+
+// The old form still exists and still writes no destination, so a caller that
+// genuinely does not know one is not made to invent it. A harness that sends no
+// session_id reaches the same place through the new form: the field is omitted,
+// not filled with a placeholder.
+func TestADigestWithNoKnownDestinationSaysNothing(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("DEJA_INDEX_DIR", dir)
+
+	RecordDigestPolicy(dir, KindHook, "a digest of earlier work", 2, 4000, "local-only")
+	RecordDigestPolicyInto(dir, KindHook, "another digest", "", 2, 4000, "local-only")
+
+	got := Snapshots(dir, 0)
+	if len(got) != 2 {
+		t.Fatalf("wrote two snapshots, read %d", len(got))
+	}
+	for _, s := range got {
+		if s.Into != "" {
+			t.Errorf("a caller with no destination recorded one anyway: %q", s.Into)
+		}
+	}
+}
