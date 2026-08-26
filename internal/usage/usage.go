@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/atomicfile"
@@ -148,6 +149,10 @@ const (
 	// (#1922). Measured at 59.8 KB, against the megabyte that triggers a
 	// rewrite.
 	keepAtLeast = 200
+	// memoWindow is how long a read's finding answers for later appends. Short
+	// enough that an event arriving with an old stamp waits minutes rather than
+	// a fortnight, long enough that a busy process pays the read rarely.
+	memoWindow = 5 * time.Minute
 )
 
 // ahead reports a timestamp past the end of the reader's day — a clock that
@@ -439,14 +444,19 @@ func read(p string) []Event {
 // recall rewrote the whole thing and left it exactly as long. Measured on a
 // 10k-session store, per-recall cost went 123ms at an empty log to 342ms at
 // 1.2MB and 870ms at 5.8MB, none of those rewrites dropping a single event.
-// Reading the log to find that out is nearly free; writing it back is not, so
-// the write is what gets skipped when every event survives the cutoff. Which
+// The write is what gets skipped when every event survives the cutoff. The read
+// that decides it is not free either — on a busy fortnight it is the whole file
+// on every event, 6.4 ms against 28 µs — so what one read found answers for the
+// next few minutes (#1972). Which
 // event is oldest cannot be assumed from the order — a clock that steps back
 // appends an older event behind a newer one, and dropping on that assumption
 // would leave stale recalls weighing on ranking forever.
 func rotate(p string) {
 	fi, err := os.Stat(p)
 	if err != nil || fi.Size() < rotateAt {
+		return
+	}
+	if skipRotation(p, fi.Size()) {
 		return
 	}
 	cutoff := time.Now().UTC().Add(-keepWindow)
@@ -458,6 +468,7 @@ func rotate(p string) {
 		}
 	}
 	if len(keep) == len(all) {
+		rememberNothingToDrop(p, all, fi.Size())
 		return
 	}
 	if len(keep) == 0 && len(all) > 0 {
@@ -592,4 +603,59 @@ func Impact(indexDir string) ImpactReport {
 		}
 	}
 	return r
+}
+
+// nothingToDrop remembers, per log, what the last full read found: the oldest
+// event in it, and the size the file had then. Both are needed — the stamp says
+// when a rotation could next drop something, the size says the file is still
+// the one that was read.
+var nothingToDrop sync.Map // path -> rotationMemo
+
+type rotationMemo struct {
+	oldest time.Time
+	size   int64
+	at     time.Time // when this was learned
+}
+
+// skipRotation reports whether the last read of this log already established
+// that nothing would age out, and nothing has happened since to change that.
+//
+// It is only worth anything to a process that records more than once — the MCP
+// server answering recalls all day. A hook runs once and exits, so it pays the
+// read the first time either way.
+func skipRotation(p string, size int64) bool {
+	v, ok := nothingToDrop.Load(p)
+	if !ok {
+		return false
+	}
+	m := v.(rotationMemo)
+	now := time.Now().UTC()
+	// A memo is about the events one read saw. An event stamped in the past —
+	// a clock that stepped back, a log carried from another machine — arrives
+	// behind it and would otherwise wait out the whole window before anything
+	// looked again. A few minutes bounds that without giving back the cost.
+	if now.Sub(m.at) > memoWindow {
+		return false
+	}
+	if !m.oldest.After(now.Add(-keepWindow)) {
+		return false // the oldest event has aged out since
+	}
+	// Only growth is expected: a file that shrank was rewritten by someone
+	// else, and what this process remembers about it is about the old one.
+	return size >= m.size
+}
+
+// rememberNothingToDrop records what a full read found, so the next append does
+// not repeat it.
+func rememberNothingToDrop(p string, all []Event, size int64) {
+	oldest := time.Time{}
+	for _, e := range all {
+		if oldest.IsZero() || e.Time.Before(oldest) {
+			oldest = e.Time
+		}
+	}
+	if oldest.IsZero() {
+		return
+	}
+	nothingToDrop.Store(p, rotationMemo{oldest: oldest, size: size, at: time.Now().UTC()})
 }
