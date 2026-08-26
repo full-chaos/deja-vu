@@ -12,6 +12,11 @@
 //
 // The index's own writers are excluded from this by `lockDir`, which is why
 // they can keep their fixed temp names.
+//
+// The same writers append rather than replace when the file is a log, and they
+// share the other half of the problem: a record left unterminated by a killed
+// process. EndsMidLine is here for them — it writes nothing, but the callers
+// are the same set and the reason is the same one.
 package atomicfile
 
 import (
@@ -129,4 +134,25 @@ func Write(path string, b []byte, perm os.FileMode) error {
 		return err
 	}
 	return nil
+}
+
+// EndsMidLine reports whether a line-oriented file's last byte is anything but
+// a newline — a record whose writer was killed before it finished. A caller
+// appending to such a file writes onto that line unless it closes it first, and
+// the glued line then parses as neither record: measured on the usage log
+// (#1901), the injection snapshots (#1965) and the hook dedup file (#1967).
+//
+// The file must be open for reading; O_WRONLY silently reports a clean end. A
+// file that cannot be read is treated as ending cleanly, because none of these
+// writers may fail a recall over their own bookkeeping.
+func EndsMidLine(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil || fi.Size() == 0 {
+		return false
+	}
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], fi.Size()-1); err != nil {
+		return false
+	}
+	return last[0] != '\n'
 }
