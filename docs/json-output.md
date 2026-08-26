@@ -17,6 +17,15 @@ a `schema_version` field so consumers can detect breaking changes.
   element shapes are stable; only additive fields inside them are permitted.
 - **`deja stats --impact --json`** returns one flat object of counters and
   carries no `schema_version` either, on the same terms.
+- **`deja log --last --json`** carries no `schema_version` for two reasons of
+  its own. The object it prints is the record deja stores in
+  `.injections.jsonl`, marshalled from the same struct, so a version field on it
+  would be written into every line of that file. And the surface answers `null`
+  when no digest has been recorded: a shape that is sometimes absent cannot be
+  relied on to carry a version.
+- **`deja bench recall|context|prompt --json`** are object-shaped and carry no
+  `schema_version` either. They report a benchmark run to whoever asked for it,
+  not a contract anything downstream parses on a schedule.
 
 ### What changed in version 2
 
@@ -148,7 +157,7 @@ when empty:
 | `lifecycle` | state of an imported promoted note: `accepted`, `rejected`, `superseded` or `stale` |
 | `lifecycle_note` | the note left with that state |
 | `lifecycle_at` | when that state was set |
-| `kind` | the harness's own word for a session an agent spawned (`subagent`, `subagent_fork`); absent for sessions a person started |
+| `kind` | the harness's own word for a session an agent spawned — `sidechain` from Claude, `subagent` or `subagent_fork` from Grok, and whatever a harness deja has not met yet calls it; absent for sessions a person started |
 | `parent` | the session this one was spawned from, where the harness records the edge itself — deja never infers one |
 | `agent` | name of the agent that ran a spawned session |
 
@@ -191,6 +200,8 @@ return redacted index content in a bounded message window; the default limit is
     "harness": "codex",
     "id": "abc123",
     "project": "myapp",
+    "started": "2026-01-02T03:04:05Z",
+    "updated": "2026-01-02T03:10:00Z",
     "source": {"origin": "local", "instance": "workstation"},
     "messages": [
       {"role": "user", "text": "bounded redacted text", "time": "2026-01-02T03:04:05Z"}
@@ -261,6 +272,23 @@ Inside `recall`, `raw_bytes` is the size of the source transcripts the served
 digests distilled and `since` is the oldest event still in the usage log; both
 are omitted when zero, so a store with no recall history yet shows neither.
 
+
+`week_recalls`, `week_bytes`, `week_injected` and `week_agent_credits` cover
+seven calendar days back from now, at the same wall clock — not a fixed 168
+hours. Across a clock change that means the week runs an hour longer in autumn
+and an hour shorter in spring; and where a spring-forward removed the wall time
+the week would have started at, it starts at the time the clock reached instead.
+A day, where deja counts one, runs from local midnight. Both are the reader's own
+timezone, not UTC.
+
+`week_recalls` and `week_bytes` count what an agent asked for and got, so a
+recall that matched nothing is left out. `week_injected` counts what deja pushed
+unprompted, including a session start that carried only the environment block —
+that injection has no project session in it, which is a different thing from
+having served nothing.
+
+deja had two rules for a week until #1921, and the two numbers on the status bar
+disagreed for one week in each direction, so the definition is worth stating.
 
 Optional fields are omitted when zero or empty — `sidecar_size`, for one,
 appears only after `deja embed` has built a semantic sidecar. The heatmap grid used by
@@ -338,7 +366,12 @@ appears only after `deja embed` has built a semantic sidecar. The heatmap grid u
 ```
 
 `embed`, `ingest_health` and `deep` (present only under `--deep`) are omitted
-when unavailable; `policy` is always present. `index.path` points at the index
+when unavailable; `policy` is always present. `embed.state` is the endpoint's,
+`unavailable` or `reachable`. `sidecar` is the file's own state and appears only
+when it is `unreadable` — the sidecar is on disk and deja cannot parse it —
+with an `error` saying why. A sidecar fault is reported whether or not an
+endpoint is configured, so `embed` is present in that case even with no
+endpoint. `index.path` points at the index
 directory; `index.db` is that directory's name, not a file. Store `state`
 values are `ok`, `missing`, `unreadable`, `parsed-zero`, `denied` (which adds a
 `denied` field naming the unreadable path), `needs-sqlite3` and `needs-zstd`
@@ -406,7 +439,11 @@ one.
 `recalls` counts agent-initiated recalls that returned matches, `injections`
 session starts that began with project memory. `served_bytes` is what the
 digests actually returned and `raw_bytes` the source transcripts they were
-distilled from, so the ratio is how much reading deja saved. `reused_twice` is
+distilled from, so the ratio is how much reading deja saved. The two go
+together: a session start that carried only the environment block is in neither,
+because that block is a summary of what the machine keeps hitting rather than a
+digest of transcripts. `deja stats` counts its bytes, which is the number for
+everything deja handed over. `reused_twice` is
 sessions agents recalled two or more times, `dejavu_moments` prompts matched to
 prior work, and `credited_aloud` the recalls an agent said out loud.
 
@@ -414,8 +451,64 @@ prior work, and `credited_aloud` the recalls an agent said out loud.
 more than the period from then to now. On a quiet machine that is every event
 there has ever been; once the log grows past 1MB it is rewritten keeping the
 last 14 days, and from then on the figures are a window whose start moves. Read
-`since` rather than assuming either. It is absent when the log holds nothing,
-which is the one case where the counts are all zero anyway.
+`since` rather than assuming either — it can also be older than 14 days, since a
+rewrite that would leave nothing keeps the newest few hundred events instead of
+emptying the file. It is absent only when the log holds nothing at all, which is
+the one case where the counts are all zero anyway.
+
+## `deja log --json`
+
+What deja actually fed the agents, newest first:
+
+```json
+[
+  { "t": "2026-08-24T12:00:00Z", "kind": "recall", "bytes": 0, "empty": true },
+  { "t": "2026-08-24T11:00:00Z", "kind": "hook", "bytes": 400, "sessions": 1, "raw": 4000 },
+  {
+    "t": "2026-08-24T10:00:00Z",
+    "kind": "recall",
+    "bytes": 900,
+    "sessions": 2,
+    "raw": 9000,
+    "ids": ["s1", "s2"]
+  }
+]
+```
+
+A top-level array, so no `schema_version`, on the same terms as `blame`. It is
+`[]` and never `null` when there is nothing to report: this is the output a
+script polls, and `null` raises where an empty list iterates zero times.
+
+`t` is when it happened and `kind` is what deja did — `recall`, `recall_context`
+and `blame` are answers to an agent that asked; `hook`, `dejavu` and `tool` are
+memory offered unasked; `resource` is a read of `deja://session/…`; `remember`
+writes rather than serves; `search` and `handoff` are the reader's own commands.
+A kind this list does not name may still appear: another version of deja may
+have written it, and the log keeps what it was given.
+
+`bytes` is the size of the text that changed hands — what deja served, or, for
+`remember`, the note the agent wrote — and `raw` the size of the transcripts
+behind a served digest, which is omitted when there is none. `bytes` is always
+there, zero included: a recall that served nothing is a fact, not a missing
+field. `sessions` counts what the digest held, `ids` names them for a
+recall, and `empty` marks an event no session went into — a recall that returned
+no sessions is still a recall, and the count of those is what
+`empty_result_rate` is made of. It does not mean nothing was served: a session
+start on a checkout with no sessions of its own injects the environment block,
+which is about the machine rather than the project, so that event is `empty`
+and carries its `bytes`.
+
+A line needs both `t` and `kind` to appear here at all: a half-written line, or
+one from something that is not deja, is skipped rather than shown with a missing
+half. The same rule decides what the counters in `stats --json` read, so the two
+never disagree about whether something happened.
+
+`deja log --last --json` is a different shape: one object, the most recent
+injected digest itself. It carries `t` and `kind` as above, the `digest` text,
+`bytes`, and — each omitted when empty — `sessions`, the `policy` that allowed
+the injection, the `terms` behind a déjà vu firing, and `into`, the agent session
+it went to. It is `null` when no digest has been recorded: one object is the
+shape, and that is how a missing one is spelled.
 
 ## `deja blame <path> --json`
 

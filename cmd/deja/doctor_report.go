@@ -200,8 +200,16 @@ func collectDoctorPolicy(dir string) doctorPolicyReport {
 	return r
 }
 
+// doctorEmbedReport is the Embedding section. State is the endpoint's —
+// unavailable or reachable — and Sidecar is the file's, which is a separate
+// thing that can fail on its own: a sidecar deja cannot parse used to read
+// exactly like never having embedded anything (#1960). Error says why, as it
+// does for sync and policy. Two fields rather than one state because the reader
+// needs both to know whether re-running `deja embed` can fix it.
 type doctorEmbedReport struct {
 	State    string  `json:"state"`
+	Sidecar  string  `json:"sidecar,omitempty"`
+	Error    string  `json:"error,omitempty"`
 	Model    string  `json:"model,omitempty"`
 	Dim      int     `json:"dim,omitempty"`
 	Coverage float64 `json:"coverage"`
@@ -312,6 +320,14 @@ func collectDoctorEmbed(dir string) *doctorEmbedReport {
 	}
 	s, err := embed.Read(dir)
 	if err != nil {
+		// A sidecar that is there and will not parse is a fault to report even
+		// when no endpoint is configured: the file is the evidence, and the
+		// endpoint is not what broke it. A Stat that fails means it is gone,
+		// which is the ordinary "nothing embedded yet" below.
+		if _, statErr := os.Stat(embed.Path(dir)); statErr == nil {
+			r.Sidecar, r.Error = "unreadable", err.Error()
+			return r
+		}
 		if !reachable {
 			return nil
 		}

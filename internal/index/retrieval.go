@@ -1709,12 +1709,31 @@ func FindByID(dir, id string) (model.Session, bool, error) {
 	if err != nil {
 		return model.Session{}, false, err
 	}
+	var best SessionMeta
+	var found bool
 	for _, meta := range m.Sessions {
-		if meta.ID == id {
-			return loadSessionMeta(dir, m, meta)
+		if meta.ID != id {
+			continue
+		}
+		if !found || betterIDMatch(meta, best) {
+			best, found = meta, true
 		}
 	}
-	return model.Session{}, false, nil
+	if !found {
+		return model.Session{}, false, nil
+	}
+	return loadSessionMeta(dir, m, best)
+}
+
+// betterIDMatch picks between two sessions carrying the same id (#1997). The
+// freshest is the best guess for the one that just compacted; the harness name
+// breaks a tie, and since the manifest is keyed harness:id it always breaks —
+// so the answer never depends on map order.
+func betterIDMatch(candidate, held SessionMeta) bool {
+	if !candidate.Updated.Equal(held.Updated) {
+		return candidate.Updated.After(held.Updated)
+	}
+	return candidate.Harness < held.Harness
 }
 
 func loadSessionMeta(dir string, m Manifest, meta SessionMeta) (model.Session, bool, error) {

@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/atomicfile"
@@ -75,12 +77,24 @@ func injectedKind(kind string) bool {
 	return false
 }
 
+// FoundNothing reports whether a lookup came back with nothing, which is what
+// `deja log` marks. Not the same as the Empty flag: on an injection the flag
+// says no project session went in, and a session start on a checkout with no
+// sessions of its own still injects the environment block — bytes and all
+// (#1954). On a lookup the flag does mean the answer found nothing, which is
+// why an empty recall still serves the sentence that says so.
+func (e Event) FoundNothing() bool { return e.Empty && !injectedKind(e.Kind) }
+
 type Event struct {
 	Time     time.Time `json:"t"`
 	Kind     string    `json:"kind"`
 	Bytes    int       `json:"bytes"`
 	Sessions int       `json:"sessions,omitempty"`
-	Empty    bool      `json:"empty,omitempty"`
+	// Empty means no session went into the event, which is not the same as
+	// serving nothing: a session start on a checkout with no sessions of its
+	// own still injects the environment block, and that event carries its
+	// bytes (#1954).
+	Empty bool `json:"empty,omitempty"`
 	// RawBytes is the size of the source transcripts the served digest was
 	// distilled from — what the agent would have had to replay without deja.
 	RawBytes int64 `json:"raw,omitempty"`
@@ -129,6 +143,28 @@ func (s Summary) MarshalJSON() ([]byte, error) {
 const (
 	rotateAt   = 1 << 20 // rewrite the log when it grows past 1MB
 	keepWindow = 14 * 24 * time.Hour
+	// keepAtLeast is how many events survive when every one of them is older
+	// than the window. Without it, a fortnight away emptied the log on the
+	// first recall back and the impact screen said no recall had ever happened
+	// (#1922). Measured at 59.8 KB, against the megabyte that triggers a
+	// rewrite.
+	keepAtLeast = 200
+	// EventRoom is how large one event may be for the fallback above to leave
+	// the file under its threshold: keepAtLeast of them have to fit in
+	// rotateAt. A recall over short sessions with filename-length ids writes
+	// 2.9 kB of it, which is the widest a writer produces today.
+	//
+	// It bounds that fallback and not the ordinary rotation, which keeps
+	// whatever is inside the window and can leave the file over the threshold
+	// with no size rule at all. That state is transient — the next write finds
+	// nothing to drop and stops re-reading (#1972) — and closing it properly is
+	// the retention question that issue leaves open. The injection log took the
+	// other road in #1971 and drops the oldest until the rebuild fits.
+	EventRoom = 4096
+	// memoWindow is how long a read's finding answers for later appends. Short
+	// enough that an event arriving with an old stamp waits minutes rather than
+	// a fortnight, long enough that a busy process pays the read rarely.
+	memoWindow = 5 * time.Minute
 )
 
 // ahead reports a timestamp past the end of the reader's day — a clock that
@@ -205,25 +241,10 @@ func recordFull(indexDir, kind string, bytes, sessions int, empty bool, raw int6
 	// one too: appended onto the partial line, so that line no longer parsed
 	// either and a recall deja had just served went missing from every count
 	// (#1901). One byte of reading closes the line first.
-	if endsMidLine(f) {
+	if atomicfile.EndsMidLine(f) {
 		b = append([]byte{'\n'}, b...)
 	}
 	_, _ = f.Write(append(b, '\n'))
-}
-
-// endsMidLine reports whether the log's last byte is anything but a newline.
-// A file that cannot be read is treated as ending cleanly: a usage event must
-// never be the reason a recall fails.
-func endsMidLine(f *os.File) bool {
-	fi, err := f.Stat()
-	if err != nil || fi.Size() == 0 {
-		return false
-	}
-	var last [1]byte
-	if _, err := f.ReadAt(last[:], fi.Size()-1); err != nil {
-		return false
-	}
-	return last[0] != '\n'
 }
 
 // InjectedToday returns session-start context bytes injected since local midnight.
@@ -266,7 +287,11 @@ func TodayDemand(indexDir string) (recalls, bytes, injected int) {
 	now := time.Now()
 	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	for _, e := range read(Path(indexDir)) {
-		if e.Time.Before(midnight) || ahead(e.Time, now) || e.Empty {
+		// FoundNothing, not the raw flag: on an injection the flag means no
+		// project session went in, and the environment block goes out with it
+		// — dropping those said "0 B injected" on a day memory had been
+		// arriving since morning (#1962).
+		if e.Time.Before(midnight) || ahead(e.Time, now) || e.FoundNothing() {
 			continue
 		}
 		switch {
@@ -280,11 +305,22 @@ func TodayDemand(indexDir string) (recalls, bytes, injected int) {
 	return recalls, bytes, injected
 }
 
+// WeekCut is when "this week" opens: seven calendar days back, at the same wall
+// time — or, in the hour a spring-forward removes, at the time the clock
+// actually reached, since 02:30 did not happen that day. Not 168 hours — in a zone with daylight saving those differ by an hour
+// for one week in each direction, and the status bar prints the week counters
+// beside the déjà-vu count, so one of them counted an event the other did not
+// (#1920). The day counters here cut at local midnight and the brief cuts at
+// seven calendar days, so this is the rule the rest of deja already speaks.
+func WeekCut(now time.Time) time.Time {
+	return now.AddDate(0, 0, -7)
+}
+
 // DejaVuWeek counts this week's déjà vu moments — prompts the user's own
 // history already answered.
 func DejaVuWeek(indexDir string) int {
 	now := time.Now()
-	cut := now.AddDate(0, 0, -7)
+	cut := WeekCut(now)
 	n := 0
 	for _, e := range read(Path(indexDir)) {
 		if e.Kind == KindDejaVu && e.Time.After(cut) && !ahead(e.Time, now) && e.Sessions > 0 {
@@ -350,9 +386,11 @@ func Totals(indexDir string) Summary {
 // deliveries deja pushed unprompted.
 func Week(indexDir string) (recalls, bytes, injected, injectedBytes int) {
 	now := time.Now()
-	cut := now.Add(-7 * 24 * time.Hour)
+	cut := WeekCut(now)
 	for _, e := range read(Path(indexDir)) {
-		if e.Time.Before(cut) || ahead(e.Time, now) || e.Empty {
+		// Same rule as the day: the week that contains today has to contain
+		// today's injected bytes (#1962).
+		if e.Time.Before(cut) || ahead(e.Time, now) || e.FoundNothing() {
 			continue
 		}
 		switch {
@@ -373,6 +411,20 @@ func Today(indexDir string) (recalls int, bytes int) {
 	return recalls, bytes
 }
 
+// usable reports whether a line is an event at all: a stamp, so it can be
+// placed in time, and a kind, so it can be counted or named. The two readers
+// asked for one each — the counters for a stamp, `deja log` for a kind — so a
+// half-written line was a row on one surface and nothing on the other, and a
+// line with no kind, which no counter has a case for, still set `since`, the
+// window every figure on the impact screen is measured from (#1917).
+//
+// An unrecognised kind stays an event: deja may have written it, an older or a
+// newer version of itself, and it belongs in the log the reader browses even
+// though no counter has a case for it.
+func (e Event) usable() bool {
+	return !e.Time.IsZero() && e.Kind != ""
+}
+
 func read(p string) []Event {
 	f, err := os.Open(p)
 	if err != nil {
@@ -384,7 +436,7 @@ func read(p string) []Event {
 	s.Buffer(make([]byte, 4096), 1<<20)
 	for s.Scan() {
 		var e Event
-		if json.Unmarshal(s.Bytes(), &e) == nil && !e.Time.IsZero() {
+		if json.Unmarshal(s.Bytes(), &e) == nil && e.usable() {
 			out = append(out, e)
 		}
 	}
@@ -404,14 +456,19 @@ func read(p string) []Event {
 // recall rewrote the whole thing and left it exactly as long. Measured on a
 // 10k-session store, per-recall cost went 123ms at an empty log to 342ms at
 // 1.2MB and 870ms at 5.8MB, none of those rewrites dropping a single event.
-// Reading the log to find that out is nearly free; writing it back is not, so
-// the write is what gets skipped when every event survives the cutoff. Which
+// The write is what gets skipped when every event survives the cutoff. The read
+// that decides it is not free either — on a busy fortnight it is the whole file
+// on every event, 6.4 ms against 28 µs — so what one read found answers for the
+// next few minutes (#1972). Which
 // event is oldest cannot be assumed from the order — a clock that steps back
 // appends an older event behind a newer one, and dropping on that assumption
 // would leave stale recalls weighing on ranking forever.
 func rotate(p string) {
 	fi, err := os.Stat(p)
 	if err != nil || fi.Size() < rotateAt {
+		return
+	}
+	if skipRotation(p, fi.Size()) {
 		return
 	}
 	cutoff := time.Now().UTC().Add(-keepWindow)
@@ -423,7 +480,21 @@ func rotate(p string) {
 		}
 	}
 	if len(keep) == len(all) {
+		rememberNothingToDrop(p, all, fi.Size())
 		return
+	}
+	if len(keep) == 0 && len(all) > 0 {
+		// Newest first, then back into the order the file is read in.
+		// Stable, so two events written in the same second keep the order they
+		// were written in — that order is the only thing separating them, and
+		// `deja log` prints it.
+		byTime := append([]Event(nil), all...)
+		sort.SliceStable(byTime, func(i, j int) bool { return byTime[i].Time.After(byTime[j].Time) })
+		if len(byTime) > keepAtLeast {
+			byTime = byTime[:keepAtLeast]
+		}
+		sort.SliceStable(byTime, func(i, j int) bool { return byTime[i].Time.Before(byTime[j].Time) })
+		keep = byTime
 	}
 	// One buffer, then one atomic replace. The temp name used to be derived
 	// from the log's own path, and this is the one writer in deja with no lock
@@ -520,6 +591,14 @@ func Impact(indexDir string) ImpactReport {
 			// the environment block, and that event is logged empty. Counting
 			// it made "N session starts began with project memory" claim
 			// memory that was not there.
+			//
+			// The bytes go with the count, which is the part that looks like
+			// an oversight and is not. The block is a summary of what this
+			// machine keeps hitting, not a digest of transcripts, so it is
+			// recorded with no raw size behind it. Adding it to ServedBytes
+			// alone divides a real numerator by an unchanged denominator:
+			// measured on three recalls and ten blocks, a tenfold saving reads
+			// as fourfold, understating what deja did. Both stay out.
 			if e.Empty {
 				continue
 			}
@@ -536,4 +615,59 @@ func Impact(indexDir string) ImpactReport {
 		}
 	}
 	return r
+}
+
+// nothingToDrop remembers, per log, what the last full read found: the oldest
+// event in it, and the size the file had then. Both are needed — the stamp says
+// when a rotation could next drop something, the size says the file is still
+// the one that was read.
+var nothingToDrop sync.Map // path -> rotationMemo
+
+type rotationMemo struct {
+	oldest time.Time
+	size   int64
+	at     time.Time // when this was learned
+}
+
+// skipRotation reports whether the last read of this log already established
+// that nothing would age out, and nothing has happened since to change that.
+//
+// It is only worth anything to a process that records more than once — the MCP
+// server answering recalls all day. A hook runs once and exits, so it pays the
+// read the first time either way.
+func skipRotation(p string, size int64) bool {
+	v, ok := nothingToDrop.Load(p)
+	if !ok {
+		return false
+	}
+	m := v.(rotationMemo)
+	now := time.Now().UTC()
+	// A memo is about the events one read saw. An event stamped in the past —
+	// a clock that stepped back, a log carried from another machine — arrives
+	// behind it and would otherwise wait out the whole window before anything
+	// looked again. A few minutes bounds that without giving back the cost.
+	if now.Sub(m.at) > memoWindow {
+		return false
+	}
+	if !m.oldest.After(now.Add(-keepWindow)) {
+		return false // the oldest event has aged out since
+	}
+	// Only growth is expected: a file that shrank was rewritten by someone
+	// else, and what this process remembers about it is about the old one.
+	return size >= m.size
+}
+
+// rememberNothingToDrop records what a full read found, so the next append does
+// not repeat it.
+func rememberNothingToDrop(p string, all []Event, size int64) {
+	oldest := time.Time{}
+	for _, e := range all {
+		if oldest.IsZero() || e.Time.Before(oldest) {
+			oldest = e.Time
+		}
+	}
+	if oldest.IsZero() {
+		return
+	}
+	nothingToDrop.Store(p, rotationMemo{oldest: oldest, size: size, at: time.Now().UTC()})
 }
