@@ -117,7 +117,7 @@ _deja_completion() {
             fi
             ;;
         remember)
-            COMPREPLY=( $(compgen -W "--project" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--project --tag" -- "$cur") )
             ;;
         resume)
             COMPREPLY=( $(compgen -W "--exec" -- "$cur") )
@@ -243,7 +243,7 @@ _deja() {
       _arguments '--harness=[filter by harness]:harness:($harnesses)' '--project=[filter by project]:project:' '--since=[filter by age]:duration:' '--role=[filter by role]:role:(%ROLES%)' '1:count:'
       ;;
     remember)
-      _arguments '--project=[note project]:project:' '1:text:'
+      _arguments '--project=[note project]:project:' '*--tag=[tag the note, repeatable]:tag:' '1:text:'
       ;;
     resume)
       _arguments '--exec[launch the native harness]' '1:session ID prefix:'
@@ -320,6 +320,7 @@ complete -c deja -n '__fish_seen_subcommand_from last' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from last' -l since -r
 complete -c deja -n '__fish_seen_subcommand_from last' -l role -r -a '%ROLES%'
 complete -c deja -n '__fish_seen_subcommand_from remember' -l project -r
+complete -c deja -n '__fish_seen_subcommand_from remember' -l tag -r
 complete -c deja -n '__fish_seen_subcommand_from resume' -l exec
 complete -c deja -n '__fish_seen_subcommand_from stats' -l json
 complete -c deja -n '__fish_seen_subcommand_from stats' -l impact
@@ -400,7 +401,7 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
                 elseif ($previous -eq '--role') { @('user', 'assistant', 'tool') }
                 else { @('--harness', '--project', '--since', '--role') }
             }
-            'remember' { @('--project') }
+            'remember' { @('--project', '--tag') }
             'resume' { @('--exec') }
             'stats' {
                 if ($previous -eq '--harness') { $harnesses }
