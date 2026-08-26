@@ -54,10 +54,17 @@ const RecordRoom = snapshotRotateAt / snapshotsToKeep
 // Escaping is a multiplier rather than a constant, which is what makes this a
 // function. Measured against a budget of 8192: plain text costs 168 bytes, a
 // real digest with its newlines 558, and text that is all newlines or all
-// quotes doubles, since each is two bytes in JSON. Three, not two, because a
-// byte that is not valid UTF-8 is written as the replacement character and
-// costs three — a truncated binary paste in a transcript is enough, and nothing
-// strips it.
+// quotes doubles, since each is two bytes in JSON. Three, not two, because of
+// what a truncated binary paste does: an invalid byte becomes the replacement
+// character, three bytes, and the worst shape is invalid bytes alternating with
+// newlines. The ceiling there is exactly 2.5: three bytes out for the invalid
+// byte, two for the cheapest neighbour that stops it collapsing — brute-forced
+// over every one and two byte repeat unit, and nothing beats it. A solid run of
+// invalid bytes is not the worst case and looks like the best one, since
+// ToValidUTF8 collapses a run to a single character.
+//
+// The other 512 is the envelope, which is only a constant because the terms are
+// bounded before they are written (#1988).
 //
 // Two things are kept out of the multiplier rather than allowed for. Control
 // bytes would cost six each as \u00XX escapes, and SafeText strips them before
@@ -285,6 +292,7 @@ func marshalSnapshot(s Snapshot) ([]byte, error) {
 	// raw. A record whose size depends on the toolchain is not a record with a
 	// bound, and a transcript picks up invalid bytes from any truncated paste.
 	s.Digest = strings.ToValidUTF8(s.Digest, "\ufffd")
+	s.Terms = boundTerms(s.Terms)
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetEscapeHTML(false)
@@ -293,4 +301,37 @@ func marshalSnapshot(s Snapshot) ([]byte, error) {
 	}
 	// Encode appends a newline; the callers add their own.
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// termsRoom is what a record carries of the query terms behind a déjà vu
+// firing. They are there so a wrong "you have been here" can be explained
+// afterwards, and a term cut to its first characters still does that — while an
+// uncut one does not fit the envelope RecordSize allows: `prompt.Terms` treats a
+// pasted path or hash as one token, and one such word wrote a record 1.8 times
+// its own bound (#1988).
+const termsRoom = 256
+
+// boundTerms is the terms as the record keeps them: the same terms, each cut so
+// the set fits termsRoom, and nothing dropped — a term that is missing reads as
+// a term that did not match.
+func boundTerms(terms []string) []string {
+	total := 0
+	for _, t := range terms {
+		total += len(t) + 3 // the quotes and the comma
+	}
+	if total <= termsRoom {
+		return terms
+	}
+	each := termsRoom/max(len(terms), 1) - 3
+	if each < 8 {
+		each = 8
+	}
+	out := make([]string, len(terms))
+	for i, t := range terms {
+		if len(t) > each {
+			t = strings.ToValidUTF8(t[:each], "") + "…"
+		}
+		out[i] = t
+	}
+	return out
 }
