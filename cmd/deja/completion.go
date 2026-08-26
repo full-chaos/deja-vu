@@ -140,7 +140,14 @@ _deja_completion() {
                 COMPREPLY=( $(compgen -d -- "$cur") )
             fi
             ;;
-        check|ctx|embed|hook-precompact|hook-prompt|mcp|share|show|sources|statusline|update|version|warmup)
+        show)
+            if [[ "$prev" == "--harness" ]]; then
+                COMPREPLY=( $(compgen -W "$harnesses" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--json --harness --offset --limit" -- "$cur") )
+            fi
+            ;;
+        check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|update|version|warmup)
             COMPREPLY=()
             ;;
         *)
@@ -262,7 +269,10 @@ _deja() {
         _arguments '--pull[pull from the remote]' '--full[transfer all records]' '1:host:'
       fi
       ;;
-    check|ctx|embed|hook-precompact|hook-prompt|mcp|share|show|sources|statusline|update|version|warmup)
+    show)
+      _arguments '--json[print JSON]' '--harness=[filter by harness]:harness:($harnesses)' '--offset=[skip leading messages]:count:' '--limit=[cap messages printed]:count:' '1:session ID prefix:'
+      ;;
+    check|ctx|embed|hook-precompact|hook-prompt|mcp|share|sources|statusline|update|version|warmup)
       ;;
     *)
       _arguments '--json[print JSON]' '--re[interpret query as a regular expression]' '--all[include all results]' '--no-embed[skip semantic reranking]' '--harness=[filter by harness]:harness:($harnesses)' '--project=[filter by project]:project:' '--since=[filter by age]:duration:' '--role=[filter by role]:role:(%ROLES%)' '--session=[only one session]:id:' '--rebuild[force a full rebuild]'
@@ -316,6 +326,10 @@ complete -c deja -n '__fish_seen_subcommand_from hook-context' -l plain
 complete -c deja -n '__fish_seen_subcommand_from index' -l rebuild
 complete -c deja -n '__fish_seen_subcommand_from install uninstall' -a '%INSTALL_TARGETS% --all --auto'
 complete -c deja -n '__fish_seen_subcommand_from install uninstall' -l no-guidance
+complete -c deja -n '__fish_seen_subcommand_from show' -l json
+complete -c deja -n '__fish_seen_subcommand_from show' -l harness -r -a '%HARNESSES%'
+complete -c deja -n '__fish_seen_subcommand_from show' -l offset -r
+complete -c deja -n '__fish_seen_subcommand_from show' -l limit -r
 complete -c deja -n '__fish_seen_subcommand_from last' -l harness -r -a '%HARNESSES%'
 complete -c deja -n '__fish_seen_subcommand_from last' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from last' -l since -r
@@ -415,7 +429,11 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
                 elseif ($action -eq 'ssh') { @('--pull', '--full') }
                 else { @() }
             }
-            { $_ -in @('check', 'ctx', 'embed', 'hook-precompact', 'hook-prompt', 'mcp', 'share', 'show', 'sources', 'statusline', 'update', 'version', 'warmup') } { @() }
+            'show' {
+                if ($previous -eq '--harness') { $harnesses }
+                else { @('--json', '--harness', '--offset', '--limit') }
+            }
+            { $_ -in @('check', 'ctx', 'embed', 'hook-precompact', 'hook-prompt', 'mcp', 'share', 'sources', 'statusline', 'update', 'version', 'warmup') } { @() }
             default { $defaultOptions }
         }
     }
