@@ -89,7 +89,7 @@ _deja_completion() {
             COMPREPLY=( $(compgen -W "--json --offline --deep" -- "$cur") )
             ;;
         forget)
-            COMPREPLY=( $(compgen -W "--list --dry-run --session --project --before --unforget" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--list --dry-run --session --project --before --unforget --all-matches" -- "$cur") )
             ;;
         handoff)
             if [[ "$prev" == "--to" ]]; then
@@ -225,7 +225,7 @@ _deja() {
       _arguments '--json[print JSON]' '--offline[skip version check]' '--deep[verify index against sources]'
       ;;
     forget)
-      _arguments '--list[list tombstones]' '--dry-run[show changes without applying]' '--session=[session ID prefix]:session:' '--project=[project substring]:project:' '--before=[duration or date]:time:' '--unforget=[tombstone ID]:ID:'
+      _arguments '--list[list tombstones]' '--dry-run[show changes without applying]' '--session=[session ID prefix]:session:' '--project=[project substring]:project:' '--before=[duration or date]:time:' '--unforget=[tombstone ID]:ID:' '--all-matches[act on every match]'
       ;;
     handoff)
       _arguments '--to=[target agent]:agent:(%HANDOFF_TARGETS%)' '--exec[launch the target agent]' '1:session ID prefix:'
@@ -309,6 +309,7 @@ complete -c deja -n '__fish_seen_subcommand_from forget' -l session -r
 complete -c deja -n '__fish_seen_subcommand_from forget' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from forget' -l before -r
 complete -c deja -n '__fish_seen_subcommand_from forget' -l unforget -r
+complete -c deja -n '__fish_seen_subcommand_from forget' -l all-matches
 complete -c deja -n '__fish_seen_subcommand_from handoff' -l to -r -a '%HANDOFF_TARGETS%'
 complete -c deja -n '__fish_seen_subcommand_from handoff' -l exec
 complete -c deja -n '__fish_seen_subcommand_from hook-context' -l plain
@@ -388,7 +389,7 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
             }
             'completion' { @('bash', 'zsh', 'fish', 'powershell', 'pwsh') }
             'doctor' { @('--json', '--offline', '--deep') }
-            'forget' { @('--list', '--dry-run', '--session', '--project', '--before', '--unforget') }
+            'forget' { @('--list', '--dry-run', '--session', '--project', '--before', '--unforget', '--all-matches') }
             'handoff' {
                 if ($previous -eq '--to') { $handoffTargets }
                 else { @('--to', '--exec') }
