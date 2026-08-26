@@ -498,7 +498,8 @@ never disagree about whether something happened.
 injected digest itself. It carries `t` and `kind` as above, the `digest` text,
 `bytes`, and — each omitted when empty — `sessions`, the `policy` that allowed
 the injection, the `terms` behind a déjà vu firing, and `into`, the agent session
-it went to.
+it went to. It is `null` when no digest has been recorded: one object is the
+shape, and that is how a missing one is spelled.
 
 ## `deja blame <path> --json`
 
