@@ -60,12 +60,18 @@ func Terms(prompt string) []string {
 	// field, and techTerm rejects every rune above 127 — a Chinese, Japanese
 	// or Korean prompt therefore yields no terms at all and auto-recall can
 	// never fire for it. Fall back to the terms the relevance tier already
-	// ranks on: per-run bigrams with pure-grammar pairs dropped. A bigram is
-	// as specific as the identifiers techTerm looks for, and the caller still
+	// ranks on: per-run bigrams with pure-grammar pairs dropped. That filter
+	// is a Chinese closed class, while Japanese grammar lives in hiragana:
+	// particles and inflection, and even pairs such as "ての" where the
+	// bigram slide crosses the word boundary in "すべて|の". A bigram with
+	// hiragana is therefore grammar or an okurigana fragment rather than a
+	// topic; kanji and katakana runs carry the content this hook can act on.
+	// Issue 2260 is the field failure this distinction fixes. A bigram is as
+	// specific as the identifiers techTerm looks for, and the caller still
 	// demands two of them overlap before claiming a déjà vu.
 	if hasCJKRune(prompt) {
 		for _, t := range relevanceTerms(prompt) {
-			if !hasCJKRune(t) {
+			if !hasCJKRune(t) || hasHiragana(t) {
 				continue
 			}
 			if add(t) {
@@ -130,10 +136,20 @@ func cyrPromptTerm(f string) bool {
 	}
 	return !strings.Contains(f, "-")
 }
+
 func hasCJKRune(s string) bool {
 	for _, r := range s {
 		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) ||
 			unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasHiragana(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Hiragana, r) {
 			return true
 		}
 	}
