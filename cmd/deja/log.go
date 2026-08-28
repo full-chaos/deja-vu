@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
+	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/usage"
 )
 
@@ -59,15 +62,18 @@ func runLogTo(w io.Writer, dir string, args []string) error {
 			enc.SetIndent("", "  ")
 			return enc.Encode(s)
 		}
-		pol := ""
-		if s.Policy != "" {
-			pol = " · policy: " + s.Policy
-		}
-		fmt.Fprintf(w, "# %s · %s · %d session%s · %s%s\n\n", s.Kind, s.Time.Local().Format("2006-01-02 15:04"), s.Sessions, pluralS(s.Sessions), humanBytes(int64(s.Bytes)), pol)
+		fmt.Fprintf(w, "# %s · %s · %d session%s · %s%s\n\n", s.Kind, s.Time.Local().Format("2006-01-02 15:04"), s.Sessions, pluralS(s.Sessions), humanBytes(int64(s.Bytes)), snapshotTail(s))
 		fmt.Fprintln(w, s.Digest)
+		// This is the newest digest by its stamp (#2140), so a stamp from
+		// ahead of the clock holds the spot until the clock catches up — and
+		// the digest an agent actually received last is then not the one on
+		// screen. The list above names the same fault in its own words.
+		if index.StampedAhead(s.Time, time.Now()) {
+			fmt.Fprintf(os.Stderr, "deja: this digest is stamped later than this machine's clock, so it leads by its stamp — a digest served since may be older by that stamp and sit below it\n")
+		}
 		return nil
 	}
-	events := usage.Events(dir, n)
+	events, total := usage.EventsCounted(dir, n)
 	if jsonOut {
 		// A nil slice encodes as null, and null is not an empty list: len()
 		// raises, iteration raises, `jq '.[]'` errors. Every other
@@ -93,8 +99,70 @@ func runLogTo(w io.Writer, dir string, args []string) error {
 		if e.Sessions > 0 {
 			sess = fmt.Sprintf(" · %d session%s", e.Sessions, pluralS(e.Sessions))
 		}
-		fmt.Fprintf(w, "%s  %-14s %s%s%s\n", e.Time.Local().Format("2006-01-02 15:04"), e.Kind, humanBytes(int64(e.Bytes)), sess, mark)
+		into := ""
+		if e.Into != "" {
+			into = " · into: " + e.Into
+		}
+		fmt.Fprintf(w, "%s  %-14s %s%s%s%s\n", e.Time.Local().Format("2006-01-02 15:04"), e.Kind, humanBytes(int64(e.Bytes)), sess, into, mark)
+	}
+	if total > len(events) {
+		// Nobody typed the 20 — it is the default above — and this is the
+		// audit trail, where a list that stops without saying so reads as
+		// everything deja served. The same sentence blame and show print
+		// (#2299, #2296, #2305).
+		fmt.Fprintf(w, "\nshowing %d of %d — `deja log %d` shows the rest\n", len(events), total, total)
 	}
 	fmt.Fprintln(w, "\nuse `deja log --last` to see the exact text of the most recent injected digest")
+	// The log's stamps are deja's own, written at recall time, so one in the
+	// future means the clock moved backwards since — and those events sit above
+	// everything from then on, while the status bar leaves them out of its
+	// counters. Two surfaces reading one file and disagreeing with nothing to
+	// say why is the shape #696 rejected; `deja last` and `doctor` name it
+	// already (#2105, #2107, #2122).
+	if n := eventsStampedAhead(events, time.Now()); n > 0 {
+		fmt.Fprintf(os.Stderr, "deja: %d event%s stamped later than this machine's clock — %s at the top of this list, and the counters leave %s out\n",
+			n, pluralS(n), pluralThatThose(n), pluralThoseOnes(n))
+	}
 	return nil
+}
+
+// pluralThoseOnes is the pronoun for the tail of that sentence, so it never
+// says "leaves it out" about several events or "them" about one.
+func pluralThoseOnes(n int) string {
+	if n == 1 {
+		return "it"
+	}
+	return "them"
+}
+
+// eventsStampedAhead counts the listed events whose stamp is after now, by the
+// same rule the other surfaces count sessions with.
+func eventsStampedAhead(events []usage.Event, now time.Time) int {
+	n := 0
+	for _, e := range events {
+		if index.StampedAhead(e.Time, now) {
+			n++
+		}
+	}
+	return n
+}
+
+// snapshotTail is the part of the header that depends on what the record
+// happens to carry. The record knows which agent session received the digest
+// and which terms fired it — both were added to explain an injection after the
+// fact (#1494) — and only --json ever said them, so the surface a person types
+// answered "what was injected" and never to whom or why (#2301). Fields the
+// record does not carry print nothing, the way policy already did.
+func snapshotTail(s usage.Snapshot) string {
+	var b strings.Builder
+	if s.Policy != "" {
+		b.WriteString(" · policy: " + s.Policy)
+	}
+	if s.Into != "" {
+		b.WriteString(" · into: " + s.Into)
+	}
+	if len(s.Terms) > 0 {
+		b.WriteString(" · terms: " + strings.Join(s.Terms, ", "))
+	}
+	return b.String()
 }

@@ -24,6 +24,13 @@ func runShare(dir string, args []string, w io.Writer) error {
 			return fmt.Errorf("share: unknown flag %q — share writes to stdout (redirect it), and `deja promote <id> --to <path>` is the one that writes a file", a)
 		}
 	}
+	// An empty prefix used to match the first session there is, so `deja share
+	// "$ID"` with the variable unset printed a shareable digest of a session
+	// nobody chose (#2259). The lookup refuses one now; this says which
+	// argument was missing rather than reporting a session that does not exist.
+	if strings.TrimSpace(args[0]) == "" {
+		return idPrefixNeeded(dir, "share needs an id-prefix", "share needs id-prefix (see `deja last`)")
+	}
 	s, ok, err := findByPrefix(dir, args[0])
 	noteAmbiguousPrefix(dir, args[0], "sharing")
 	if err != nil {
@@ -49,7 +56,7 @@ func runShare(dir string, args []string, w io.Writer) error {
 func printSanitized(w io.Writer, text string) {
 	// Redact the whole document at once: multiline secrets (PEM private key
 	// blocks) never match when scanned line-by-line.
-	redacted, counts := redact.Text(text)
+	redacted, _ := redact.Text(text)
 	redacted = stripBidiAndInvisible(redacted)
 	fmt.Fprint(w, redacted)
 	if !strings.HasSuffix(redacted, "\n") {
@@ -62,11 +69,10 @@ func printSanitized(w io.Writer, text string) {
 	// nothing new. Counting only what this pass replaced reported "0 secrets
 	// masked" on a document visibly full of them — the opposite of what the
 	// line is for.
+	// One count, of the markers in what is being shared: adding the pass's own
+	// tally on top counted a secret this pass caught twice (#2061).
 	masked := strings.Count(redacted, redact.Marker)
-	for _, n := range counts {
-		masked += n
-	}
-	fmt.Fprintf(os.Stderr, "deja: %d secrets masked in this share. pattern redaction is a floor — review before sending; rotate anything that leaked.\n", masked)
+	fmt.Fprintf(os.Stderr, "deja: %d secret%s masked in this share. pattern redaction is a floor — review before sending; rotate anything that leaked.\n", masked, pluralS(masked))
 }
 
 // stripBidiAndInvisible removes the characters that make a share render as

@@ -61,50 +61,125 @@ func IngestHealth(dir string) map[string]HarnessIngest {
 	return m.IngestHealth
 }
 
-// mergeIngestDiag folds the sources side-channel counters into the manifest,
-// keyed by harness. Harnesses untouched this pass keep their previous entry.
+// IngestFilesReport returns the same story per file: which path each refused
+// line, clipped message or unreadable store came from. The rollup says a line
+// was skipped and doctor points at `--json` for more, which used to hold the
+// rollup again (#2189). Sparse — only files with something to report.
+func IngestFilesReport(dir string) map[string]FileIngest {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	m, err := readManifest(dir)
+	if err != nil {
+		return nil
+	}
+	return m.IngestFiles
+}
+
+// mergeIngestDiag folds the sources side-channel counters into the manifest.
+// The counts live per file, because that is what they are about: a pass that
+// re-reads one transcript must not erase what a different one reported, and a
+// file rewritten without its bad line must be able to clear its own count
+// (#2015). The per-harness map every reader asks for is the sum.
 func mergeIngestDiag(m *Manifest) {
 	malformed, failed := sources.DiagSnapshot()
-	if len(malformed) == 0 && len(failed) == 0 {
-		return
+	if m.IngestFiles == nil {
+		m.IngestFiles = map[string]FileIngest{}
 	}
-	if m.IngestHealth == nil {
-		m.IngestHealth = map[string]HarnessIngest{}
-	}
-	touched := map[string]bool{}
-	for p := range malformed {
-		touched[harnessForPath(p)] = true
-	}
-	for p := range failed {
-		touched[harnessForPath(p)] = true
-	}
-	for h := range touched {
-		if h == "" {
+	// Whatever this pass read, it read whole: its files start from nothing and
+	// take what the parsers just reported.
+	for p := range passParsed {
+		// The clip count for this pass was recorded during redaction, which
+		// runs before this fold, so it is not something to start over.
+		if e, ok := m.IngestFiles[p]; ok && e.Clipped > 0 {
+			m.IngestFiles[p] = FileIngest{Clipped: e.Clipped}
 			continue
 		}
-		// The clip count for this pass is recorded during redaction, which
-		// runs before this fold; resetting the whole entry threw it away.
-		m.IngestHealth[h] = HarnessIngest{ClippedMessages: m.IngestHealth[h].ClippedMessages}
+		delete(m.IngestFiles, p)
 	}
 	for p, n := range malformed {
-		h := harnessForPath(p)
-		if h == "" {
-			continue
-		}
-		e := m.IngestHealth[h]
-		e.MalformedLines += n
-		m.IngestHealth[h] = e
+		e := m.IngestFiles[p]
+		e.Malformed += n
+		m.IngestFiles[p] = e
 	}
 	for p, msg := range failed {
-		h := harnessForPath(p)
+		e := m.IngestFiles[p]
+		e.Error = msg
+		m.IngestFiles[p] = e
+	}
+	// A file this pass read is a file that opens. Only the error goes: the bad
+	// lines it counted are still in the part already indexed.
+	for p := range passRead {
+		if failed[p] != "" {
+			continue
+		}
+		if e, ok := m.IngestFiles[p]; ok && e.Error != "" {
+			e.Error = ""
+			if e.Malformed == 0 && e.Clipped == 0 {
+				delete(m.IngestFiles, p)
+			} else {
+				m.IngestFiles[p] = e
+			}
+		}
+	}
+	// A file deja no longer walks has nothing left to report. Kept for a file
+	// that failed to open, which is exactly the file a walk may not see.
+	for p, e := range m.IngestFiles {
+		if e.Error != "" {
+			continue
+		}
+		if _, ok := m.Files[p]; !ok {
+			delete(m.IngestFiles, p)
+		}
+	}
+	if len(m.IngestFiles) == 0 {
+		m.IngestFiles = nil
+	}
+	m.IngestHealth = healthFromFiles(m.IngestFiles)
+	// The set belongs to the pass that recorded it. Left standing, it deleted
+	// those files' entries again on the next manifest write in the process —
+	// and `deja sync` writes one, from Import, right after a pass.
+	passParsed, passRead = nil, nil
+}
+
+// healthFromFiles sums the per-file counts per harness.
+//
+// Paths in order, because LastError is one of them: taking whichever the map
+// handed over last gave the same index a different error on every run, so a
+// script diffing `doctor --json` saw a change where nothing changed (#2245).
+// The first failing path is the one quoted; ingest_files holds them all.
+func healthFromFiles(files map[string]FileIngest) map[string]HarnessIngest {
+	out := map[string]HarnessIngest{}
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		e := files[p]
+		// The store, not the file kind: the run narrates "cline" and doctor
+		// filed the same fact under "cline-sdk", while the documentation calls
+		// this key a harness. Five stores have kinds by another name, so for
+		// those a script keyed on the documented name found nothing (#2234).
+		h := sources.HarnessForKind(harnessForPath(p))
 		if h == "" {
 			continue
 		}
-		e := m.IngestHealth[h]
-		e.FailedFiles++
-		e.LastError = msg
-		m.IngestHealth[h] = e
+		cur := out[h]
+		cur.MalformedLines += e.Malformed
+		cur.ClippedMessages += e.Clipped
+		if e.Error != "" {
+			cur.FailedFiles++
+			if cur.LastError == "" {
+				cur.LastError = e.Error
+			}
+		}
+		out[h] = cur
 	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // UpToDate reports whether Ensure would do nothing, and how many sessions the
@@ -357,12 +432,15 @@ func rebuild(dir string, harness string, scope string, files map[string]FileStat
 
 func rebuildWithTombstones(dir string, harness string, scope string, files map[string]FileState, progress io.Writer, dead map[string]bool) error {
 	// This build's counts, not the process's: see writeSessionsWithSync (#1850).
+	beginPass()
 	emptied.Store(0)
 	collisions.Store(0)
+	merged.Store(0)
 	// A rebuild evicts nothing, but a number left by an earlier build must not
 	// outlive it (#1861).
 	evicted.Store(0)
 	lastIngestFiles = len(files)
+	parsedThisPass(files)
 	initialBuild := !HasManifest(dir)
 	writtenMessages := 0
 	imported := importedSessions(dir)
@@ -614,6 +692,7 @@ func loadProgress(h string, progress io.Writer) []model.Session {
 	}
 	wg.Wait()
 	unreadable := malformedByHarness()
+	refused := failedByHarness()
 	var ss []model.Session
 	for _, r := range results {
 		if len(r.ss) == 0 {
@@ -621,14 +700,25 @@ func loadProgress(h string, progress io.Writer) []model.Session {
 			// index run that narrates every store it read and stays silent
 			// about the one it skipped makes an empty deja look like an empty
 			// history (#794).
-			if reason := sources.SkipReason(r.name); reason != "" && progress != nil && !SuppressHarnessNarration {
-				fmt.Fprintf(progress, "deja: %s: skipped — %s\n", r.name, reason)
+			//
+			// Two ways to yield nothing, and the second had no line at all: a
+			// store deja could not open has a skip reason, and one whose files
+			// it read and refused has a count instead — computed just above and
+			// then dropped, in the case where nothing else on screen mentions
+			// the store (#2229).
+			if progress != nil && !SuppressHarnessNarration {
+				switch reason := sources.SkipReason(r.name); {
+				case reason != "":
+					fmt.Fprintf(progress, "deja: %s: skipped — %s\n", r.name, reason)
+				case unreadable[r.name] > 0 || refused[r.name] > 0:
+					fmt.Fprintln(progress, nothingReadableNarration(r.name, unreadable[r.name], refused[r.name]))
+				}
 			}
 			continue
 		}
 		ss = append(ss, r.ss...)
 		if progress != nil && !SuppressHarnessNarration {
-			fmt.Fprintln(progress, harnessNarration(r.name, r.ss, sources.SkipReason(r.name), unreadable[r.name]))
+			fmt.Fprintln(progress, harnessNarration(r.name, r.ss, sources.SkipReason(r.name), unreadable[r.name], refused[r.name]))
 		}
 	}
 	return ss
@@ -639,7 +729,7 @@ func loadProgress(h string, progress io.Writer) []model.Session {
 // in SQLite — and the count alone then reads as the whole story while half of
 // it is missing from recall. The skip reason was printed only for a store that
 // yielded nothing at all (#1758, the shape of #794).
-func harnessNarration(name string, ss []model.Session, skipped string, unreadable int) string {
+func harnessNarration(name string, ss []model.Session, skipped string, unreadable, refused int) string {
 	msgs := 0
 	for _, s := range ss {
 		msgs += len(s.Messages)
@@ -653,10 +743,61 @@ func harnessNarration(name string, ss []model.Session, skipped string, unreadabl
 	if unreadable > 0 {
 		line += fmt.Sprintf(" — %d line%s skipped, deja could not read %s", unreadable, pluralS(unreadable), pluralThem(unreadable))
 	}
+	// A file deja could not read at all is the third fact of this kind, beside
+	// the refused lines and the missing tool. Without it a store that gave up
+	// ten sessions and lost three tasks read like a store with nothing wrong
+	// (#2236).
+	if refused > 0 {
+		line += fmt.Sprintf(" — %d path%s could not be read at all", refused, pluralS(refused))
+	}
 	if skipped != "" {
 		line += " — part of this store could not be read: " + skipped
 	}
 	return line
+}
+
+// nothingReadableNarration is the line for a store that yielded no session
+// because deja could not read what it found. "0 sessions, 0 messages" is the
+// ordinary line's shape and says the wrong thing here — there were sessions,
+// and none of them survived the read (#2229).
+func nothingReadableNarration(name string, unreadable, refused int) string {
+	label := name
+	if label == "deja" {
+		label = "notes"
+	}
+	// Lines and whole files are different losses and the sentence says which:
+	// a task deja could not parse is a path, and calling it a line said "1
+	// line" about three thousand turns (#2232).
+	var what []string
+	if unreadable > 0 {
+		what = append(what, fmt.Sprintf("%d line%s", unreadable, pluralS(unreadable)))
+	}
+	if refused > 0 {
+		what = append(what, fmt.Sprintf("%d path%s", refused, pluralS(refused)))
+	}
+	return fmt.Sprintf("deja: %s: nothing indexed — %s could not be read", label, strings.Join(what, " and "))
+}
+
+// failedByHarness is malformedByHarness for the paths that would not open or
+// would not parse at all.
+func failedByHarness() map[string]int {
+	out := map[string]int{}
+	for p := range sources.DiagFailedPaths() {
+		if h := sources.HarnessForKind(harnessForPath(p)); h != "" {
+			out[h]++
+		}
+	}
+	return out
+}
+
+// totalMalformed is malformedByHarness summed: the incremental line names the
+// pass, not a store.
+func totalMalformed() int {
+	n := 0
+	for _, c := range malformedByHarness() {
+		n += c
+	}
+	return n
 }
 
 // malformedByHarness folds the per-file malformed counts the parsers reported
@@ -665,7 +806,10 @@ func harnessNarration(name string, ss []model.Session, skipped string, unreadabl
 func malformedByHarness() map[string]int {
 	out := map[string]int{}
 	for p, n := range sources.DiagMalformedCounts() {
-		if h := harnessForPath(p); h != "" {
+		// By the store's own name, not the file kind's: harnessForPath answers
+		// "cline-sdk" where the run narrates "cline", so the count never
+		// reached the line that would have said it (#2229).
+		if h := sources.HarnessForKind(harnessForPath(p)); h != "" {
 			out[h] += n
 		}
 	}
@@ -680,6 +824,11 @@ func ReportCollisions() int {
 	return int(collisions.Swap(0))
 }
 
+// ReportMerged is ReportCollisions plus the pairs deja merges without warning.
+func ReportMerged() int {
+	return int(merged.Swap(0))
+}
+
 // markShared records that a manifest row covers more than one conversation, so
 // a later forget can say what it is about to take (#970).
 func markShared(sessions map[string]SessionMeta, key string) {
@@ -690,6 +839,7 @@ func markShared(sessions map[string]SessionMeta, key string) {
 }
 
 func rebuildForSearch(dir string, o query.Options, scope string, files map[string]FileState, progress io.Writer) error {
+	beginPass()
 	tmp := dir + ".tmp"
 	_ = os.RemoveAll(tmp)
 	if err := os.MkdirAll(filepath.Join(tmp, "buckets"), 0o700); err != nil {
@@ -751,9 +901,11 @@ func writeSessionsWithSync(tmp, dir string, ss []model.Session, files map[string
 	// why it showed in the test binary first.
 	emptied.Store(0)
 	collisions.Store(0)
+	merged.Store(0)
 	initialBuild := !HasManifest(dir)
 	writtenMessages := 0
 	lastIngestFiles = len(files)
+	parsedThisPass(files)
 	m := Manifest{Version: version, Files: files, Sessions: map[string]SessionMeta{}, BuiltAt: time.Now(), Generation: time.Now().UTC().Format(time.RFC3339Nano), Scope: scope,
 		ExportWatermarks: imp.watermarks, ExportBoundary: imp.boundary, ImportedRecords: imp.dedupe,
 		ExcludeFingerprint: sources.ExclusionFingerprint(),
@@ -1643,6 +1795,14 @@ func sortedKeys[V any](m map[string]V) []string {
 // current build. The two full-build paths index sessions in parallel, so the
 // counter is atomic.
 var collisions atomic.Int64
+
+// merged counts every pair of transcripts that became one row, including the
+// ones deja does not warn about — a goose session present in both of that
+// harness's stores is a migration, not a clash, but the per-harness lines
+// still count it twice. The reconciling totals key on this, so they appear
+// whenever the sums have parted rather than only when there is a warning
+// (#1091, #2066).
+var merged atomic.Int64
 var emptied atomic.Int64
 
 // evicted counts the indexed files that left because their store went away —
@@ -1664,7 +1824,29 @@ func attributeSession(held SessionMeta, s model.Session) (owns, collided bool) {
 	if held.Path == "" || s.Path == "" || held.Path == s.Path {
 		return true, false
 	}
+	merged.Add(1)
+	// goose 1.10 moved its sessions into sessions.db and left the JSONL files
+	// where they were, so after a migration the same conversation is in both
+	// stores under one id — the db row keeps the id the file was named after.
+	// That is one conversation across two storage generations, not two
+	// transcripts clashing, and sort order decided it: `<stamp>.jsonl` sorts
+	// below `sessions.db`, so every migrated session was filed under the
+	// superseded copy and counted as a collision the reader can do nothing
+	// about (#2066). The live store owns the row and the pair is not reported.
+	if s.Harness == "goose" {
+		if newIsDB, heldIsDB := isGooseStore(s.Path), isGooseStore(held.Path); newIsDB != heldIsDB {
+			return newIsDB, false
+		}
+	}
 	return s.Path < held.Path, true
+}
+
+// isGooseStore reports whether a path is goose's database rather than one of
+// the JSONL files beside it. Named, not compared against sources.GooseDB(),
+// because the row deja already holds was written by an earlier pass that may
+// have read a differently configured root.
+func isGooseStore(path string) bool {
+	return strings.EqualFold(filepath.Base(path), "sessions.db")
 }
 
 // pluralS keeps "1 sessions" off the first line anyone sees from deja (#737).
@@ -1816,8 +1998,14 @@ func titleWorthy(t string) bool {
 // — and the state is what every one-line surface reads it for, so cutting the
 // tail would drop exactly the part that matters and, worse, make a state
 // change invisible to the comparison that decides whether to rewrite the row
-// (#R11). Note titles are deja's own text, so the injection this bound exists
-// to stop cannot arrive through them.
+// (#R11).
+//
+// What makes the exemption safe is not that the text is deja's own — the notes
+// file is edited by hand, so a note title is whatever someone typed (#2063) —
+// but that every reader clips it for its own layout: `last`, `stats`, the view
+// page and the MCP payloads through SafeNoteTitle, hook-context through
+// trimBriefTitle. TestEverySurfaceThatPrintsANoteTitleBoundsIt holds that, and
+// a new surface has to join it (#2092).
 func boundSourceTitle(harness, title string) string {
 	if harness == "deja" {
 		return title
@@ -1878,7 +2066,10 @@ func redactForIngest(m *Manifest, sourcePath, text string) string {
 	if m.RedactionRules == nil {
 		m.RedactionRules = map[string]int{}
 	}
-	h := harnessForPath(sourcePath)
+	// The store, not the file kind: `deja stats` prints these as headings, and
+	// "cline-sdk" is a word no other screen uses (#2238, the shape #2234 fixed
+	// for the ingest counters).
+	h := sources.HarnessForKind(harnessForPath(sourcePath))
 	if h == "" {
 		if _, ok := m.Files[sources.OpencodeDB()]; ok {
 			h = "opencode"
@@ -1925,7 +2116,11 @@ func carryRedactions(m *Manifest, old Manifest, skip map[string]bool) {
 		if !skipped {
 			continue
 		}
-		h := harnessForPath(path)
+		// The store, matching the key the rules are filed under since #2238:
+		// asking for the file kind here left "cline-sdk" against a "cline" key,
+		// so nothing matched and every incremental pass carried the old counts
+		// on top of the fresh ones (#2240).
+		h := sources.HarnessForKind(harnessForPath(path))
 		if h == "" && path == sources.OpencodeDB() {
 			h = "opencode"
 		}
@@ -1933,9 +2128,193 @@ func carryRedactions(m *Manifest, old Manifest, skip map[string]bool) {
 	}
 	for key, count := range old.RedactionRules {
 		parts := strings.SplitN(key, ":", 2)
-		if len(parts) == 2 && !skipHarness[parts[0]] {
+		if len(parts) != 2 {
+			continue
+		}
+		// Folded before the lookup: an index written before #2238 files these
+		// by file kind, and a pass since then drops by store — so a stale
+		// "cline-sdk" count survived its file being re-read and was added to
+		// the fresh "cline" one when the report folded them (#2240).
+		name := parts[0]
+		if store := sources.HarnessForKind(name); store != "" {
+			name = store
+		}
+		if !skipHarness[name] {
 			m.RedactionRules[key] = count
 		}
+	}
+}
+
+// fromDatabase reports whether a record came out of a shared store rather than
+// a file of its own, which is what exempts it from the changed-file rule: the
+// database changes whenever any session in it does, and dropping every record
+// that names it would take the untouched sessions along.
+//
+// The path settles it for goose and cursor, which name the database as the
+// session's path. opencode names the project directory, so nothing about its
+// path says "database" — the key names the harness, and opencode has no
+// per-file kind to confuse it with (#2033).
+func fromDatabase(r Record) bool {
+	// The key first, and only for opencode: it has one store and no per-file
+	// kind, so nothing else carries an "opencode:" key and no path can
+	// contradict it. Asking the path first got this wrong for an opencode
+	// project that lives inside another harness's root — a versioned ~/.claude,
+	// say — where harnessForPath answers with that harness's kind.
+	if h, _, ok := strings.Cut(r.Key, ":"); ok && h == "opencode" {
+		return true
+	}
+	switch h := harnessForPath(r.SourcePath); h {
+	case "cursor-db", "goose-db":
+		return true
+	default:
+		// A path that names a per-file kind settles it: two transcripts in
+		// different projects can share a filename-derived id, and judging those
+		// by key erased the sibling that was never re-read (#699).
+		return false
+	}
+}
+
+// readWholeThisPass reports whether the pass re-read this record's store in
+// full. Only then may an old record be dropped because its key came back: a
+// store read from a watermark hands back the new turns alone, and dropping the
+// rest by key would take the earlier turns of a continued session with them.
+//
+// By store rather than by harness where the record names one: cursor keeps a
+// database per workspace as well as the global one, and a first sight of a new
+// workspace — opening a project — has no watermark, so a harness-wide flag let
+// that pass replace sessions in the store it had only read the tail of.
+func readWholeThisPass(r Record) bool {
+	if len(passWholeStores) == 0 {
+		return false
+	}
+	switch harnessForPath(r.SourcePath) {
+	case "cursor-db", "goose-db":
+		return passWholeStores[r.SourcePath]
+	}
+	harness, _, ok := strings.Cut(r.Key, ":")
+	return ok && passWholeStores[harness]
+}
+
+// passWholeStores names the database-backed stores this pass read whole, by
+// harness. Package state for the same reason passParsed is: a pass holds the
+// directory lock.
+var passWholeStores map[string]bool
+
+// wholeStoresThisPass records them, under both the store path and the harness:
+// a record names the first where it can and the second otherwise.
+//
+// Only these three stores are stamped with a watermark (setStoreLastUpdated).
+// Everything else is read whole on every pass and judged by its path, which is
+// why it needs none of this — a watermark added to another database later would
+// have to join fromDatabase and this function in the same change.
+func wholeStoresThisPass(changed, old map[string]FileState) {
+	passWholeStores = map[string]bool{}
+	for p := range changed {
+		harness := ""
+		switch harnessForPath(p) {
+		case "opencode":
+			harness = "opencode"
+		case "cursor-db":
+			harness = "cursor"
+		case "goose-db":
+			harness = "goose"
+		default:
+			continue
+		}
+		if old[p].LastUpdated == 0 || rereadsWholeSessions(p) {
+			passWholeStores[harness] = true
+			passWholeStores[p] = true
+		}
+	}
+}
+
+// rereadsWholeSessions marks a store whose cursor selects sessions rather than
+// messages: goose asks for every message of any session touched since the
+// stamp, so a continued session hands back turns already counted, and adding
+// them again grew the count on every pass. Starting the file over is the lesser
+// wrong — it loses what an untouched session held, which is #2025 again for
+// this one store, rather than a number that only climbs. Narrowing the clause
+// instead costs the session its earlier turns (#2033), so the re-reading stays.
+func rereadsWholeSessions(p string) bool {
+	return harnessForPath(p) == "goose-db"
+}
+
+// fullyReadFiles drops the files a pass reads only part of. LastUpdated is
+// stamped for database-backed stores alone (setStoreLastUpdated), and it is
+// exactly what makes their parse partial: parseChangedFile hands it to the kind
+// as the since cursor.
+func fullyReadFiles(changed, old map[string]FileState) map[string]FileState {
+	out := make(map[string]FileState, len(changed))
+	for p, f := range changed {
+		if old[p].LastUpdated > 0 && !rereadsWholeSessions(p) {
+			continue
+		}
+		out[p] = f
+	}
+	return out
+}
+
+// copyIngestFiles hands the new manifest its own map: the old one belongs to
+// the manifest this build read, which is still in use while the build runs. The
+// files this pass will re-read arrive with their clip count zeroed — the pass
+// records its own as it goes, and adding it to what the last pass found counted
+// one long message twice.
+func copyIngestFiles(old map[string]FileIngest, reread map[string]FileState) map[string]FileIngest {
+	out := make(map[string]FileIngest, len(old))
+	for p, e := range old {
+		if _, ok := reread[p]; ok {
+			e.Clipped = 0
+		}
+		out[p] = e
+	}
+	return out
+}
+
+// beginPass clears the parsers' skip counters, which belong to the pass that
+// parsed. They used to be cleared only by the manifest fold, so a pass that died
+// before writing left its count for the next one to report: one bad line on
+// disk, "2 lines skipped" on screen, with the manifest agreeing (#2010).
+//
+// Called at every place a pass parses: this one, rebuildForSearch — which a
+// recall reaches directly once an index is found damaged, without passing
+// through updateIndex at all — and rebuildWithTombstones, which forget and
+// unforget call for themselves.
+func beginPass() {
+	sources.DiagSnapshot()
+	passParsed = nil
+	passRead = nil
+	passWholeStores = nil
+}
+
+// passParsed is the set of files the pass in progress re-read. Package state
+// for the same reason lastIngestFiles is: a pass holds the directory lock, so
+// only one is ever in flight.
+var passParsed map[string]bool
+
+// passRead is the files a pass read without the open failing. The append path
+// cannot use parsedThisPass — it reads a tail, so its counts add — but a file
+// it read is a file that opens, and an error recorded when it did not has to
+// go, or a permission blip stayed in doctor until a forced rebuild (#2015).
+var passRead map[string]bool
+
+// readThisPass records a file a pass opened and parsed.
+func readThisPass(files map[string]FileState) {
+	if passRead == nil {
+		passRead = map[string]bool{}
+	}
+	for p := range files {
+		passRead[p] = true
+	}
+}
+
+// parsedThisPass records which files a pass read, so the fold can start their
+// counts over rather than adding to what an earlier pass left (#2015).
+func parsedThisPass(files map[string]FileState) {
+	if passParsed == nil {
+		passParsed = map[string]bool{}
+	}
+	for p := range files {
+		passParsed[p] = true
 	}
 }
 
@@ -1945,6 +2324,7 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 	// reset down there would zero the number this build is about to report
 	// (#1861).
 	evicted.Store(0)
+	beginPass()
 	old, err := readManifest(dir)
 	if err == nil && !recordsIntact(dir, old) {
 		force = true // records.bin lost its tail to a crash; only a rebuild is safe
@@ -2025,7 +2405,7 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		return nil
 	}
 	if len(removed) == 0 && canAppendIncremental(changed, old.Files) {
-		filesTouched, messages, err := appendIncremental(dir, harness, scope, old, files, changed)
+		filesTouched, messages, unreadable, err := appendIncremental(dir, harness, scope, old, files, changed)
 		if IsCorrupt(err) {
 			if progress != nil {
 				fmt.Fprintf(progress, "deja: index damaged (%v), rebuilding ...\n", err)
@@ -2036,7 +2416,15 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 			return fmt.Errorf("append: %w", err)
 		}
 		if progress != nil {
-			fmt.Fprintf(progress, "deja: updated %d file%s (%d new message%s)\n", filesTouched, pluralS(filesTouched), messages, pluralS(messages))
+			line := fmt.Sprintf("deja: updated %d file%s (%d new message%s)", filesTouched, pluralS(filesTouched), messages, pluralS(messages))
+			// After the first build every run a person sees is this one, so a
+			// clause that lives only in the full pass is a clause nobody reads
+			// (#2007). Same counters, summed across the stores this pass
+			// touched — the line is about the pass rather than one store.
+			if unreadable > 0 {
+				line += fmt.Sprintf(" — %d line%s skipped, deja could not read %s", unreadable, pluralS(unreadable), pluralThem(unreadable))
+			}
+			fmt.Fprintln(progress, line)
 		}
 		return nil
 	}
@@ -2044,6 +2432,7 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 	// This pass's counts, like every other build path (#1850).
 	emptied.Store(0)
 	collisions.Store(0)
+	merged.Store(0)
 	lastIngestFiles = len(changed)
 	for p, f := range changed {
 		ss, err := parseChangedFile(harness, p, old.Files[p])
@@ -2065,6 +2454,20 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		replacements = append(replacements, sources.FilterSessions(filterTombstoned(ss))...)
 		files[p] = f
 	}
+	// After the loop, because a file whose parse failed is dropped from
+	// `changed` there and keeps what it already held — starting it over would
+	// throw the counts away on the one pass that could not read it.
+	//
+	// A database-backed store reads only what is newer than the cursor the last
+	// pass stamped, so this pass cannot speak for the rest of it either: it adds
+	// to what the store holds, the way an append does (#2025). The trade is the
+	// append path's — a db's counts can only grow until a full rebuild.
+	reread := fullyReadFiles(changed, old.Files)
+	parsedThisPass(reread)
+	wholeStoresThisPass(changed, old.Files)
+	// A file the pass read is a file that opens, whether or not it read all of
+	// it, so an error recorded when it did not has to go.
+	readThisPass(changed)
 	replaceKeys := map[string]bool{}
 	for _, s := range replacements {
 		replaceKeys[s.Harness+":"+s.ID] = true
@@ -2100,7 +2503,13 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		// those patterns, so claiming today's set would be a lie the reader
 		// cannot check.
 		ExcludeFingerprint: old.ExcludeFingerprint,
-		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir))}
+		ToolFingerprint:    mergedToolFingerprint(priorToolFingerprint(dir)),
+		// What deja could not read is about the files, not about the pass that
+		// happened to notice: the lines are still there. Dropping the map meant
+		// doctor forgot a store's unreadable file because an unrelated
+		// transcript changed (#2015). A store this pass re-read starts over,
+		// because a file rewritten clean has to be able to clear its count.
+		IngestFiles: copyIngestFiles(old.IngestFiles, reread)}
 	skipRedactions := map[string]bool{}
 	for p := range changed {
 		skipRedactions[p] = true
@@ -2164,8 +2573,7 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		// watermark, so their untouched sessions are NOT re-emitted on a
 		// change — they must be retained, not dropped, or they vanish.
 		// Superseded sessions are handled by replaceKeys.
-		h := harnessForPath(r.SourcePath)
-		sharedStore := h == "opencode" || h == "cursor-db" || h == "goose-db"
+		fromStore := fromDatabase(r)
 		// replaceKeys is scoped to shared stores. A shared store is parsed since
 		// a watermark, so a superseded session's old record is not re-read and
 		// clause two never reaches it — replaceKeys is what drops it. For a
@@ -2174,7 +2582,11 @@ func updateIndex(dir, harness, scope string, files map[string]FileState, force b
 		// hurts: two transcripts in different projects can share a filename-derived
 		// id, and dropping by key alone erased the sibling that was never re-read
 		// (#699). The record's own SourcePath decides its fate for those.
-		if removed[r.SourcePath] || (changed[r.SourcePath].Path != "" && !sharedStore) || (sharedStore && replaceKeys[r.Key]) {
+		//
+		// And only when the pass read that store whole: a store read from its
+		// watermark hands back the new turns alone, so dropping the rest by key
+		// would take the earlier turns of every continued session (#2033).
+		if removed[r.SourcePath] || (changed[r.SourcePath].Path != "" && !fromStore) || (fromStore && readWholeThisPass(r) && replaceKeys[r.Key]) {
 			return
 		}
 		recErr = addRec(r)
@@ -2339,16 +2751,22 @@ func canAppendIncremental(changed map[string]FileState, old map[string]FileState
 	return true
 }
 
-func appendIncremental(dir, harness, scope string, old Manifest, files map[string]FileState, changed map[string]FileState) (int, int, error) {
+func appendIncremental(dir, harness, scope string, old Manifest, files map[string]FileState, changed map[string]FileState) (filesTouched, messages, unreadable int, err error) {
 	// This pass's counts, like the two full paths: an incremental that nobody
 	// read between builds otherwise reported its own colliding ids plus the
 	// ones before it (#1850).
 	emptied.Store(0)
 	collisions.Store(0)
+	merged.Store(0)
 	lastIngestFiles = len(changed)
+	readThisPass(changed)
+	// Deliberately not parsedThisPass: this path reads the appended tail, not
+	// the file, so what it finds adds to the file's count instead of replacing
+	// it. Marking the file re-read dropped every bad line in the part already
+	// indexed — which is every live session.
 	rf, err := os.OpenFile(filepath.Join(dir, "records.bin"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	// The log is being APPENDED to, so ids must continue where the existing
 	// records left off. Starting a fresh table would hand id 0 to a new
@@ -2357,7 +2775,7 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 	rw, err := newRecordWriter(rf, tbl)
 	if err != nil {
 		_ = rf.Close()
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer func() { _ = rw.Close() }()
 	buckets := bucketPostings{}
@@ -2387,7 +2805,6 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 	if m.Sessions == nil {
 		m.Sessions = map[string]SessionMeta{}
 	}
-	filesTouched, messages := 0, 0
 	// Sorted, not map order: two sessions can claim the same harness:id, and
 	// which one wins decided the project a whole conversation was filed under
 	// — differently on every run (#698).
@@ -2471,7 +2888,7 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 				}
 				off, err := rw.write(Record{Key: key, SourcePath: s.Path, Role: msg.Role, Text: text, Time: msg.Time})
 				if err != nil {
-					return filesTouched, messages, err
+					return filesTouched, messages, 0, err
 				}
 				messages++
 				seen := map[string]bool{}
@@ -2482,7 +2899,7 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 					seen[tok] = true
 					data, err := loadBucket(tok)
 					if err != nil {
-						return filesTouched, messages, err
+						return filesTouched, messages, 0, err
 					}
 					data[tok] = append(data[tok], posting{Off: off, Sid: meta.Ord})
 				}
@@ -2490,17 +2907,20 @@ func appendIncremental(dir, harness, scope string, old Manifest, files map[strin
 		}
 	}
 	if err := rw.Close(); err != nil {
-		return filesTouched, messages, err
+		return filesTouched, messages, 0, err
 	}
 	if err := writeBucketsConcurrent(filepath.Join(dir, "buckets"), buckets); err != nil {
-		return filesTouched, messages, err
+		return filesTouched, messages, 0, err
 	}
 	setOpencodeLastUpdated(m.Files, m.Sessions)
 	m.RecordStrings = tbl.strs
+	// Read before writeManifest: the fold in there drains the counters, and the
+	// caller prints its line after this returns (#2007).
+	unreadable = totalMalformed()
 	if err := writeManifest(dir, m); err != nil {
-		return filesTouched, messages, err
+		return filesTouched, messages, unreadable, err
 	}
-	return filesTouched, messages, nil
+	return filesTouched, messages, unreadable, nil
 }
 
 func sameFile(a, b FileState) bool {
@@ -2575,8 +2995,25 @@ func setOpencodeLastUpdated(files map[string]FileState, sessions map[string]Sess
 	}
 }
 
+// sessionInStore reports whether a row came from the store being stamped.
+//
+// Cursor keeps one database per workspace, and both it and goose record the
+// store path in Path, so the row says which one it came from. opencode records
+// the project directory instead (#2033) — and has a single database, so there
+// the harness is the store.
+func sessionInStore(s SessionMeta, harness, db string) bool {
+	if harness == "opencode" {
+		return true
+	}
+	return s.Path == db
+}
+
 // setStoreLastUpdated stamps a database-backed store with the newest session
 // time so incremental passes can query only newer content.
+//
+// The newest session in THAT store: taking the newest across the harness
+// stamped a quiet Cursor workspace with the busy one's time, and a turn the
+// quiet store gained below that line was never asked for again (#2071).
 func setStoreLastUpdated(files map[string]FileState, sessions map[string]SessionMeta, harness, db string) {
 	f, ok := files[db]
 	if !ok {
@@ -2584,7 +3021,10 @@ func setStoreLastUpdated(files map[string]FileState, sessions map[string]Session
 	}
 	var latest int64
 	for _, s := range sessions {
-		if s.Harness == harness && s.Updated.UnixNano() > latest {
+		if s.Harness != harness || !sessionInStore(s, harness, db) {
+			continue
+		}
+		if s.Updated.UnixNano() > latest {
 			latest = s.Updated.UnixNano()
 		}
 	}
@@ -2883,7 +3323,8 @@ func preRedactSessions(m *Manifest, ss []model.Session) {
 						if m.RedactionRules == nil {
 							m.RedactionRules = map[string]int{}
 						}
-						h := harnessForPath(s.Path)
+						// The store, as above (#2238).
+						h := sources.HarnessForKind(harnessForPath(s.Path))
 						if h == "" {
 							if _, ok := m.Files[sources.OpencodeDB()]; ok {
 								h = "opencode"
@@ -2972,25 +3413,30 @@ func filePrefixHash(path string, n int64) uint64 {
 	return h.Sum64()
 }
 
-// countClipped records messages stored short of the transcript. The caller
-// holds the lock where one is needed; redactForIngest runs single-threaded.
+// countClipped records messages stored short of the transcript, against the
+// file that holds them. The caller holds the lock where one is needed;
+// redactForIngest runs single-threaded.
 func countClipped(m *Manifest, sourcePath string, n int) {
 	if m == nil || n == 0 {
 		return
 	}
-	h := harnessForPath(sourcePath)
-	if h == "" {
-		if _, ok := m.Files[sources.OpencodeDB()]; ok {
-			h = "opencode"
+	p := sourcePath
+	if harnessForPath(p) == "" {
+		// opencode sessions carry their project dir as Path; the store on
+		// record is the database file.
+		if db := sources.OpencodeDB(); db != "" {
+			if _, ok := m.Files[db]; ok {
+				p = db
+			}
 		}
 	}
-	if h == "" {
+	if harnessForPath(p) == "" {
 		return
 	}
-	if m.IngestHealth == nil {
-		m.IngestHealth = map[string]HarnessIngest{}
+	if m.IngestFiles == nil {
+		m.IngestFiles = map[string]FileIngest{}
 	}
-	e := m.IngestHealth[h]
-	e.ClippedMessages += n
-	m.IngestHealth[h] = e
+	e := m.IngestFiles[p]
+	e.Clipped += n
+	m.IngestFiles[p] = e
 }

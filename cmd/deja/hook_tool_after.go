@@ -59,7 +59,6 @@ func runHookToolAfter(dir string, stdin io.Reader, stdout io.Writer) error {
 	var input toolAfterInput
 	raw := readHookPayload(stdin, hookStdinWait)
 	_ = json.NewDecoder(bytes.NewReader(raw)).Decode(&input)
-	adoptHookCWD(input.CWD)
 	if !planIndexReady(dir) {
 		return nil
 	}
@@ -302,13 +301,31 @@ func fixLine(p index.FixPair) string {
 	return "deja: this error came up here before" + when + " — what followed it: " + cmd
 }
 
+// exitMarker is the shape a source appends when it knows what a command
+// returned: two spaces, the marker, the digits, end of string
+// (internal/sources/codex.go:259, internal/sources/opencode.go:202).
+const exitMarker = "  → exit "
+
 // withoutFailedExit drops the recorded exit status from a command, and reports
 // false when that status says the command failed.
+//
+// Only a suffix of that exact shape counts. Looking for the marker anywhere cut
+// `echo "→ exit 0"` down to `echo "` and called it a failure, because the code
+// it read was `0"` — a command that mentions deja's own marker is still just a
+// command (#2048).
 func withoutFailedExit(cmd string) (string, bool) {
-	i := strings.LastIndex(cmd, "→ exit ")
+	i := strings.LastIndex(cmd, exitMarker)
 	if i < 0 {
 		return cmd, true
 	}
-	code := strings.TrimSpace(cmd[i+len("→ exit "):])
+	code := cmd[i+len(exitMarker):]
+	if code == "" {
+		return cmd, true
+	}
+	for _, r := range code {
+		if r < '0' || r > '9' {
+			return cmd, true
+		}
+	}
 	return strings.TrimSpace(cmd[:i]), code == "0"
 }

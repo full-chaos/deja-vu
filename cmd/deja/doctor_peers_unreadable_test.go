@@ -167,13 +167,13 @@ func TestAFileDejaCannotOpenIsReportedToo(t *testing.T) {
 			t.Skipf("cannot drop permissions here: %v", err)
 		}
 		t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
-		// Chmod succeeding is not the same as access being denied: on Windows
-		// it toggles a read-only attribute and the file opens as before, so the
-		// skip above never fired and this asserted a state the platform cannot
-		// reach. Ask the file itself.
+		// Chmod reports success on Windows and leaves the file readable — it
+		// only toggles the read-only attribute — so the case this test is about
+		// never existed there and the assertion failed instead of skipping
+		// (#2081). Ask the filesystem rather than the call.
 		if f, err := os.Open(path); err == nil {
 			_ = f.Close()
-			t.Skip("this platform still reads a file with no permission bits")
+			t.Skip("this platform reads the file anyway, so there is no denial to report")
 		}
 		got := collectDoctorSync(t.TempDir())
 		if got.State != "unreadable" || !strings.Contains(got.Error, "permission denied") {

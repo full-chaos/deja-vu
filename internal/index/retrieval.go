@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -91,9 +92,23 @@ func searchDetailedOnce(dir string, o query.Options) (SearchResult, error) {
 				// token to all indexed tokens containing it (bucket directories only,
 				// no record scan), then intersect.
 				var variants map[string][]string
-				posts, variants, err = intersectSubstringPostingsDetailed(dir, tokens(o.Query))
+				bare, spelledApart := compoundQueryTokens(tokens(o.Query))
+
+				posts, variants, err = intersectSubstringPostingsDetailed(dir, bare)
 				if err != nil {
 					return SearchResult{}, fmt.Errorf("substr postings: %w", err)
+				}
+				// The postings above found the parts; the record check below
+				// counts what the reader typed, and the text does not hold the
+				// compound. Hand it the words spelled apart as this term's
+				// other spelling, which is what the store actually says (#2125).
+				if len(spelledApart) > 0 {
+					if variants == nil {
+						variants = map[string][]string{}
+					}
+					for tok, apart := range spelledApart {
+						variants[tok] = append(variants[tok], apart)
+					}
 				}
 				if len(posts) > 0 {
 					fallbackVariants = variants
@@ -104,7 +119,12 @@ func searchDetailedOnce(dir string, o query.Options) (SearchResult, error) {
 					// enough informative words to rank by relevance, prefer
 					// that ranking and keep the substring hits as the tail.
 					if rel, rerr := relevanceSearch(dir, m, o); rerr == nil && len(rel.Sessions) > 0 {
-						closeSS, serr := scanRecords(dir, m, o, postingOffsets(cutPostingsBySession(posts, m, o)))
+						// With the variants too, for the reason the scan below
+						// takes them: a compound spelled apart is not a
+						// substring of what the store wrote, so this
+						// comparison would call the close tier empty and hand
+						// the answer to relevance (#2125).
+						closeSS, serr := scanRecordsWithVariants(dir, m, o, postingOffsets(cutPostingsBySession(posts, m, o)), variants)
 						agree := false
 						if serr == nil {
 							top := rel.Sessions[0].Harness + ":" + rel.Sessions[0].ID
@@ -183,7 +203,12 @@ func searchDetailedOnce(dir string, o query.Options) (SearchResult, error) {
 	if len(posts) == 0 {
 		return SearchResult{}, nil
 	}
-	ss, err := scanRecords(dir, m, o, postingOffsets(posts))
+	// With the variants the rung above collected, not without them. A
+	// substring variant needs none — the text holding "opencode" holds "code"
+	// too — but a compound spelled apart is not a substring of anything the
+	// store wrote, so the postings found the session and this check dropped it
+	// again (#2125).
+	ss, err := scanRecordsWithVariants(dir, m, o, postingOffsets(posts), fallbackVariants)
 	if err == nil && len(ss) == 0 {
 		if result, ferr := stemSearch(dir, m, o); ferr != nil {
 			return SearchResult{}, fmt.Errorf("stem postings: %w", ferr)
@@ -689,13 +714,28 @@ func projectInScope(project, want string) bool {
 		return false
 	}
 	p, w := strings.ToLower(project), strings.ToLower(want)
+	imported := false
 	if rest, ok := strings.CutPrefix(p, "imported:"); ok {
 		// A synced session carries the peer's prefix and is otherwise the same
 		// project under the same name.
-		p = rest
+		p, imported = rest, true
 	}
 	if p == w {
 		return true
+	}
+	// A candidate with no separator is a bare directory name, and as a suffix
+	// against a LOCAL project it cannot tell two directories apart: working in
+	// /work/api, the candidate "api" matched a client's acme/api and the
+	// session-start hook injected it "from this project" (#2333). Nothing is
+	// lost by insisting on more here — a claude project is recorded as
+	// parent/base and the candidates carry that form, and the stores that
+	// record a bare project name match it exactly on the line above.
+	//
+	// A peer's project keeps the peer's path, which is not this machine's, so
+	// the loose rule stays for imported work: matching it by the name this
+	// machine knows it by is the point of scoping a synced index.
+	if !imported && !strings.ContainsAny(w, `/\`) {
+		return false
 	}
 	// Both separators, because a project name is built from a path and windows
 	// builds it with backslashes. Matching only "/" made every scoped ranking on
@@ -704,6 +744,33 @@ func projectInScope(project, want string) bool {
 	// platform's separator with it.
 	return strings.HasSuffix(p, "/"+w) || strings.HasSuffix(p, `\`+w)
 }
+
+// ProjectInScopeStrict is ProjectInScope without the allowance synced work
+// gets. The loose rule is right for recall — a peer's parent path is not this
+// machine's, so `imported:goprojects/svc` has to answer to a local `svc` — and
+// wrong for a command that packages one session's content for another agent:
+// `deja handoff`, run from a directory named api, picked a teammate's
+// `clients/acme/api` because it was the newest thing ending in /api (#2347).
+func ProjectInScopeStrict(project, want string) bool {
+	if want == "" {
+		return false
+	}
+	p := strings.TrimPrefix(strings.ToLower(project), "imported:")
+	w := strings.ToLower(want)
+	if p == w {
+		return true
+	}
+	if !strings.ContainsAny(w, `/\`) {
+		return false
+	}
+	return strings.HasSuffix(p, "/"+w) || strings.HasSuffix(p, `\`+w)
+}
+
+// ProjectInScope reports whether a session's project is the one a caller is
+// standing in. Exported so the automatic surfaces share one rule: the same
+// question answered three different ways is how a client's project reached a
+// session start (#2333), a handoff (#2336) and a tool-time line (#2339).
+func ProjectInScope(project, want string) bool { return projectInScope(project, want) }
 
 // relevantMetasCounts additionally reports how many terms of ANY frequency
 // each session matched — the noise gate for full-index relevance search,
@@ -1212,6 +1279,46 @@ func displayPath(p string) string {
 	return p
 }
 
+// RecentInProject is RecentProject under the scope rule the automatic paths
+// use: a session belongs to this project or it does not. `deja handoff`, which
+// picks a session for another agent when nobody named one, walked the loose
+// helper and packaged a client's acme/api from a directory named api (#2336) —
+// the shape #2333 closed on the session-start hook.
+func RecentInProject(dir, project string, n int) ([]model.Session, error) {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	unlock, ok, err := tryLockDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		defer unlock()
+	}
+	m, err := readManifestCached(dir)
+	if err != nil {
+		return nil, err
+	}
+	// Scoped before the cut, not after: filtering a window of the loose
+	// helper's answer would drop this project's sessions whenever another
+	// project's newer ones filled it.
+	var metas []SessionMeta
+	for _, meta := range m.Sessions {
+		if projectInScope(meta.Project, project) {
+			metas = append(metas, meta)
+		}
+	}
+	sort.Slice(metas, func(i, j int) bool { return newestFirstMeta(metas[i], metas[j]) })
+	if n > 0 && len(metas) > n {
+		metas = metas[:n]
+	}
+	return sessionsForMetas(dir, metas)
+}
+
+// RecentProject finds sessions whose project name contains the given string —
+// a browsing helper, loose on purpose, the way `--project` is on the surfaces a
+// person types. A caller deciding on its own which sessions belong to the
+// directory it is standing in wants RecentInProject instead (#2336).
 func RecentProject(dir, project string, n int) ([]model.Session, error) {
 	if dir == "" {
 		dir = DefaultDir()
@@ -1374,8 +1481,10 @@ func RecentProjects(dir string, projects []string, perName int) ([]model.Session
 		project = strings.ToLower(project)
 		var mine []SessionMeta
 		for _, meta := range m.Sessions {
-			p := strings.ToLower(meta.Project)
-			if p == project || (project != "" && strings.Contains(p, project)) {
+			// The same scope rule the ranked path uses. A substring test here
+			// put a client's acme/api into a session start in /work/api,
+			// injected under "sessions from this project" (#2333).
+			if projectInScope(meta.Project, project) {
 				mine = append(mine, meta)
 			}
 		}
@@ -1416,6 +1525,13 @@ func FindByPrefix(dir, p string) (model.Session, bool, error) {
 	}
 	if ok {
 		defer unlock()
+	}
+	// Every id has the empty string as a prefix, so a blank selector matched
+	// whichever session came first and the caller handed back a transcript
+	// nobody asked for. The MCP resource reader guards its own (#1728) and the
+	// CLI now guards share and ctx (#2259); doing it here ends the class.
+	if strings.TrimSpace(p) == "" {
+		return model.Session{}, false, nil
 	}
 	m, err := readManifestCached(dir)
 	if err != nil {
@@ -1691,6 +1807,18 @@ func ChildrenOf(dir, id string) ([]model.Session, error) {
 // one without naming the harness, and the id is unique in practice: the
 // harnesses that generate them use uuids or their own prefixed ids.
 func FindByID(dir, id string) (model.Session, bool, error) {
+	return FindByIDPreferProject(dir, id, "")
+}
+
+// FindByIDPreferProject is FindByID for a caller that knows where it is
+// standing. A preference, not a filter: a session outside the project still
+// answers when nothing inside it does.
+// The freshest match is the right guess only while the copies are the same
+// conversation; two projects can hold a session with one id, and then the
+// freshest is whichever was touched last, which has nothing to do with the one
+// asking (#1999). A project that names one of them settles it, and the rest of
+// the rule is unchanged.
+func FindByIDPreferProject(dir, id, project string) (model.Session, bool, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
@@ -1710,18 +1838,74 @@ func FindByID(dir, id string) (model.Session, bool, error) {
 	}
 	var best SessionMeta
 	var found bool
+	bestNear := -1
 	for _, meta := range m.Sessions {
 		if meta.ID != id {
 			continue
 		}
-		if !found || betterIDMatch(meta, best) {
-			best, found = meta, true
+		near := -1
+		if project != "" {
+			near = projectDistance(meta.Project, project)
+		}
+		switch {
+		case !found, nearerProject(near, bestNear):
+			best, found, bestNear = meta, true, near
+		case near == bestNear && betterIDMatch(meta, best):
+			best = meta
 		}
 	}
 	if !found {
 		return model.Session{}, false, nil
 	}
 	return loadSessionMeta(dir, m, best)
+}
+
+// projectDistance measures a session's project against the directory the caller
+// is standing in. A project is recorded as the directory's own name, sometimes
+// with its parent — "app" or "w/app" — so the caller's path is matched by its
+// last segments rather than whole.
+//
+// And by its ancestors' too: a session started in a subdirectory is re-projected
+// onto the repository root once it has touched enough files under it
+// (projectFromPaths), so the recorded name can be two segments the cwd only
+// reaches by walking up. Bare names match at the leaf alone, where the caller
+// actually is — an ancestor matching by base would make every worktree named
+// "wt" the same project.
+//
+// It answers with how far up the match was found — 0 where the caller stands —
+// so a session recorded against this very directory outranks one recorded
+// against a directory three levels above it. Without that, an agent someone ran
+// from their home directory could outrank the project's own session by being
+// the fresher of the two.
+func projectDistance(recorded, cwd string) int {
+	if recorded == "" || cwd == "" {
+		return -1
+	}
+	cwd = path.Clean(filepath.ToSlash(cwd))
+	if strings.EqualFold(recorded, path.Base(cwd)) {
+		return 0
+	}
+	for dir, up := cwd, 0; ; dir, up = path.Dir(dir), up+1 {
+		parent, base := path.Base(path.Dir(dir)), path.Base(dir)
+		if parent == "." || parent == "/" || base == "." || base == "/" {
+			return -1
+		}
+		if strings.EqualFold(recorded, parent+"/"+base) {
+			return up
+		}
+	}
+}
+
+func sameProject(recorded, cwd string) bool { return projectDistance(recorded, cwd) >= 0 }
+
+// nearerProject reports whether a match this far from the caller beats the one
+// already held. A match at any distance beats none; among matches the nearer
+// wins, and equals fall through to betterIDMatch.
+func nearerProject(near, held int) bool {
+	if near < 0 {
+		return false
+	}
+	return held < 0 || near < held
 }
 
 // betterIDMatch picks between two sessions carrying the same id (#1997). The
@@ -2171,6 +2355,44 @@ func intersectSubstringPostings(dir string, bare []string) ([]posting, error) {
 	return posts, err
 }
 
+// compoundQueryTokens spells a compound query token as its parts, and says how
+// the words read spelled apart.
+//
+// The index already splits what it stores — indexKeys adds identifierParts,
+// which is why `retry backoff` reaches a session that wrote `retry-backoff`.
+// The other direction had nothing: a store that says "blowing up" was
+// unreachable from `blowing-up`, because this rung expands a query token to
+// indexed tokens *containing* it ("code" finds "opencode") and no indexed token
+// contains a compound the store never wrote (#2125).
+//
+// The parts replace the compound rather than joining it: the list is
+// intersected, so a token that expands to nothing empties the result. A query
+// naming a compound the store really holds never arrives here — the exact tier
+// answered it — so the replacement costs nothing that works.
+func compoundQueryTokens(toks []string) ([]string, map[string]string) {
+	out := make([]string, 0, len(toks))
+	apart := map[string]string{}
+	for _, tok := range toks {
+		if !strings.ContainsAny(tok, "-_") {
+			out = append(out, tok)
+			continue
+		}
+		var parts []string
+		for _, part := range strings.FieldsFunc(tok, func(r rune) bool { return r == '-' || r == '_' }) {
+			if len(part) >= 2 {
+				parts = append(parts, part)
+			}
+		}
+		if len(parts) < 2 {
+			out = append(out, tok)
+			continue
+		}
+		out = append(out, parts...)
+		apart[tok] = strings.Join(parts, " ")
+	}
+	return out, apart
+}
+
 func intersectSubstringPostingsDetailed(dir string, bare []string) ([]posting, map[string][]string, error) {
 	if len(bare) == 0 {
 		return nil, nil, nil
@@ -2348,9 +2570,16 @@ func stemPostings(dir string, terms, phrases []string) ([]posting, map[string][]
 		return nil, nil, err
 	}
 	matchesPer := make([][]string, len(terms))
-	anchored := 0
 	for i, term := range terms {
 		matchesPer[i] = stemMatches(term, catalog)
+	}
+	// Whatever the catalog has no whole word for gets one pass looking for the
+	// word inside a token that glued it to something else. One pass for all of
+	// them: the catalog is ~200k tokens on a real store, which is the walk the
+	// fuzzy tier goes out of its way not to do per term.
+	fillGluedMatches(terms, matchesPer, catalog)
+	anchored := 0
+	for i := range terms {
 		if len(matchesPer[i]) > 0 {
 			anchored++
 		}
@@ -2443,6 +2672,77 @@ func hasStemToken(terms []string) bool {
 		}
 	}
 	return false
+}
+
+// fillGluedMatches finds a term's other forms inside tokens that glued the
+// word to something else: "k8sнастройки" holds "настройки" and is one token,
+// so nothing splits it and stemMatches, which asks the catalog for whole
+// words, comes back empty. The reader then has to type the case the transcript
+// used, in the one place deja normally spares them that (#2145).
+//
+// Only when the whole-word lookup found nothing, only at the ends of the
+// token, only for forms of four runes or more, and only for Cyrillic terms.
+// That last one is the point rather than caution: Russian is where a word has
+// a dozen endings and the reader cannot be expected to guess which one the
+// transcript used, while in Latin the same rule reaches "latest" from "tests"
+// and "preserve" from "press". English compounds have their own road — the
+// indexer splits them into parts — and this one would only add coincidences.
+func fillGluedMatches(terms []string, matchesPer [][]string, catalog map[string]bool) {
+	formsPer := make([][]string, len(terms))
+	want := false
+	for i, term := range terms {
+		if len(matchesPer[i]) > 0 || len([]rune(term)) < 5 || !isCyrToken(term) {
+			continue
+		}
+		for _, f := range append(stemMatchForms(term), term) {
+			// Four runes is the floor: a shorter fragment at the end of a long
+			// token is a coincidence more often than a word.
+			if len([]rune(f)) >= 4 {
+				formsPer[i] = append(formsPer[i], f)
+				want = true
+			}
+		}
+	}
+	if !want {
+		return
+	}
+	found := make([]map[string]bool, len(terms))
+	for tok := range catalog {
+		for i, forms := range formsPer {
+			for _, f := range forms {
+				// The token has to be the word plus something, and the
+				// something is what makes this rung necessary — so the length
+				// is measured against the form, not against the term, which is
+				// the longer of the two when the query is in a case with a long
+				// ending. Runes on both sides: a byte comparison would admit a
+				// token one byte longer, which in Cyrillic is no character at
+				// all.
+				if len([]rune(tok)) <= len([]rune(f)) ||
+					(!strings.HasPrefix(tok, f) && !strings.HasSuffix(tok, f)) {
+					continue
+				}
+				if found[i] == nil {
+					found[i] = map[string]bool{}
+				}
+				found[i][tok] = true
+				break
+			}
+		}
+	}
+	for i, set := range found {
+		if len(set) == 0 {
+			continue
+		}
+		out := make([]string, 0, len(set))
+		for tok := range set {
+			out = append(out, tok)
+		}
+		sort.Strings(out)
+		if len(out) > 8 {
+			out = out[:8]
+		}
+		matchesPer[i] = out
+	}
 }
 
 func stemMatches(term string, catalog map[string]bool) []string {
@@ -2682,6 +2982,10 @@ func oneSuffixStep(word string) []string {
 		// full of "retries" (#1079).
 		add(strings.TrimSuffix(word, "ies") + "y")
 		add(strings.TrimSuffix(word, "es"))
+		// And the plain "s", for the reason the "es" case below takes it:
+		// "movies" is neither "movy" nor "movi", and nothing further down
+		// strips it again (#2137).
+		add(strings.TrimSuffix(word, "s"))
 	case strings.HasSuffix(word, "ied"):
 		add(strings.TrimSuffix(word, "ied") + "y")
 	case strings.HasSuffix(word, "ed"):
@@ -2693,7 +2997,15 @@ func oneSuffixStep(word string) []string {
 		add(base)
 		add(base + "e")
 	case strings.HasSuffix(word, "es"):
+		// Both strips, because the switch stops here and the plain "s" case
+		// below never runs for these words: "boxes" needs the "es" gone and
+		// "pipelines" needs only the "s", and a plural of every noun ending in
+		// "e" reached the stub "pipelin" and no further. Whichever form the
+		// store does not hold falls out at the catalog, which every lookup
+		// goes through; the relevance keys take the forms unfiltered, and there
+		// the extra one is the real singular (#2137).
 		add(strings.TrimSuffix(word, "es"))
+		add(strings.TrimSuffix(word, "s"))
 	case strings.HasSuffix(word, "s"):
 		add(strings.TrimSuffix(word, "s"))
 	}

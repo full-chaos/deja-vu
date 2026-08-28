@@ -84,6 +84,19 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	if err := denyPolicyHidden(prefix, s, os.Stderr); err != nil {
 		return err
 	}
+	// The exclude list is a privacy control that only runs at ingest, so an
+	// index built before the pattern still holds the session — share refuses
+	// it for that reason (#1307). promote copied the session's opening line
+	// into deja's own store and reported that the note now outranks the
+	// transcript in recall, while every reading surface filters that note out
+	// again for the same project (#2278).
+	// Correcting a note that already exists is exempt: it copies nothing new
+	// out of the excluded project, and taking a mark back on work you have
+	// since excluded is exactly the cleanup someone would want. The note stays
+	// invisible either way, and `deja forget --session deja-note-…` removes it.
+	if s.Harness != "deja" && sources.ExcludedProject(s.Project) {
+		return fmt.Errorf("%s is in a project your exclude list covers — a note promoted from it is filtered out of recall too; `deja index --rebuild` drops the session, or remove the pattern to promote it", prefix)
+	}
 	src := s.Harness + ":" + s.ID
 	if s.Harness == "deja" {
 		// A correction on a promoted note is what `promote` tells you to write,
@@ -141,7 +154,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 			// The note is already written by this point, so failing with a bare
 			// syscall told the reader their decision was lost when it was not
 			// — and named a path with nothing to do about it (#871).
-			fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, title)
+			fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, search.SafeNote(title))
 			return fmt.Errorf("the note is kept, but %s could not be written (%s) — export it somewhere you can, or read the note back with `deja show %s`",
 				exportPath, exportFailureReason(err), "deja-note-"+strings.ReplaceAll(src, ":", "-"))
 		}
@@ -151,7 +164,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		// rewritten — the warning is what was missing (#848).
 		fmt.Fprintf(os.Stderr, "deja: %d secret%s masked in this file. pattern redaction is a floor — review before sending; rotate anything that leaked.\n", masked, pluralS(masked))
 	}
-	fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, title)
+	fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, search.SafeNote(title))
 	if line := markTakenBack(src, state, prior); line != "" {
 		fmt.Fprintln(stdout, line)
 	}
@@ -179,7 +192,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	if exportPath != "" {
 		// The path is whatever the caller passed. A newline in it ends this
 		// line and starts one of the caller's that reads as deja's own output.
-		fmt.Fprintf(stdout, "exported to %s\n", search.SafeLine(exportPath))
+		fmt.Fprintf(stdout, "exported to %s\n", search.SafePath(exportPath))
 	}
 	// The id deja resolved, not the one the reader typed: a prefix that stood
 	// for several sessions would send the correction to whichever is newest —
@@ -288,12 +301,38 @@ func firstLine(s string) string {
 // how many secrets the redaction pass replaced on the way out — the same floor
 // `share` and `sync export` print, on the path that had none (#848).
 func exportPromoted(path, title, text, src, state string, updated time.Time) (int, error) {
-	body, counts := redact.Text(title + "\n" + text)
-	masked := strings.Count(body, redact.Marker)
-	for _, n := range counts {
-		masked += n
+	// Separately, not packed and cut apart on the first newline: a title can
+	// hold one — a note's is exempt from the bound every other title gets, and
+	// the notes file is the one store a person writes by hand — and its tail
+	// then arrived at the head of the body, beside deja's own "- state:" and
+	// "- source:" lines (#2056).
+	//
+	// The body still sees the title's last line, because a credential can be
+	// written with its key word at the end of one field and its value at the
+	// start of the next, and the patterns for those allow a newline between the
+	// two. That line is one line by construction, so the split below is exact
+	// however many the title has.
+	title, _ = redact.Text(title)
+	context := title
+	if i := strings.LastIndex(context, "\n"); i >= 0 {
+		context = context[i+1:]
 	}
-	title, text, _ = strings.Cut(body, "\n")
+	withContext, _ := redact.Text(context + "\n" + text)
+	if head, rest, ok := strings.Cut(withContext, "\n"); ok && head == context {
+		text = rest
+	} else {
+		// The pass swallowed the boundary — a private key spans it, and its
+		// marker replaces the newline too. Keeping the joined text loses
+		// nothing: by then the context line is inside the marker.
+		text = withContext
+	}
+	// The masked spots in what is about to be written, and nothing else: a
+	// secret redacted at ingest is already a marker here, and one this pass
+	// replaces became one too. Adding the pass's own tally on top counted the
+	// second kind twice (#2061). deja view counts the same way.
+	masked := strings.Count(title, redact.Marker) + strings.Count(text, redact.Marker)
+	// One line, because it is written as a heading.
+	title = strings.Join(strings.Fields(title), " ")
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
 		return 0, err

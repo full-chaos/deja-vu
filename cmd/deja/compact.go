@@ -38,11 +38,14 @@ const (
 
 // compactEvidence describes what a session did before it was compacted, or ""
 // when the session is not in the index yet or recorded nothing worth saying.
-func compactEvidence(dir, sessionID string) string {
+func compactEvidence(dir, sessionID, cwd string) string {
 	if sessionID == "" {
 		return ""
 	}
-	s, ok, err := index.FindByID(dir, sessionID)
+	// The payload names no harness, so the id is all there is to go on — and two
+	// projects can hold one id. The cwd it does carry is what keeps this block
+	// about the session that is compacting (#1999).
+	s, ok, err := index.FindByIDPreferProject(dir, sessionID, cwd)
 	if err != nil || !ok {
 		return ""
 	}
@@ -51,7 +54,7 @@ func compactEvidence(dir, sessionID string) string {
 	// wrote into the payload, escape bytes included (#2000).
 	files := lastDistinct(s.Messages, "files", compactEvidenceFiles,
 		func(text string) []string { return strings.Split(text, "\n") },
-		func(p string) string { return search.SafeLine(trimPath(p)) })
+		func(p string) string { return search.SafePath(trimPath(p)) })
 	commands := lastDistinct(s.Messages, "command", compactEvidenceCommands,
 		func(text string) []string {
 			// A multi-line command is a heredoc or a pasted script. Truncated to

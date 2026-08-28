@@ -236,6 +236,9 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 			// folding — measuring the unfolded pair there finds nothing and reports a
 			// genuine match as words that never meet.
 			windowText, windowToks := low, qtoks
+			// The pair the scorer counts on, folded below when that is where
+			// the match came from.
+			scoreLow, scoreToks := low, qtoks
 			if re != nil {
 				c = countRegex(re, text)
 			} else {
@@ -251,6 +254,17 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 						phrasesFolded, o.FuzzyVariants)
 					if c > 0 {
 						windowText, windowToks = foldedLow, qtoksFolded
+						// And the pair the scorer counts on. Leaving it
+						// unfolded gave BM25 a term frequency of zero for a
+						// match the postings had already found, so a
+						// cross-script hit counted twice and scored nothing —
+						// ranked below a record that matched once (#1605).
+						// Only when the two token lists line up: termCount is
+						// indexed by position, and a fold that merged or split
+						// a token would count against the wrong term.
+						if len(qtoksFolded) == len(qtoks) {
+							scoreLow, scoreToks = foldedLow, qtoksFolded
+						}
 					}
 				}
 			}
@@ -269,22 +283,19 @@ func runScored(ss []model.Session, o Options) ([]Hit, error) {
 					doc.minWindow = w
 				}
 			}
-			// Count the document over the same pair the match was found on.
-			// A cross-script hit is counted above through the fold and then
-			// scored here against the surface text, where the query's words
-			// appear nowhere: term frequency stays zero, BM25 scores zero, and
-			// a record that matched twice ranks below one that matched once
-			// (#1605). windowText and windowToks already carry whichever pair
-			// answered, so scoring follows the same rule proximity does.
-			doc.length += countDocumentWords(windowText, windowToks, o.FuzzyVariants, doc.termCount, doc.userCount, m.Role == "user")
+			// Counted over the pair the match was found on: a cross-script hit
+			// is counted above through the fold and, scored against the surface
+			// text where the query's words appear nowhere, would take a term
+			// frequency of zero and rank below a record that matched once.
+			doc.length += countDocumentWords(scoreLow, scoreToks, o.FuzzyVariants, doc.termCount, doc.userCount, m.Role == "user")
 			// The token, not the raw query — the same rule as countIn. This
 			// path is what scores `retry` inside `retry-backoff`, which
 			// countDocumentWords cannot match because it counts whole words
 			// and treats the hyphen as one. Comparing the raw query here left
 			// a punctuated query with a session that matched three times and
 			// scored zero, ranked below one that matched once (#1603).
-			if len(windowToks) == 1 && doc.termCount[0] == 0 && strings.Contains(windowText, windowToks[0]) {
-				n := strings.Count(windowText, windowToks[0])
+			if len(scoreToks) == 1 && doc.termCount[0] == 0 && strings.Contains(scoreLow, scoreToks[0]) {
+				n := strings.Count(scoreLow, scoreToks[0])
 				doc.termCount[0] += n
 				if m.Role == "user" {
 					doc.userCount[0] += n
@@ -551,7 +562,10 @@ func scoreBM25(documents []bm25Document, df []int, corpusDocuments int, avgLengt
 		}
 		score *= proximityBoost(doc.minWindow, queryTokenCount)
 		score *= titleBoost(doc.titleHits, queryTokenCount)
-		if n := worn[doc.hit.Session.ID]; n > 0 {
+		// By the id as a log holds it: the counts come from .usage.jsonl, and
+		// a byte that is not valid UTF-8 is U+FFFD there and itself here, so
+		// the two never met (#2199).
+		if n := worn[model.LoggedID(doc.hit.Session.ID)]; n > 0 {
 			doc.hit.Reused = n
 			score *= wornBoost(n)
 		}
@@ -2230,12 +2244,91 @@ func SafeNote(s string) string {
 	return clip(SafeLine(s))
 }
 
+// noteStateCap bounds the bracketed tail SafeNoteTitle will carry past the
+// clip. The longest state deja writes is " [superseded]" at 13 bytes; the room
+// above that is for one deja does not know yet, from a store written by hand.
+const noteStateCap = 24
+
+// SafeNoteTitle is SafeNote for a promoted note's title, which ends in the state
+// the note is in — "… [rejected]" — and that suffix is the part every one-line
+// surface reads it for. Clipping from the left would drop exactly it (#R11), so
+// the middle gives way instead.
+func SafeNoteTitle(s string) string {
+	line := SafeLine(s)
+	state := ""
+	// Only a short tail: the suffix is a state word, and exempting whatever
+	// follows the last " [" would let a long bracketed tail carry the whole
+	// title past the bound the clip is here to apply (#1645).
+	if i := strings.LastIndex(line, " ["); i > 0 && strings.HasSuffix(line, "]") && len(line)-i <= noteStateCap {
+		state, line = line[i:], line[:i]
+	}
+	return clip(line) + state
+}
+
 // SafeLine is SafeText confined to a single line, for the places that print
 // an untrusted string as one row of something structured — a listing entry, a
 // digest row, a "saved <path>" confirmation. A newline there ends deja's own
 // line and starts a line of the caller's, which reads as deja's own output.
 func SafeLine(s string) string {
 	return strings.Join(strings.Fields(SafeText(s)), " ")
+}
+
+// SafePath is SafeLine for a path, which is an identifier rather than prose: it
+// strips what a terminal would obey and keeps the result on one line, but the
+// spaces inside a name are part of the name. Collapsing them made blame print
+// "/tmp/app/two spaces.go" for a file with two, and restoring that printed path
+// found nothing (#2044).
+func SafePath(s string) string { return safeVerbatim(s, clipPath) }
+
+// SafeCommand is the same treatment for a command, which is the other thing on
+// these screens that a person copies and runs rather than reads. `deja how`
+// printed `-run "Pool Size"` for a command that ran `-run "Pool  Size"`, which
+// is a different test filter (#2052).
+//
+// Clipped from the other end than a path: a path is recognised by its tail, a
+// command by the program it runs.
+func SafeCommand(s string) string { return safeVerbatim(s, clipCommand) }
+
+// safeVerbatim keeps what was recorded, minus what a terminal would obey and
+// minus the line breaks that would let one row become two.
+func safeVerbatim(s string, clip func(string) string) string {
+	if s == "" {
+		return ""
+	}
+	// SafeText leaves only newline and tab standing, and both have to go: this
+	// is one row of something structured. One space each rather than a run
+	// collapsed, which is the whole point.
+	cleaned := strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, SafeText(s))
+	return clip(strings.Trim(cleaned, " "))
+}
+
+// pathCap bounds a printed path. Long enough for any real one, short enough
+// that a transcript-supplied string cannot fill a terminal or an MCP payload.
+const pathCap = 300
+
+// clipCommand bounds a command from the right: what identifies a command is the
+// program it runs, so the head is the part a reader cannot give up.
+func clipCommand(s string) string {
+	r := []rune(s)
+	if len(r) <= pathCap {
+		return s
+	}
+	return string(r[:pathCap-1]) + "…"
+}
+
+// clipPath bounds a path from the left: a path is recognised by its tail, and
+// the head is what a reader gives up first.
+func clipPath(s string) string {
+	r := []rune(s)
+	if len(r) <= pathCap {
+		return s
+	}
+	return "…" + string(r[len(r)-pathCap+1:])
 }
 
 func unsafeForTerminal(r rune) bool {

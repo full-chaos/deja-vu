@@ -1,14 +1,38 @@
 package model
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Message struct {
 	Role string    `json:"role"`
 	Text string    `json:"text"`
 	Time time.Time `json:"time"`
+}
+
+// MarshalJSON leaves the time out of a message the transcript never stamped.
+//
+// The zero time marshals as "0001-01-01T00:00:00Z", which reads as a date
+// rather than as the absence of one: a consumer sorting by it puts the message
+// before everything that ever happened, and one bucketing by month gets a
+// bucket in the year one. Every surface deja prints already refuses it — the
+// listing shows "-" because "0001-01-01 reads as corrupted data rather than as
+// a missing field" (#765) — and this is the surface a machine reads (#2113).
+func (m Message) MarshalJSON() ([]byte, error) {
+	// The alias sheds the method, so this does not call itself; the outer Time
+	// shadows the embedded one, which is how a field is dropped without
+	// restating the rest of the shape.
+	type message Message
+	if m.Time.IsZero() {
+		return json.Marshal(struct {
+			message
+			Time *time.Time `json:"time,omitempty"`
+		}{message(m), nil})
+	}
+	return json.Marshal(message(m))
 }
 
 type Session struct {
@@ -94,4 +118,33 @@ func (s *Session) Touch(t time.Time) {
 	if s.Updated.IsZero() || t.After(s.Updated) {
 		s.Updated = t
 	}
+}
+
+// LoggedID is a session id as a JSON log holds it. encoding/json replaces every
+// byte that is not valid UTF-8 with U+FFFD, so an id carrying one — a project
+// directory named with a stray byte, which ext4 allows — comes back from the
+// usage log as a different string and matched no session in the index (#2199).
+// Anything comparing an id against one that has been through JSON has to
+// compare the same form.
+//
+// Byte for byte what the encoder does, rather than strings.ToValidUTF8, which
+// collapses a run of bad bytes into one replacement where the encoder writes
+// one per byte.
+func LoggedID(id string) string {
+	if utf8.ValidString(id) {
+		return id
+	}
+	var b strings.Builder
+	b.Grow(len(id))
+	for i := 0; i < len(id); {
+		r, size := utf8.DecodeRuneInString(id[i:])
+		if r == utf8.RuneError && size == 1 {
+			b.WriteRune(utf8.RuneError)
+			i++
+			continue
+		}
+		b.WriteString(id[i : i+size])
+		i += size
+	}
+	return b.String()
 }

@@ -93,14 +93,55 @@ func parseTimeAny(v any) time.Time {
 	return time.Time{}
 }
 
+// newerThanEpoch is the SQL for "this numeric stamp is after t", for a column
+// deja reads through unixGuess and so accepts in either unit.
+//
+// A since clause that picks one unit is wrong in one direction or the other: a
+// seconds row is below every millisecond watermark, so the store is read once
+// and then never updated again with nothing printed (#2064); a millisecond row
+// is above every seconds watermark, so the store comes back whole on every
+// pass. Comparing against both unconditionally is the second of those. The
+// split is unixGuess's own, applied to the row rather than to the watermark.
+func newerThanEpoch(expr string, t time.Time) string {
+	// Milliseconds and seconds are the two units a store writes and then
+	// filters on; a microsecond or nanosecond row is a larger number than any
+	// millisecond watermark, so it passes the first test and comes back. Over-
+	// inclusion is the safe direction here — the reader decides the date.
+	return fmt.Sprintf("(%[1]s > %[2]d or (%[1]s < %[4]d and %[1]s > %[3]d))",
+		expr, t.UnixMilli(), t.Unix(), epochMilliCutoff)
+}
+
+// The magnitudes that tell one unit from another. A moment in the 2020s is
+// about 1.7e9 seconds, 1.7e12 milliseconds, 1.7e15 microseconds and 1.7e18
+// nanoseconds, so each band holds every real stamp of its unit with three
+// decades of room either side.
+//
+// Reading anything above milliseconds AS milliseconds is what this replaces: a
+// microsecond store came back dated to the year 58136 and a nanosecond one to
+// the year 56 million, and a session dated in the future takes the top of every
+// recency surface and keeps it (#2063, #2102).
+const (
+	epochMilliCutoff = int64(1e11)
+	epochMicroCutoff = int64(1e14)
+	epochNanoCutoff  = int64(1e17)
+)
+
+// unixGuess reads a numeric stamp in whichever unit it was written in. It is
+// the front door for every store that writes a number rather than a date, so a
+// unit it cannot place is a whole harness misdated.
 func unixGuess(n int64) time.Time {
-	if n > 1e12 {
-		return time.UnixMilli(n)
-	}
-	if n > 0 {
+	switch {
+	case n <= 0:
+		return time.Time{}
+	case n < epochMilliCutoff:
 		return time.Unix(n, 0)
+	case n < epochMicroCutoff:
+		return time.UnixMilli(n)
+	case n < epochNanoCutoff:
+		return time.UnixMicro(n)
+	default:
+		return time.Unix(0, n)
 	}
-	return time.Time{}
 }
 
 // textFromContentKind is textFromContent plus the attribution question: did
@@ -476,7 +517,11 @@ func toolPathsIn(v any, d toolDialect) string {
 			continue
 		}
 		for _, p := range toolPathStrings(in, d) {
-			if seen[p] {
+			// The record is one path per line and the index splits it back on
+			// the newline, so a path carrying one arrives as two files the
+			// session never touched — which reaches the files listing, blame,
+			// and the project a session is filed under (#2042).
+			if seen[p] || strings.ContainsAny(p, "\n\r") {
 				continue
 			}
 			seen[p] = true
@@ -533,6 +578,14 @@ func editSpansIn(v any, d toolDialect) []string {
 		}
 		path, _ := in[d.pathKey].(string)
 		if path == "" {
+			continue
+		}
+		// The record is "path\nspan" and restore splits it on the first
+		// newline, so a path carrying one puts the rest of itself at the head
+		// of the span — handed back as the exact bytes that stopped existing
+		// (#2042). The format cannot hold such a path, so the span is not
+		// recorded rather than recorded wrong.
+		if strings.ContainsAny(path, "\n\r") {
 			continue
 		}
 		old, _ := in[d.oldSpanKey()].(string)
@@ -640,4 +693,15 @@ func truncateRunes(s string, n int) string {
 		n--
 	}
 	return s[:n]
+}
+
+// millisecondBackoff formats a watermark for a clause that compares through
+// strftime's %f. That is milliseconds, and the readers parse nanoseconds, so a
+// message inside the watermark's own millisecond compares as not after it — and
+// the two sides disagree about which millisecond a stamp is in at all, because
+// Go truncates here where strftime rounds. Backing the watermark off by a
+// millisecond puts the error on the side that costs a message being offered
+// twice rather than the side that skips it for good (#2155).
+func millisecondBackoff(t time.Time) string {
+	return t.UTC().Add(-time.Millisecond).Format("2006-01-02T15:04:05.000")
 }

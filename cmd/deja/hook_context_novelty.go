@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-
 	"github.com/vshulcz/deja-vu/internal/digest"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/usage"
@@ -17,12 +15,11 @@ import (
 // sharing one cooldown let the start use up the prompt's: a session shown as
 // context could no longer be served as an answer, which took two existing
 // tests red for the right reason.
-func hookProjectKey() string {
-	cwd := os.Getenv("CLAUDE_PROJECT_DIR")
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
-	cands := digest.ProjectNameCandidates(cwd)
+// The project comes from the payload rather than from the environment: deja
+// exports its own once per process, so a second payload in that process would
+// be keyed to the first one's project (#2182).
+func hookProjectKey(fromPayload string) string {
+	cands := digest.ProjectNameCandidates(hookCWD(fromPayload))
 	if len(cands) == 0 {
 		return ""
 	}

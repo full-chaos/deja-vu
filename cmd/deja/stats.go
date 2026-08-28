@@ -108,7 +108,7 @@ func runStats(dir string, args []string) error {
 	if (jsonOut && card) || (jsonOut && html) || (card && html) {
 		return fmt.Errorf("stats: choose one output")
 	}
-	if err := checkHarness(options.Harness); err != nil {
+	if err := checkHarness(&options.Harness); err != nil {
 		return fmt.Errorf("stats: %w", err)
 	}
 	if err := checkRole(options.Role); err != nil {
@@ -185,7 +185,7 @@ func runStats(dir string, args []string) error {
 			return err
 		}
 		base := filepath.Base(path)
-		fmt.Fprintf(os.Stdout, "saved %s\n\nshare it — paste into a README or post:\n  ![deja](%s)\n", search.SafeLine(path), search.SafeLine(base))
+		fmt.Fprintf(os.Stdout, "saved %s\n\nshare it — paste into a README or post:\n  ![deja](%s)\n", search.SafePath(path), search.SafePath(base))
 		return nil
 	}
 	if htmlPath != "" {
@@ -193,7 +193,7 @@ func runStats(dir string, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stdout, search.SafeLine(path))
+		fmt.Fprintln(os.Stdout, search.SafePath(path))
 		return nil
 	}
 	if jsonOut {
@@ -316,7 +316,7 @@ func printStats(w io.Writer, r stats.Report) {
 		}
 	}
 	for _, p := range r.TopProjects {
-		fmt.Fprintf(w, "  %-18s %s %d\n", stats.TrimRunes(p.Project, 18), strings.Repeat(barGlyph, stats.ScaledBar(p.Sessions, maxProject, 18)), p.Sessions)
+		fmt.Fprintf(w, "  %-18s %s %d\n", stats.TrimRunes(search.SafeLine(p.Project), 18), strings.Repeat(barGlyph, stats.ScaledBar(p.Sessions, maxProject, 18)), p.Sessions)
 	}
 	fmt.Fprintln(w)
 
@@ -342,7 +342,7 @@ func printStats(w io.Writer, r stats.Report) {
 	fmt.Fprintln(w)
 
 	fmt.Fprintf(w, "%sHighlights%s\n", bold, reset)
-	fmt.Fprintf(w, "  Longest session  %d message%s · %s · %s\n", r.Longest.Messages, pluralS(r.Longest.Messages), statHarnessTag(r.Longest.Harness, color), valueOrDash(r.Longest.Title))
+	fmt.Fprintf(w, "  Longest session  %d message%s · %s · %s\n", r.Longest.Messages, pluralS(r.Longest.Messages), statHarnessTag(r.Longest.Harness, color), valueOrDash(search.SafeNoteTitle(r.Longest.Title)))
 	fmt.Fprintf(w, "  Busiest day      %s · %d message%s\n", valueOrDash(r.BusiestDay.Date), r.BusiestDay.Messages, pluralS(r.BusiestDay.Messages))
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "%sRecall%s\n", bold, reset)

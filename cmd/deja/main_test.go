@@ -629,7 +629,7 @@ func TestStemmedOutputIsDeterministic(t *testing.T) {
 func TestPrintNoMatchesReportsTheStoreSize(t *testing.T) {
 	dir := seedBriefIndex(t)
 	var b bytes.Buffer
-	printNoMatches(&b, dir, "jwt refresh token")
+	printNoMatches(&b, dir, "jwt refresh token", false)
 	out := b.String()
 	if strings.Contains(out, "in 0 indexed session") {
 		t.Fatalf("printed the corruption signature for a healthy index: %q", out)
@@ -639,14 +639,14 @@ func TestPrintNoMatchesReportsTheStoreSize(t *testing.T) {
 	}
 	// No index at all: say nothing rather than a wrong number.
 	var b2 bytes.Buffer
-	printNoMatches(&b2, filepath.Join(t.TempDir(), "gone"), "q")
+	printNoMatches(&b2, filepath.Join(t.TempDir(), "gone"), "q", false)
 	if strings.Contains(b2.String(), "indexed session") {
 		t.Fatalf("invented a count with no index: %q", b2.String())
 	}
 }
 
 func TestActiveFiltersNamesWhatEmptiedTheResult(t *testing.T) {
-	if got := activeFilters(search.Options{}, ""); got != "" {
+	if got := activeFilters(search.Options{}, "", ""); got != "" {
 		t.Fatalf("no filters set, got %q", got)
 	}
 	// Each filter alone, so none of them can be deleted unnoticed.
@@ -659,11 +659,11 @@ func TestActiveFiltersNamesWhatEmptiedTheResult(t *testing.T) {
 		{search.Options{Role: "command"}, `role "command"`},
 		{search.Options{Since: 24 * time.Hour}, "since 24h0m0s"},
 	} {
-		if got := activeFilters(c.o, ""); got != c.want {
+		if got := activeFilters(c.o, "", ""); got != c.want {
 			t.Errorf("got %q, want %q", got, c.want)
 		}
 	}
-	got := activeFilters(search.Options{Harness: "codex", Project: "api", Role: "command", Since: 24 * time.Hour}, "7d")
+	got := activeFilters(search.Options{Harness: "codex", Project: "api", Role: "command", Since: 24 * time.Hour}, "7d", "")
 	for _, want := range []string{`harness "codex"`, `project "api"`, `role "command"`, "since 7d", " and "} {
 		if !strings.Contains(got, want) {
 			t.Errorf("%q missing from %q", want, got)
@@ -678,7 +678,7 @@ func TestActiveFiltersNamesWhatEmptiedTheResult(t *testing.T) {
 	// from the command line. It stays here because filterRecentSources applies
 	// no time filter for one, and naming it would report a filter that never
 	// ran and suppress the empty-store advice.
-	if got := activeFilters(search.Options{Since: -time.Hour}, "-1h"); got != "" {
+	if got := activeFilters(search.Options{Since: -time.Hour}, "-1h", ""); got != "" {
 		t.Errorf("named a filter that was never applied: %q", got)
 	}
 }
@@ -1300,7 +1300,7 @@ func TestSessionCountCountsSessionsNotFiles(t *testing.T) {
 		t.Fatalf("SessionCount = %d, want the 2 sessions across 4 scanned files", n)
 	}
 	var b bytes.Buffer
-	printNoMatches(&b, dir, "nothing")
+	printNoMatches(&b, dir, "nothing", false)
 	if !strings.Contains(b.String(), "in 2 indexed sessions") {
 		t.Fatalf("message = %q", b.String())
 	}

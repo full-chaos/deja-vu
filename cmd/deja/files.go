@@ -89,7 +89,13 @@ func runFiles(dir string, args []string, stdout io.Writer) error {
 	if err := index.EnsureForSearch(dir, o, false, os.Stderr); err != nil {
 		return ensureError(dir, err)
 	}
-	hits, err := index.Search(dir, o)
+	// The recovering door, like every other surface: a reader that lands
+	// between another pass's append and its manifest write reads a store that
+	// does not add up, and this printed "search: corrupt index: records.bin
+	// size does not match the manifest (crash-truncated or uncommitted tail)"
+	// — a command that lists files telling a person their store is truncated
+	// while an ordinary `deja index` ran in another terminal (#2176).
+	hits, err := index.SearchWithRecovery(dir, o, os.Stderr)
 	if err != nil {
 		return fmt.Errorf("search: %w", err)
 	}
@@ -413,13 +419,13 @@ var repoCheck sync.Map
 // filesRowPath is what one row shows: the head removed, what the terminal acts
 // on removed, and the rest bounded to the column.
 //
-// SafeLine comes before the bound, not after. A file name can hold an escape
+// SafePath comes before the bound, not after. A file name can hold an escape
 // or a carriage return — recorded from the tool call verbatim, and #1090
 // stripped them from the other reading surfaces while this row was missed —
 // and those bytes print as nothing, so measuring the path with them still in
 // it spends the budget the file name needs.
 func filesRowPath(p string, col int) string {
-	return trimPathTo(search.SafeLine(trimPath(p)), col)
+	return trimPathTo(search.SafePath(trimPath(p)), col)
 }
 
 // trimPathTo bounds a path to a column width, cutting from the left so the
