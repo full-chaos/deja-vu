@@ -189,12 +189,12 @@ func doctorHooks(w io.Writer) {
 	path := filepath.Join(sources.ClaudeConfigDir(), "settings.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Fprintf(w, "  %-12s missing      %s\n", "claude-code", path)
+		fmt.Fprintf(w, "  %-12s missing      %s\n", "claude-code", reportPath(path))
 		return
 	}
 	var root map[string]any
 	if json.Unmarshal(b, &root) != nil {
-		fmt.Fprintf(w, "  %-12s unreadable   %s\n", "claude-code", path)
+		fmt.Fprintf(w, "  %-12s unreadable   %s\n", "claude-code", reportPath(path))
 		return
 	}
 	hooks, _ := root["hooks"].(map[string]any)
@@ -210,7 +210,7 @@ func doctorHooks(w io.Writer) {
 	} else if len(missing) > 0 {
 		status = "out of date"
 	}
-	fmt.Fprintf(w, "  %-12s %-11s %s\n", "claude-code", status, path)
+	fmt.Fprintf(w, "  %-12s %-11s %s\n", "claude-code", status, reportPath(path))
 	if len(missing) > 0 && len(missing) < len(claudeHookWiring) {
 		// Named, because the difference is what the machine is missing out on:
 		// a settings.json written by an older deja keeps working and quietly
@@ -253,7 +253,7 @@ func doctorCodexHook(w io.Writer) {
 				"codex-hook", "plugin", hooksPath)
 			return
 		}
-		fmt.Fprintf(w, "  %-12s missing      %s\n", "codex-hook", hooksPath)
+		fmt.Fprintf(w, "  %-12s missing      %s\n", "codex-hook", reportPath(hooksPath))
 		return
 	}
 	cfgPath := filepath.Join(sources.CodexHome(), "config.toml")
@@ -639,7 +639,7 @@ func doctorHarnesses(w io.Writer, dir string) {
 		// A store path can come from the environment (DEJA_NOTES_FILE) or from
 		// disk. On a fixed-width row a newline in it prints a line of its own
 		// that reads as one of doctor's.
-		line := fmt.Sprintf("  %-12s %-9s %s", name, status, search.SafePath(path))
+		line := fmt.Sprintf("  %-12s %-9s %s", name, status, reportPath(path))
 		if detail != "" {
 			line += "  (" + detail + ")"
 		}
@@ -799,7 +799,9 @@ func doctorCursorPresent() bool {
 }
 
 func doctorCursorLocation() string {
-	return strings.Join([]string{sources.CursorUserRoot(), sources.CursorCLIRoot()}, ", ")
+	// Contracted here rather than by the row: this location is two paths in one
+	// string, and the row's own contraction only reaches the first (#2360).
+	return strings.Join([]string{reportPath(sources.CursorUserRoot()), reportPath(sources.CursorCLIRoot())}, ", ")
 }
 
 func doctorAiderLocation() string {
@@ -896,7 +898,7 @@ func doctorPolicy(w io.Writer, dir string) {
 		// was local-only, on the one screen someone opens to find out what is
 		// allowed (#939).
 		if pol := policy.Load(); pol.Describe(policy.ActivationAuto) != "local+imported" {
-			fmt.Fprintf(w, "  %-12s no file at %s\n", "default", policy.Path())
+			fmt.Fprintf(w, "  %-12s no file at %s\n", "default", reportPath(policy.Path()))
 			withheld, total := policyWithheldCounts(dir)
 			for _, activation := range []string{policy.ActivationSearch, policy.ActivationMCP, policy.ActivationAuto} {
 				line := pol.Describe(activation)
@@ -908,7 +910,7 @@ func doctorPolicy(w io.Writer, dir string) {
 			fmt.Fprintf(w, "  %-12s DEJA_AUTORECALL_LOCAL_ONLY is set in this environment\n", "from env")
 			return
 		}
-		fmt.Fprintf(w, "  %-12s no file at %s — every origin activates everywhere\n", "default", policy.Path())
+		fmt.Fprintf(w, "  %-12s no file at %s — every origin activates everywhere\n", "default", reportPath(policy.Path()))
 		// Except one thing, which is in force with or without a file and is
 		// the reason a directory can be missing from recall (#2050).
 		printIgnored(w, policy.Load())
@@ -917,7 +919,7 @@ func doctorPolicy(w io.Writer, dir string) {
 	if err != nil {
 		// The permissive default is what is actually in force, and that is the
 		// part worth saying out loud: the file reads like a restriction.
-		fmt.Fprintf(w, "  %-12s %s: %v\n", "unreadable", policy.Path(), err)
+		fmt.Fprintf(w, "  %-12s %s: %v\n", "unreadable", reportPath(policy.Path()), err)
 		fmt.Fprintf(w, "  %-12s every origin activates everywhere until it parses\n", "in force")
 		return
 	}
@@ -969,7 +971,7 @@ func doctorMCP(w io.Writer) {
 		if status != "wired" && c.name == "codex" && codexPluginInstalled() {
 			status = "plugin"
 		}
-		fmt.Fprintf(w, "  %-12s %-14s guidance %-11s %s\n", c.name, status, guidanceStatus(guidanceHarness(c.name)), c.path)
+		fmt.Fprintf(w, "  %-12s %-14s guidance %-11s %s\n", c.name, status, guidanceStatus(guidanceHarness(c.name)), reportPath(c.path))
 		// "Wired" says the server is declared, not that it can start. A config
 		// naming a binary that is gone — a restored backup, a hand edit, a
 		// machine where deja moved and one file was fixed by hand — read as
@@ -1278,7 +1280,7 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 	if loc == "" {
 		loc = dir
 	}
-	fmt.Fprintf(w, "  location %s\n", loc)
+	fmt.Fprintf(w, "  location %s\n", reportPath(loc))
 	fmt.Fprintf(w, "  exclusions %d active patterns\n", len(sources.ExclusionPatterns()))
 	// A precise non-claim: users deciding what to trust deserve to read the
 	// boundary in the tool itself, not only in the security docs.
@@ -1289,7 +1291,7 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 		// the command people run when memory looks absent, so this is the
 		// worst place to describe it as absent (#873).
 		if st := readWarmupStatus(dir); st != nil {
-			fmt.Fprintf(w, "  status   building now (%s) — recall comes online in a few seconds\n", st.progress())
+			fmt.Fprintf(w, "  status   building now (%s) — recall comes online when it finishes\n", st.progress())
 			return
 		}
 		// A build requested moments ago has published no progress yet, and
@@ -1297,7 +1299,7 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 		// running — the first build after install is exactly that state
 		// (#925).
 		if warmupJustRequested(dir) {
-			fmt.Fprintln(w, "  status   building now — started moments ago, recall comes online in a few seconds")
+			fmt.Fprintln(w, "  status   building now — started moments ago, recall comes online when it finishes")
 			return
 		}
 		// An index whose disk was unplugged is not a missing index, and
@@ -1467,6 +1469,41 @@ func doctorVersion(w io.Writer, lookup doctorVersionLookup) {
 	if current == "dev" || current == "" {
 		fmt.Fprintln(w, "  status   dev build")
 	}
+}
+
+// reportPath is how the human report names a file: control characters
+// sanitised, and a home-prefixed path contracted to ~. The issue template asks
+// a reporter to "run deja doctor and redact local paths before pasting", which
+// is work this report can do for them — ~/.claude/projects is as actionable as
+// the absolute form for the person who ran it (#2360). --json keeps the real
+// path: a tool reading it may need one, and nobody pastes JSON by hand.
+func reportPath(p string) string {
+	if p == "" {
+		return p
+	}
+	// Some rows carry several paths in one string — a store deja looks for in
+	// two places, or a root list from the environment. Contracting the whole
+	// string would only reach the first, which is how the cursor row came out
+	// half in ~ and half in /Users/… .
+	parts := strings.Split(p, string(os.PathListSeparator))
+	for i, part := range parts {
+		parts[i] = search.SafePath(underHome(part))
+	}
+	return strings.Join(parts, string(os.PathListSeparator))
+}
+
+// underHome contracts a home-prefixed path to ~, and leaves everything else
+// alone. The boundary check keeps /home/alicia out of alice's tilde.
+func underHome(p string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" || !strings.HasPrefix(p, home) {
+		return p
+	}
+	rest := strings.TrimPrefix(p, home)
+	if rest == "" || rest[0] == '/' || rest[0] == '\\' {
+		return "~" + rest
+	}
+	return p
 }
 
 func doctorCount(n int, noun string) string {

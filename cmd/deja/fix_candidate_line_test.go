@@ -14,8 +14,8 @@ import (
 // is stuck has to be told which of the two it was handed.
 func TestACandidateSaysNobodyConfirmedIt(t *testing.T) {
 	when := time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)
-	sure := fixLine(index.FixPair{Command: "brew install coreutils", When: when})
-	guess := fixLine(index.FixPair{Command: "brew install coreutils", When: when, Candidate: true})
+	sure := fixLine(index.FixPair{Command: "brew install coreutils", When: when}, 1)
+	guess := fixLine(index.FixPair{Command: "brew install coreutils", When: when, Candidate: true}, 1)
 	if sure == "" || guess == "" {
 		t.Fatal("no line at all")
 	}
@@ -36,7 +36,7 @@ func TestACandidateSaysNobodyConfirmedIt(t *testing.T) {
 // And a command that failed is still no remedy, whichever half of the evidence
 // it came from.
 func TestACandidateThatFailedIsStillNotAnAnswer(t *testing.T) {
-	if got := fixLine(index.FixPair{Command: "make build  → exit 2", Candidate: true}); got != "" {
+	if got := fixLine(index.FixPair{Command: "make build  → exit 2", Candidate: true}, 1); got != "" {
 		t.Errorf("a failed command was offered as what to do: %q", got)
 	}
 }
