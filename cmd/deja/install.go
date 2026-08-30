@@ -2489,6 +2489,96 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 	return installResult{Path: path, Action: a, Note: note}, err
 }
 
+// firstDirThatTakesAWrite is the directory a write would actually land in: the
+// config's own directory once it exists, and otherwise the nearest parent that
+// does, since install creates what is missing under it. os.Stat rather than a
+// Lstat: the write follows a symlinked directory, so the question has to
+// follow it too.
+func firstDirThatTakesAWrite(dir string) string {
+	for {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+		dir = parent
+	}
+}
+
+// mcpConfigReadable asks only whether the config can be read and parsed —
+// deliberately not whether its block is a shape deja edits. On the way out,
+// a block deja never wrote is left alone and reported unchanged (#2399), so
+// naming it as a host deja gave up on would be wrong.
+func mcpConfigReadable(path string) error {
+	old, err := readConfig(path)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(old)) == 0 {
+		return nil
+	}
+	_, err = parseConfigRoot(path, old)
+	return err
+}
+
+// parseConfigRoot decodes a config the writers edit, comments and all. It
+// returns a nil root only for an empty file; `null` is an error, since it
+// decodes into a nil map without one and the writer then assigns into it.
+func parseConfigRoot(path string, old []byte) (map[string]any, error) {
+	text := string(old)
+	if configIsJSONC(old) {
+		text = stripJSONComments(text)
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(text), &root); err != nil {
+		return nil, configParseError(path, err)
+	}
+	if root == nil {
+		return nil, configParseError(path, errors.New("the file holds null, not an object"))
+	}
+	return root, nil
+}
+
+// mcpEntryWritable asks whether installMCPJSON could write its entry into this
+// config, without writing anything.
+//
+// It has to accept exactly what the writer accepts: a comment is not a broken
+// file (#1664), so a JSONC config passes here and is edited as text. What it
+// catches is the config the writer would refuse — one that does not parse, or
+// whose block is something other than an object.
+func mcpEntryWritable(path, blockKey string) error {
+	old, err := readConfig(path)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(old)) == 0 {
+		return nil
+	}
+	jsonc := configIsJSONC(old)
+	root, err := parseConfigRoot(path, old)
+	if err != nil {
+		return err
+	}
+	if jsonc {
+		// The text writer inserts rather than replaces, so a key holding
+		// anything but an object would end up in the file twice with the
+		// reader's value winning — writeJSONCEntry refuses those, and so must
+		// this (#2740). It also needs a top-level object to insert into.
+		if v, present := root[blockKey]; present {
+			if _, isObject := v.(map[string]any); !isObject {
+				return fmt.Errorf("%s: %q is not an object deja can edit — left as it was", path, blockKey)
+			}
+		}
+		if zedTopLevelOpen(string(old)) < 0 {
+			return fmt.Errorf("%s: does not look like a settings object; add %q by hand", path, blockKey)
+		}
+	}
+	_, _, err = mcpBlock(root, blockKey, path)
+	return err
+}
+
 func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
 	old, err := readConfig(path)
 	if err != nil {
