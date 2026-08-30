@@ -605,16 +605,25 @@ func existingTargets() []string {
 func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	switch target {
 	case "claude-auto":
+		if err := readableStrictJSON(filepath.Join(sources.ClaudeConfigDir(), "settings.json")); err != nil {
+			return installResult{}, err
+		}
 		return installClaudeAuto(exe, uninstall)
 	case "claude-code", "claude":
 		return installClaude(exe, uninstall)
 	case "codex":
 		return installCodex(exe, uninstall)
 	case "codex-auto":
+		if err := readableStrictJSON(filepath.Join(sources.CodexHome(), "hooks.json")); err != nil {
+			return installResult{}, err
+		}
 		return installCodexAuto(exe, uninstall)
 	case "cursor":
 		return installCursor(exe, uninstall)
 	case "cursor-auto":
+		if err := readableStrictJSON(filepath.Join(sources.CursorCLIHome(), "hooks.json")); err != nil {
+			return installResult{}, err
+		}
 		return installCursorAuto(exe, uninstall)
 	case "gemini":
 		return installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall)
@@ -637,6 +646,15 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	case "grok":
 		return installGrok(exe, uninstall)
 	case "grok-auto":
+		probe := []string{filepath.Join(sources.GrokHome(), "user-settings.json")}
+		if !uninstall {
+			// Uninstall removes the hook file rather than reading it, so a
+			// file it can still take is not one to refuse over.
+			probe = append(probe, grokHooksPath())
+		}
+		if err := readableStrictJSON(probe...); err != nil {
+			return installResult{}, err
+		}
 		if _, err := installGrok(exe, uninstall); err != nil {
 			return installResult{}, err
 		}

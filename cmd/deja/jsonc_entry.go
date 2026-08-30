@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -295,4 +298,38 @@ func jsoncIsKey(text string, end int) bool {
 		}
 	}
 	return false
+}
+
+// readableStrictJSON refuses before anything is written when a config the
+// target is about to edit cannot be parsed.
+//
+// A target that wires more than one file wrote the first and refused the
+// second, so a run reported as refused had already changed a config and left a
+// snapshot beside it (#2744). The writers that edit an entry take a file with
+// comments; the hook writers cannot, and this is where that is found out —
+// before the first write rather than after it.
+func readableStrictJSON(paths ...string) error {
+	for _, path := range paths {
+		b, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if len(bytes.TrimSpace(b)) == 0 {
+			continue
+		}
+		// An object, the way the writers read it: `null` decodes into a nil
+		// map without an error and the writer then panics assigning into it,
+		// and a list refuses one write too late.
+		var probe map[string]any
+		if err := json.Unmarshal(b, &probe); err != nil {
+			return configParseError(path, err)
+		}
+		if probe == nil {
+			return configParseError(path, errors.New("the file holds null, not an object"))
+		}
+	}
+	return nil
 }
