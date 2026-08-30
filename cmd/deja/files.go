@@ -15,6 +15,7 @@ import (
 	"github.com/vshulcz/deja-vu/internal/index"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/policy"
+	"github.com/vshulcz/deja-vu/internal/query"
 	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/termwidth"
 )
@@ -112,6 +113,12 @@ func runFiles(dir string, args []string, stdout io.Writer) error {
 			fmt.Fprint(stdout, note)
 			return nil
 		}
+		// The same for the rule that keeps a tree out of recall: it took the
+		// answer and left the sentence reading as looked-and-absent (#2632).
+		if note := ignoredHiddenNoteFor("answer", index.IgnoredWithAllTerms(dir, query.Tokens(q))); note != "" {
+			fmt.Fprint(stdout, note)
+			return nil
+		}
 		// A filter the caller set is not the topic's fault: three sessions can
 		// mention it and still be absent because they are in another project
 		// (#727, the same shape as #715 in search).
@@ -127,6 +134,12 @@ func runFiles(dir string, args []string, stdout io.Writer) error {
 			return nil
 		}
 		fmt.Fprintf(stdout, "no sessions mention %q\n", q)
+		// This screen matches on where a topic was discussed, which is what its
+		// comment above defends and what the measurement behind it says. A
+		// topic that lives only in a filename or a command is therefore a miss
+		// here and an answer next door — and this is the surface most likely to
+		// be handed a filename (#2646). The same two lines search ends on.
+		fmt.Fprint(stdout, roleServedHint(dir, q))
 		return nil
 	}
 	// Retrieval hands candidates back in map order, so taking the first 250 of

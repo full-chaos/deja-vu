@@ -12,9 +12,16 @@ import (
 
 func writeClaudeSettings(t *testing.T, events ...string) {
 	t.Helper()
+	// A binary that is there. doctor also reports wiring that names a binary
+	// which has been moved away, and a hard-coded path nobody installed made
+	// every one of these fixtures look like that case.
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var entries []string
 	for _, e := range events {
-		entries = append(entries, `"`+e+`":[{"matcher":"","hooks":[{"type":"command","command":"/usr/local/bin/deja `+
+		entries = append(entries, `"`+e+`":[{"matcher":"","hooks":[{"type":"command","command":"`+exe+` `+
 			subFor(e)+`"}]}]`)
 	}
 	body := `{"hooks":{` + strings.Join(entries, ",") + `}}`

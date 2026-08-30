@@ -450,11 +450,17 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		if _, err := index.EnsureForSearchStale(dir, search.Options{}, mcpProgress()); err != nil {
 			return "", err
 		}
-		entries, hidden, err := howEntries(dir, strings.Fields(a.What), a.Project, policy.ActivationMCP)
+		entries, hidden, ignored, err := howEntries(dir, strings.Fields(a.What), a.Project, policy.ActivationMCP)
 		if err != nil {
 			return "", err
 		}
 		if len(entries) == 0 {
+			// The same reasoning one line down, for the other rule: an agent
+			// told nothing exists invents one, and the ignore rule is exactly
+			// the case where something does exist (#2630).
+			if note := ignoredHiddenNoteFor("answer", ignored); note != "" {
+				return strings.TrimSpace(note), nil
+			}
 			// Not a flat negative when the policy is what emptied the answer:
 			// an agent told nothing exists invents one, and here something does
 			// exist. The CLI has said so since the note was written; this
@@ -477,7 +483,9 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			if !e.Last.IsZero() {
 				when = ", last " + e.Last.Local().Format("2006-01-02")
 			}
-			fmt.Fprintf(&hb, "%s\n  ran %s in %s%s\n", commandListingLine(e.Command), pluralRuns(e.Runs), pluralSessions(len(e.Sessions)), when)
+			// The same note the CLI prints: the agent reading this is the
+			// one most likely to run the command back without looking.
+			fmt.Fprintf(&hb, "%s\n  ran %s in %s%s%s\n", commandListingLine(e.Command), pluralRuns(e.Runs), pluralSessions(len(e.Sessions)), when, e.failureNote())
 		}
 		return strings.TrimRight(hb.String(), "\n"), nil
 	case "remember":

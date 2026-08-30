@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 )
 
 // A hook or plugin deja wrote is a copy of what this binary generates, frozen
@@ -151,6 +152,46 @@ func recordWiring(targets []string, uninstall bool) {
 	_ = os.WriteFile(path, append(b, '\n'), 0o644)
 }
 
+// exeIsTemporary reports whether the running binary is one the wiring must not
+// adopt. A variable so a test can drive both answers: the test binary itself
+// always lives in a temp directory, so the check has to be exercised rather
+// than inherited (#2684).
+var exeIsTemporary = func(p string) bool {
+	if underTestBinary() {
+		return false
+	}
+	return underTempDir(p)
+}
+
+// underTempDir reports whether a path sits under this machine's temp directory,
+// or under the two that are temp everywhere regardless of what TMPDIR says.
+func underTempDir(p string) bool {
+	if p == "" {
+		return false
+	}
+	p = filepath.Clean(p)
+	// Both forms of each root: /tmp resolves to /private/tmp on macOS and
+	// /var/folders to /private/var/folders, and the path being judged may be
+	// written either way — it need not exist, so it cannot be resolved itself.
+	var roots []string
+	for _, root := range []string{os.TempDir(), "/tmp", "/private/tmp"} {
+		if root == "" || root == "/" {
+			continue
+		}
+		root = filepath.Clean(root)
+		roots = append(roots, root)
+		if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
+			roots = append(roots, resolved)
+		}
+	}
+	for _, root := range roots {
+		if p == root || strings.HasPrefix(p, root+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
 // refreshWiringAfterUpgrade rewrites the recorded targets when the binary that
 // wrote them is not the one running now. It returns the targets it changed, so
 // a caller with somewhere to print can say so; the hook paths call it and stay
@@ -177,6 +218,15 @@ func refreshWiringAfterUpgrade() []string {
 	if st.Version == version && (st.Exe == "" || st.Exe == exe) {
 		return nil
 	}
+	// But not a binary that will be gone tomorrow. The repair exists because
+	// deja moves — a release replaces it, a package manager relocates it — and
+	// it cannot tell that from one run of a build somewhere else: a `go run`, a
+	// colleague's checkout, a CI job, a scratch build in a temp directory. Each
+	// of those rewrote every config on the machine to a path that stops
+	// existing, and the reader found out when recall went quiet (#2684).
+	if exeIsTemporary(exe) {
+		return nil
+	}
 	// Only the home the targets were written under: this repairs, it does not
 	// spread (#885).
 	if st.Home != "" && st.Home != homeDir() {
@@ -197,7 +247,16 @@ func refreshWiringAfterUpgrade() []string {
 			stuckWiring = append(stuckWiring, target)
 			continue
 		}
-		if res.Action != "" && res.Action != "unchanged" {
+		cr, cerr := refreshCommandFile(target, exe)
+		if cerr != nil {
+			failed = true
+			stuckWiring = append(stuckWiring, target)
+			continue
+		}
+		// The command counts as a change of its own. It is text the reader can
+		// have edited, and a rewrite that replaces it has to be announced even
+		// when the wiring beside it was already right (#886).
+		if wiringChanged(res) || wiringChanged(cr) {
 			changed = append(changed, target)
 		}
 	}
@@ -222,6 +281,65 @@ func wiringCreated(path string) bool {
 	}
 	for _, p := range createdByThisRun {
 		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshCommandFile rewrites the /deja command for a target that already has
+// one. The command holds the same absolute path the wiring does, and was
+// written by the install command rather than by installTarget, so a move left
+// it running a binary that is gone while everything around it was repaired
+// (#2693).
+//
+// Only a file that is already there: a machine installed with --no-guidance
+// has none, and the repair is not the place to hand it text it declined.
+func refreshCommandFile(target, exe string) (installResult, error) {
+	harness := guidanceHarness(target)
+	if !commandFileWritten(harness) {
+		return installResult{}, nil
+	}
+	return installCommandFile(harness, exe, false)
+}
+
+// wiringChanged reports whether a write did something worth telling the reader
+// about.
+func wiringChanged(r installResult) bool {
+	return r.Action != "" && r.Action != "unchanged"
+}
+
+// commandFileWritten reports whether this harness has a /deja command on disk.
+// Goose keeps the command in config.yaml and the workflow in a recipe beside
+// it, so the recipe is what answers for goose.
+func commandFileWritten(harness string) bool {
+	if harness == "goose" {
+		// Both halves. The writer re-adds the slash_commands entry and creates
+		// config.yaml if it has to, so going by the recipe alone would put back
+		// a command someone took out of the config by hand.
+		if _, err := os.Stat(gooseRecipePath()); err != nil {
+			return false
+		}
+		return gooseSlashCommandPresent()
+	}
+	path := commandFilePath(harness)
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// gooseSlashCommandPresent reports whether config.yaml still lists deja's
+// slash command, in any of the three quotings removeGooseSlashCommand knows.
+func gooseSlashCommandPresent() bool {
+	b, err := os.ReadFile(filepath.Join(gooseConfigDir(), "config.yaml"))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		switch strings.TrimSpace(line) {
+		case `- command: "deja"`, "- command: deja", "- command: 'deja'":
 			return true
 		}
 	}

@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/redact"
 	"github.com/vshulcz/deja-vu/internal/search"
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -168,6 +169,13 @@ func exportRecordsDeferred(dir, outDir, peer string, full bool) (int, func() err
 	// where data leaves, and a pattern set after the index was built has to
 	// hold at that boundary whether or not the index has been rebuilt.
 	ex := sources.NewExcluder()
+	// And the other privacy control, for the same reason at the same boundary.
+	// The ignore rule is what a reader sets when a tree should stay out of
+	// recall — its own documentation calls it the one directory deja never
+	// recalls from without being asked — and it was applied everywhere except
+	// where memory actually leaves the machine, so the export shipped it to a
+	// peer that then served it as imported memory (#2654).
+	pol := policy.Load()
 	// The oldest instant held back per source. A watermark that ran past an
 	// excluded record would settle it forever: remove the pattern later and
 	// that work never syncs again, because the source resumes from a point
@@ -198,7 +206,10 @@ func exportRecordsDeferred(dir, outDir, peer string, full bool) (int, func() err
 		if !ok {
 			return
 		}
-		if !ex.Empty() && ex.Match(meta.Project) {
+		if (!ex.Empty() && ex.Match(meta.Project)) || pol.Ignored(meta.Path, meta.Project) {
+			// Held, not settled, for both: a watermark that ran past a
+			// withheld record would settle it forever, so lifting the rule
+			// later would never send that work.
 			if tn := r.Time.UnixNano(); !r.Time.IsZero() {
 				if cur, seen := heldFrom[wk]; !seen || tn < cur {
 					heldFrom[wk] = tn
@@ -310,6 +321,16 @@ var lastImportSkippedForgotten int
 // peer's copy of a forgotten session is exactly what someone expects deja to
 // leave alone (#968).
 func ImportSkippedForgotten() int { return lastImportSkippedForgotten }
+
+// lastImportSkippedExcluded holds how many records the last Import dropped
+// because the reader's own exclude list covers their project. Its three
+// neighbours in the same loop are each counted and reported; this one was not,
+// so a batch dropped in full read as an empty or already-synced one — the
+// misread #1118 recorded for the drop beside it (#2666).
+var lastImportSkippedExcluded int
+
+// ImportSkippedExcluded reports that count.
+func ImportSkippedExcluded() int { return lastImportSkippedExcluded }
 
 // lastImportSkippedIncomplete holds how many records the last Import dropped
 // because they could not be attributed to a session — no harness or no
@@ -454,9 +475,11 @@ func Import(dir, inDir string) (int, error) {
 	ownSkipped := 0
 	forgottenSkipped := 0
 	incompleteSkipped := 0
+	excludedSkipped := 0
 	defer func() { lastImportSkippedForgotten = forgottenSkipped }()
 	defer func() { lastImportSkippedOwn = ownSkipped }()
 	defer func() { lastImportSkippedIncomplete = incompleteSkipped }()
+	defer func() { lastImportSkippedExcluded = excludedSkipped }()
 	for _, p := range paths {
 		// A file is imported whole or not at all, so what it contributed is
 		// remembered before it is read and rolled back if it turns out to be
@@ -569,8 +592,10 @@ func Import(dir, inDir string) (int, error) {
 				}
 			}
 			// The exclude list keeps a project out of this machine's memory;
-			// a sync from another machine must not put it back.
+			// a sync from another machine must not put it back. Counted, so
+			// the batch it empties does not read as an empty batch (#2666).
 			if ex.Match(sr.Project) {
+				excludedSkipped++
 				return nil
 			}
 			key := sr.Harness + ":" + importID

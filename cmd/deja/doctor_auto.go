@@ -114,6 +114,12 @@ func doctorAutoRecall(w io.Writer) {
 			fmt.Fprintf(w, "  %-12s %-11s %s  (no %s call — reinstall)\n", a.name, "stale", reportPath(path), a.marker)
 		default:
 			fmt.Fprintf(w, "  %-12s %-11s %s%s\n", a.name, "wired", reportPath(path), note)
+			// Only the rows that run the binary. aider's file is a digest of
+			// past sessions and roo's is guidance — neither executes anything,
+			// and both can quote a path for reasons of their own.
+			if exe := hookExeNote(path, a.name+"-auto"); a.marker != "" && exe != "" {
+				fmt.Fprintf(w, "  %-12s %s\n", "", exe)
+			}
 		}
 	}
 }
@@ -122,23 +128,48 @@ func doctorAutoRecall(w io.Writer) {
 // both nest ours under a key: a plain "deja appears in the file" check would
 // pass on a disabled entry.
 func doctorGooseWired(path string) bool {
-	return yamlHasKey(path, "  deja:")
+	return yamlHasChildKey(path, "extensions:", "deja:")
 }
 
 func doctorHermesWired(path string) bool {
-	return yamlHasKey(path, "mcp_servers:") && yamlHasKey(path, "  deja:")
+	return yamlHasChildKey(path, "mcp_servers:", "deja:")
 }
 
-// yamlHasKey looks for a key on its own line. Matching a leading newline
-// instead would miss a config whose first line is the key — which is exactly
-// how a hand-written file tends to start.
-func yamlHasKey(path, key string) bool {
+// yamlHasChildKey reports whether a key sits directly under a top-level parent.
+//
+// The indent is whatever the reader wrote the block at, and asking for exactly
+// two called a goose deja had just wired at four unwired — while the writer
+// itself follows the block (#2614, #2727). "Anywhere below the top level" was
+// the other end of the same mistake: `deja:` in another server's env, or in a
+// comment-shaped example under `notes:`, then read as a wired server (#2730).
+func yamlHasChildKey(path, parent, key string) bool {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if strings.TrimRight(line, " \t\r") == key {
+	lines := strings.Split(string(b), "\n")
+	inBlock := false
+	child := -1
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, " \t\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if strings.TrimSpace(line) == parent && yamlIndentWidth(line) == 0 {
+			inBlock, child = true, -1
+			continue
+		}
+		if !inBlock {
+			continue
+		}
+		if yamlIndentWidth(line) == 0 {
+			inBlock = false
+			continue
+		}
+		if child < 0 {
+			child = yamlIndentWidth(line)
+		}
+		if strings.TrimSpace(line) == key && yamlIndentWidth(line) == child {
 			return true
 		}
 	}

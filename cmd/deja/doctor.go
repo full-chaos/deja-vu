@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -217,6 +216,11 @@ func doctorHooks(w io.Writer) {
 		// lacks everything added since.
 		fmt.Fprintf(w, "               %d of %d events wired — no %s; run `deja install`\n",
 			len(claudeHookWiring)-len(missing), len(claudeHookWiring), strings.Join(missing, ", "))
+	}
+	// Only when something here is actually wired: the note is about the binary
+	// those entries name, and a file with no deja in it names none.
+	if note := hookExeNote(path, "claude-auto"); note != "" && len(missing) < len(claudeHookWiring) {
+		fmt.Fprintf(w, "  %-12s %s\n", "", note)
 	}
 }
 
@@ -1109,18 +1113,33 @@ func mcpEntryDejaCommand(v any) string {
 	if m == nil {
 		return ""
 	}
-	if t, ok := m["transport"].(map[string]any); ok {
-		if cmd := mcpEntryDejaCommand(t); cmd != "" {
-			return cmd
+	// The top level first: when an entry carries both, that is the one deja
+	// wrote, and naming the nested one sent the reader after a path deja had
+	// already replaced (#2716).
+	switch c := m["command"].(type) {
+	case string:
+		if commandIsDeja(c) {
+			return strings.TrimSpace(c)
 		}
-	}
-	if cmd, _ := m["command"].(string); commandIsDeja(cmd) {
-		return strings.TrimSpace(cmd)
+	case []any:
+		// opencode writes the command as a list. The recogniser reads that
+		// shape since #2713, and a check that says "wired" without being able
+		// to name the binary cannot report one that is gone.
+		for _, v := range c {
+			if s, ok := v.(string); ok && commandIsDeja(s) {
+				return strings.TrimSpace(s)
+			}
+		}
 	}
 	args, _ := m["args"].([]any)
 	for _, a := range args {
 		if s, ok := a.(string); ok && commandIsDeja(s) {
 			return strings.TrimSpace(s)
+		}
+	}
+	if t, ok := m["transport"].(map[string]any); ok {
+		if cmd := mcpEntryDejaCommand(t); cmd != "" {
+			return cmd
 		}
 	}
 	return ""
@@ -1283,51 +1302,25 @@ func doctorJSONDejaKeys(key string) func(string) []string {
 
 // mcpEntryRunsDeja reports whether an MCP server entry launches deja, in any
 // of the shapes clients accept: a bare command, a command plus args, a command
-// written as one list, or a nested transport object.
+// written as a list, or a nested transport object.
+//
+// One function rather than two. install had grown its own answer, and they
+// disagreed in both directions — a nested transport and a capitalised path
+// were deja here and not there, a list command the other way round (#2713).
 func mcpEntryRunsDeja(v any) bool {
 	m, _ := v.(map[string]any)
 	if m == nil {
 		return false
 	}
-	if t, ok := m["transport"].(map[string]any); ok {
-		if mcpEntryRunsDeja(t) {
-			return true
-		}
-	}
-	switch cmd := m["command"].(type) {
-	case string:
-		if commandIsDeja(cmd) {
-			return true
-		}
-	case []any:
-		// Opencode's entry keeps the command as one list, written by deja's own installer.
-		for _, word := range cmd {
-			if s, ok := word.(string); ok && commandIsDeja(s) {
-				return true
-			}
-		}
-	}
-	// Windows and npx-style wiring puts the binary in args instead.
-	args, _ := m["args"].([]any)
-	for _, a := range args {
-		if s, ok := a.(string); ok && commandIsDeja(s) {
-			return true
-		}
-	}
-	return false
+	return entryRunsDeja(m)
 }
 
+// commandIsDeja is the token test, under the name doctor's readers use. One
+// implementation, because two answers to "is this the binary" disagreed on a
+// quoted Windows path: the entry read as wired while nothing could name the
+// command in it, so the missing-binary check had nothing to report (#2716).
 func commandIsDeja(cmd string) bool {
-	cmd = strings.TrimSpace(cmd)
-	if cmd == "" {
-		return false
-	}
-	// A windows path read on a unix build and vice versa: filepath.Base only
-	// knows the separator it was compiled for, and these configs travel.
-	cmd = strings.ReplaceAll(cmd, `\`, "/")
-	base := strings.ToLower(path.Base(cmd))
-	base = strings.TrimSuffix(base, ".exe")
-	return base == "deja"
+	return isDejaBinaryToken(cmd)
 }
 
 func doctorTOMLWired(path string) bool {
@@ -1399,7 +1392,17 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 		loc = dir
 	}
 	fmt.Fprintf(w, "  location %s\n", reportPath(loc))
-	fmt.Fprintf(w, "  exclusions %d active patterns\n", len(sources.ExclusionPatterns()))
+	// "Active" is what a reader checks this screen for, and it was false in the
+	// one state they check it in: the pattern is written, the index is not
+	// rebuilt, and the next search still serves the project they meant to hide.
+	// The list applies at ingest, so it covers nothing already indexed until a
+	// rebuild — the sentence `deja index` prints for the same reason (#1307,
+	// #2664).
+	if n := len(sources.ExclusionPatterns()); n > 0 && index.ExclusionsChanged(dir) {
+		fmt.Fprintf(w, "  exclusions %d pattern%s, not applied to sessions already indexed — `deja index --rebuild`\n", n, pluralS(n))
+	} else {
+		fmt.Fprintf(w, "  exclusions %d active patterns\n", n)
+	}
 	// A precise non-claim: users deciding what to trust deserve to read the
 	// boundary in the tool itself, not only in the security docs.
 	fmt.Fprintln(w, "  security plaintext on disk — protected by file permissions only, no encryption or access control")
@@ -1469,8 +1472,12 @@ func doctorIndex(w io.Writer, idx doctorIndexReport, dir string) {
 	// answer anything, and said "up to date" until #735. The next search
 	// rebuilds it, which is worth saying too — the reader has not lost memory,
 	// only this build of the index.
-	if index.Damaged(dir) {
-		fmt.Fprintln(w, "  integrity damaged — records or postings are missing; the next search rebuilds the index")
+	if reason := indexDamageReason(dir); reason != "" {
+		// What broke, not a summary of the four ways it can: a manifest that
+		// will not decode is not missing records, and the sentence sent the
+		// reader — and whoever reads the doctor output they paste into an
+		// issue — after the wrong file (#2695).
+		fmt.Fprintf(w, "  integrity damaged — %s; the next search rebuilds the index\n", reason)
 		return
 	}
 	switch idx.State {

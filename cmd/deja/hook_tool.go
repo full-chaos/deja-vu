@@ -74,6 +74,13 @@ func runHookTool(dir string, stdin io.Reader, stdout io.Writer) error {
 	raw := readHookPayload(stdin, hookStdinWait)
 	var input toolHookInput
 	_ = json.NewDecoder(bytes.NewReader(raw)).Decode(&input)
+	// The kill switch, before anything is read. It reached the session-start
+	// hook and nothing else, so a machine with recall off still had text drawn
+	// from its own indexed sessions injected here (#2701).
+	if recallIsOff() {
+		return nil
+	}
+
 	// Spawning an agent is the one action whose reply has to reach someone
 	// other than the caller, so it answers in its own shape. See hook_spawn.go.
 	if isSpawnTool(input.ToolName) {
@@ -237,6 +244,28 @@ func commandHookLine(dir, cwd, cmd string) string {
 	}
 	if sessions < 1 {
 		return ""
+	}
+	// And the rule that keeps a tree out of recall. `how` refuses to answer
+	// from it and says so; this line was stating the same history into an
+	// agent's context unasked (#2652). It has to come from the sessions,
+	// because the table above keys by project and the rule matches on the
+	// path — which costs a manifest read, so it is paid only here, after the
+	// cheap checks have found something worth saying. A command with no
+	// history, and every inspection command, returned long before this.
+	if ignored := index.ProjectsTouchedByIgnore(dir); len(ignored) > 0 {
+		sessions, last = 0, time.Time{}
+		for proj, pu := range use.ByProject {
+			if !pol.Allows(policy.ActivationAuto, proj) || ignored[proj] {
+				continue
+			}
+			sessions += pu.Sessions
+			if pu.Last.After(last) {
+				last = pu.Last
+			}
+		}
+		if sessions < 1 {
+			return ""
+		}
 	}
 	when := ""
 	if !last.IsZero() {

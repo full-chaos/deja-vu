@@ -140,7 +140,10 @@ func runInstall(dir string, args []string, uninstall bool) error {
 	defer recordWiring(targets, uninstall)
 	saidNotes := map[string]bool{}
 	banner := !uninstall && (targetArgs[0] == "--auto" || targetArgs[0] == "--all") && logoWanted(os.Stdout)
-	type lineItem struct{ target, action, path string }
+	type lineItem struct{ target, action, path, note string }
+	// The real paths, not the display ones: an uninstall reports the snapshots
+	// it left beside the configs it handled, and ~ does not stat (#2676).
+	var touchedPaths []string
 	var done []lineItem
 	guidanceCount := 0
 	mcpCount := 0
@@ -200,8 +203,9 @@ func runInstall(dir string, args []string, uninstall bool) error {
 				pruneGuidanceDirs(cr.Path)
 			}
 		}
+		touchedPaths = append(touchedPaths, r.Path)
 		if banner {
-			done = append(done, lineItem{t, r.Action, shortHome(r.Path)})
+			done = append(done, lineItem{t, r.Action, shortHome(r.Path), r.Note})
 		} else {
 			if r.Path == "" {
 				fmt.Printf("%s: %s\n", t, r.Action)
@@ -238,23 +242,45 @@ func runInstall(dir string, args []string, uninstall bool) error {
 			note(cliSkillName, err)
 		}
 	}
+	// Held, not returned. "finished what it could" is a summary of the run, and
+	// returning it here made it an early exit from reporting the run: the
+	// banner never rendered, so nobody was told which harnesses had been wired,
+	// and the index build below was skipped, leaving those harnesses wired with
+	// nothing to read (#2721).
+	var refusal error
 	if len(refused) > 0 {
 		verb := "install"
 		if uninstall {
 			verb = "uninstall"
 		}
-		return fmt.Errorf("%s finished what it could; %d target%s refused: %s — %s",
+		refusal = fmt.Errorf("%s finished what it could; %d target%s refused: %s — %s",
 			verb, len(refused), pluralS(len(refused)), strings.Join(refused, "; "), refusalRemedy(refusedErrs))
 	}
 	// Every install builds, not only --auto and --all. Installing is the one
 	// moment a person has already accepted a wait — they just ran an installer
 	// — and spending the build here is what keeps the first real use, usually
-	// the first agent turn, instant.
-	if !uninstall && !noIndex {
+	// the first agent turn, instant. A target that refused does not change that
+	// for the ones that did not (#2721).
+	// Something has to have landed. When every target refused there is nothing
+	// to build a store for and nothing to celebrate, and printing the whole
+	// success screen ahead of the refusal is worse than the silence #2721 was
+	// about.
+	wired := len(done) > 0 || mcpCount+hookCount+guidanceCount > 0
+	if !uninstall && !noIndex && wired {
 		installIndexWarmup(dir, mcpCount, hookCount, guidanceCount,
 			targetArgs[0] == "--auto" || targetArgs[0] == "--all")
 	}
-	if banner {
+	// An uninstall keeps the snapshot it took of a config the reader already
+	// had — neither the config nor its snapshot is deja's to delete (#840) —
+	// and said nothing about them, on a screen that otherwise names what it
+	// keeps. #2487 added gemini's line for exactly that reason; nine files on
+	// disk are the same shape (#2676).
+	if uninstall {
+		if line := keptSnapshotsLine(touchedPaths); line != "" {
+			fmt.Fprint(os.Stderr, line)
+		}
+	}
+	if banner && wired {
 		info := append(brandInfo(), "")
 		nameW := 0
 		for _, d := range done {
@@ -264,6 +290,13 @@ func runInstall(dir string, args []string, uninstall bool) error {
 		}
 		for _, d := range done {
 			info = append(info, fmt.Sprintf("%-*s  %s%-9s%s %s", nameW, d.target, logoBold, d.action, logoReset, logoDim+d.path+logoReset))
+			// Under its own row. The table is the documented path — the README
+			// tells people to run `deja install --auto` — so a note that only
+			// the line-by-line output carried was a note almost nobody read
+			// (#2712).
+			if d.note != "" {
+				info = append(info, fmt.Sprintf("%-*s  %s", nameW, "", d.note))
+			}
 		}
 		mood := moodReady
 		if hint := installIndexHint(dir); hint != "" {
@@ -276,7 +309,39 @@ func runInstall(dir string, args []string, uninstall bool) error {
 		}
 		printLogoMood(os.Stdout, info, mood)
 	}
-	return nil
+	return refusal
+}
+
+// keptSnapshotsLine names the .bak files still beside the configs this run
+// touched. Only those: a snapshot next to a file deja handled is one deja took,
+// while an unrelated .bak in the tree belongs to whoever made it.
+func keptSnapshotsLine(touched []string) string {
+	seen := map[string]bool{}
+	var paths []string
+	for _, p := range touched {
+		if p == "" {
+			continue
+		}
+		bak := p + ".bak"
+		if seen[bak] {
+			continue
+		}
+		if _, err := os.Stat(bak); err != nil {
+			continue
+		}
+		seen[bak] = true
+		paths = append(paths, bak)
+	}
+	if len(paths) == 0 {
+		return ""
+	}
+	sort.Strings(paths)
+	where := reportPath(paths[0])
+	if len(paths) > 1 {
+		where = reportPath(paths[0]) + " and " + fmt.Sprintf("%d more", len(paths)-1)
+	}
+	return fmt.Sprintf("deja: kept %d snapshot%s of configs you already had — %s — yours to remove\n",
+		len(paths), pluralS(len(paths)), where)
 }
 
 func installIndexWarmup(dir string, mcp, hooks, guidance int, summary bool) {
@@ -969,11 +1034,26 @@ func structurallyEmptyConfig(b []byte) bool {
 	return false
 }
 
+// matchFinalNewline gives a file back ending as it came in. Every writer here
+// finishes with a newline, and some editors never write one, so a config
+// someone owned came back changed for nothing — #2606 the other way round
+// (#2619). Beside matchLineEndings because it is the same rule: what the file
+// was written in is not ours to convert. A file deja creates has no ending to
+// keep and gets the newline every text file wants.
+func matchFinalNewline(old, next []byte) []byte {
+	if len(old) == 0 || bytes.HasSuffix(old, []byte("\n")) {
+		return next
+	}
+	next = bytes.TrimSuffix(next, []byte("\n"))
+	return bytes.TrimSuffix(next, []byte("\r"))
+}
+
 func writeIfChanged(path string, old, next []byte) (string, error) {
 	// Before the comparison, not after: a CRLF config converted afterwards
 	// would differ from `old` on every run, so each repeat install would
 	// rewrite the file and report it changed.
 	next = matchLineEndings(old, next)
+	next = matchFinalNewline(old, next)
 	if bytes.Equal(old, next) {
 		return "unchanged", nil
 	}
@@ -1152,8 +1232,9 @@ func installClaude(exe string, uninstall bool) (installResult, error) {
 			noteBlockAdded(path, "mcpServers."+key)
 		}
 		m[key], note = mergeDejaEntry(m[key], mcpServerEntry(exe))
+		note = withOtherDejaEntries(note, m, key)
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -1301,10 +1382,14 @@ func lastShellToken(s string) string {
 // isDejaBinaryToken reports whether a token names the deja binary, quoted or
 // not, under any directory, on either platform's separator.
 func isDejaBinaryToken(tok string) bool {
-	tok = strings.Trim(tok, `"'`)
+	tok = strings.Trim(strings.TrimSpace(tok), `"'`)
+	// Both separators whatever this build was compiled for, because configs
+	// travel between machines, and folded because a filesystem that does not
+	// care about case still runs /opt/Deja (#2713).
 	if i := strings.LastIndexAny(tok, `/\`); i >= 0 {
 		tok = tok[i+1:]
 	}
+	tok = strings.ToLower(tok)
 	return tok == "deja" || tok == "deja.exe"
 }
 
@@ -1457,7 +1542,7 @@ func installStatusline(exe string, uninstall bool) (installResult, error) {
 		// user last typed.
 		root["statusLine"] = map[string]any{"type": "command", "command": cmd, "refreshInterval": 1000}
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -1949,6 +2034,161 @@ func replacedEntryNote(prev, entry any) string {
 	return fmt.Sprintf("replaced the deja entry that was already here, which ran %s", safeForStatusline(was, 200))
 }
 
+// entryRunsDeja reports whether an MCP entry runs the deja binary, wherever the
+// config keeps it: a command string, a command list, or the args behind a
+// wrapper like Windows' `cmd /c`.
+func entryRunsDeja(entry map[string]any) bool {
+	// The shape a client nests: doctor read it and install did not, so one
+	// command called a file wired while the other wrote a second server into
+	// it (#2713).
+	if t, ok := entry["transport"].(map[string]any); ok && entryRunsDeja(t) {
+		return true
+	}
+	var words []string
+	switch c := entry["command"].(type) {
+	case string:
+		words = append(words, c)
+	case []any:
+		for _, v := range c {
+			if s, ok := v.(string); ok {
+				words = append(words, s)
+			}
+		}
+	}
+	if args, ok := entry["args"].([]any); ok {
+		for _, v := range args {
+			if s, ok := v.(string); ok {
+				words = append(words, s)
+			}
+		}
+	}
+	for _, w := range words {
+		if isDejaBinaryToken(w) {
+			return true
+		}
+	}
+	return false
+}
+
+// withOtherDejaEntries folds the note about a second deja server into whatever
+// the write already had to say. Every MCP writer needs it: the file it edits is
+// the one that would hold the other entry.
+func withOtherDejaEntries(note string, servers map[string]any, mine string) string {
+	// Everything past the entry install just took over. One of them is now
+	// deja's own — adopting it is what keeps the harness from starting two
+	// servers — so naming it here would report deja's own wiring as a stranger.
+	other := otherDejaEntriesNote(servers, mine)
+	if other == "" {
+		return note
+	}
+	if note != "" {
+		return note + "; " + other
+	}
+	return other
+}
+
+// otherDejaEntriesNote names entries in the same file that also run deja under
+// another key.
+//
+// doctor already reads past the key at what an entry runs, and calls `deja-vu`
+// deja's wiring; install did not, so it wrote a second server beside one it
+// recognised and said only "updated". The harness then starts two on every
+// session, one of them possibly naming a binary that is gone (#2712).
+//
+// Said, not taken: a second entry can be deliberate — another index directory,
+// a pinned older binary — and removing one deja did not write is the damage
+// #2583 and #2600 were about. What the reader cannot do is act on a file whose
+// state nothing reports.
+func otherDejaEntriesNote(servers map[string]any, mine string) string {
+	var names []string
+	for name, entry := range servers {
+		if name == mine {
+			continue
+		}
+		m, _ := entry.(map[string]any)
+		if m != nil && entryIsDejaServer(m) {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	noun, verb, it := "the entry ", "runs", "it"
+	if len(names) > 1 {
+		noun, verb, it = "the entries ", "run", "them"
+	}
+	return fmt.Sprintf("%s%s also %s deja — this harness will start %s alongside deja's own; remove what you do not want",
+		noun, quotedList(names, 3), verb, it)
+}
+
+// entryIsDejaServer is entryRunsDeja for a claim about somebody else's entry.
+//
+// entryRunsDeja answers "may this be merged onto", where a false positive costs
+// a merge onto an entry deja then overwrites anyway. This answers "should the
+// reader be told to remove it", where a false positive is deja pointing at a
+// config line that is none of its business: a filesystem server told to serve
+// `~/code/deja` has the binary's name in its arguments and is not deja.
+//
+// So the name has to be the command — or, for the wrapper shapes where it
+// cannot be (`cmd /c … deja mcp`), it has to be running deja's server rather
+// than appearing in a path.
+func entryIsDejaServer(entry map[string]any) bool {
+	// The nested shape, on the same terms: this asks whether the entry is
+	// deja's server, so the answer has to reach wherever the launch is written
+	// (#2713).
+	if t, ok := entry["transport"].(map[string]any); ok && entryIsDejaServer(t) {
+		return true
+	}
+	switch c := entry["command"].(type) {
+	case string:
+		if isDejaBinaryToken(c) {
+			return dejaServerArgs(entry)
+		}
+	case []any:
+		if len(c) > 0 {
+			if head, ok := c[0].(string); ok && isDejaBinaryToken(head) {
+				return dejaServerArgs(entry)
+			}
+			for _, v := range c {
+				if s, ok := v.(string); ok && isDejaBinaryToken(s) {
+					return commandListRunsMCP(c)
+				}
+			}
+		}
+	}
+	if args, ok := entry["args"].([]any); ok {
+		for _, v := range args {
+			if s, ok := v.(string); ok && isDejaBinaryToken(s) {
+				return commandListRunsMCP(args)
+			}
+		}
+	}
+	return false
+}
+
+// dejaServerArgs reports whether an entry whose command is deja runs the MCP
+// server rather than something else someone wired by hand.
+func dejaServerArgs(entry map[string]any) bool {
+	args, ok := entry["args"].([]any)
+	if !ok {
+		// A command with no arguments at all is deja's own shape from before
+		// the subcommand was written into the entry.
+		return entry["args"] == nil
+	}
+	return commandListRunsMCP(args)
+}
+
+// commandListRunsMCP reports whether `mcp` is one of these words.
+func commandListRunsMCP(words []any) bool {
+	for _, v := range words {
+		if s, ok := v.(string); ok && s == "mcp" {
+			return true
+		}
+	}
+	return false
+}
+
 // mergeDejaEntry writes deja's wiring onto the entry that was already there.
 // deja owns the command, the args and the type; an env pointing at a store on
 // another disk, a timeout, a `disabled` the reader set — those are theirs, and
@@ -1960,7 +2200,7 @@ func mergeDejaEntry(prev any, entry map[string]any) (map[string]any, string) {
 	// else's entry — a `url` of a remote server, an env built for another
 	// program — would leave a mixed shape whose client has to guess which half
 	// to believe.
-	if !ok || !mcpEntryRunsDeja(old) {
+	if !ok || !entryRunsDeja(old) {
 		return entry, note
 	}
 	out := make(map[string]any, len(old)+len(entry))
@@ -1969,6 +2209,15 @@ func mergeDejaEntry(prev any, entry map[string]any) (map[string]any, string) {
 	}
 	for k, v := range entry {
 		out[k] = v
+	}
+	// deja owns how the entry is launched, and it writes that at the top level.
+	// An entry written in the nested shape kept its `transport` beside the
+	// command deja had just written, and a client that prefers the nested one
+	// went on launching the old binary while install reported success — the
+	// mixed shape this function exists to avoid, reached through the wider gate
+	// #2713 opened (#2716).
+	if _, ok := out["command"]; ok {
+		delete(out, "transport")
 	}
 	if disabled, _ := out["disabled"].(bool); disabled {
 		// Switching it back on silently would undo a decision deja was not
@@ -2089,8 +2338,9 @@ func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 			noteBlockAdded(path, "mcpServers."+key)
 		}
 		m[key], note = mergeDejaEntry(m[key], map[string]any{"type": "local", "command": command, "args": args, "tools": []string{"*"}})
+		note = withOtherDejaEntries(note, m, key)
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -2152,8 +2402,9 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 			noteBlockAdded(path, "mcp.servers."+key)
 		}
 		servers[key], note = mergeDejaEntry(servers[key], map[string]any{"command": command, "args": args})
+		note = withOtherDejaEntries(note, servers, key)
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -2206,8 +2457,9 @@ func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
 			noteBlockAdded(path, "mcpServers."+key)
 		}
 		m[key], note = mergeDejaEntry(m[key], map[string]any{"command": command, "args": args})
+		note = withOtherDejaEntries(note, m, key)
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -2269,8 +2521,9 @@ func updateOpencodeJSON(old []byte, path, exe string, uninstall bool) ([]byte, s
 			noteBlockAdded(path, "mcp."+key)
 		}
 		m[key], note = mergeDejaEntry(m[key], map[string]any{"type": "local", "command": []string{exe, "mcp"}})
+		note = withOtherDejaEntries(note, m, key)
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return nil, "", err
 	}
@@ -2282,7 +2535,7 @@ func updateOpencodeJSON(old []byte, path, exe string, uninstall bool) ([]byte, s
 // lines carries `"deja"` on its first one only; dropping just that line left
 // the rest of it in the block and the config stopped parsing (#2394), so the
 // entry is bounded by counting braces the way the block itself is.
-func dropJSONCEntry(lines []string) (body, dropped []string) {
+func dropJSONCEntry(lines []string) (body, dropped []string, wasLast bool) {
 	// On the code a parser reads, not the raw line. A comment that only names
 	// deja — a parked entry someone commented out, a note saying who wrote the
 	// block — is not an entry to replace, and dropping its first line leaves a
@@ -2296,9 +2549,13 @@ func dropJSONCEntry(lines []string) (body, dropped []string) {
 		inBlock = next
 		if !strings.Contains(code, `"deja"`) {
 			body = append(body, lines[i])
+			if code != "" {
+				wasLast = false
+			}
 			continue
 		}
 		dropped = append(dropped, lines[i])
+		wasLast = true
 		depth := jsoncBraceDelta(code)
 		for depth > 0 && i+1 < len(lines) {
 			i++
@@ -2308,7 +2565,23 @@ func dropJSONCEntry(lines []string) (body, dropped []string) {
 			depth += jsoncBraceDelta(c)
 		}
 	}
-	return body, dropped
+	return body, dropped, wasLast
+}
+
+// jsoncFirstCodeLine finds the first line of a .jsonc block that a parser
+// would read as code, so our entry goes under any comment the reader wrote
+// above their first one rather than between the comment and what it annotates.
+// It returns -1 when the block holds no code at all.
+func jsoncFirstCodeLine(body []string) int {
+	inBlock := false
+	for i, line := range body {
+		c, nextBlock, _ := jsoncCodeOf(line, inBlock)
+		inBlock = nextBlock
+		if c != "" {
+			return i
+		}
+	}
+	return -1
 }
 
 // jsoncLastCodeLine finds the last line of a .jsonc block that a parser would
@@ -2433,23 +2706,38 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, string
 		// it ran is the same sentence the .json writer prints (#2390); without
 		// it, what install told you depended on which of the two names the
 		// config had (#2392).
-		body, dropped := dropJSONCEntry(lines[start+1 : end])
+		body, dropped, wasLast := dropJSONCEntry(lines[start+1 : end])
+		// Our entry used to go last, so the comma joining it to the block sat
+		// on the line above — the reader's. Taking ours out leaves that comma
+		// with nothing after it, which a strict reader of the file rejects, so
+		// a comma we put there once has to come back out with the entry it was
+		// written for (#2617). Only where ours ended the block: a comma
+		// anywhere else is still separating two things.
+		if wasLast {
+			if i, code, trim := jsoncLastCodeLine(body); i >= 0 && strings.HasSuffix(trim, ",") {
+				body[i] = body[i][:code-1] + body[i][code:]
+			}
+		}
 		note := ""
 		if !uninstall {
 			note = replacedJSONCLineNote(dropped, line)
 		}
 		if !uninstall {
-			// Only the last line that carries content decides whether a comma
-			// is needed. Walking on past it — which is what looking for the
-			// first line not ending in a comma did — runs through an entry
-			// whose every line ends in one, which is what a .jsonc written
-			// with trailing commas looks like, and puts the comma on the line
-			// that opens the entry: `"mine": {,` (#1695).
-			if i, code, trim := jsoncLastCodeLine(body); i >= 0 &&
-				!strings.HasSuffix(trim, ",") && !strings.HasSuffix(trim, "{") && !strings.HasSuffix(trim, "[") {
-				body[i] = body[i][:code] + "," + body[i][code:]
+			// Ours goes first, carrying its own comma. Written last it needed
+			// one on the line above — the reader's — and uninstall has no way
+			// to tell that comma from one they wrote, so it stayed behind in a
+			// file that was not ours to change (#2617). A comma of ours leaves
+			// with our line, and the placement rules that a comma on someone
+			// else's line needed — not on an opening brace, not after a
+			// trailing comment, not inside a block comment (#1695) — stop
+			// applying at all.
+			entry := line
+			at := len(body)
+			if i := jsoncFirstCodeLine(body); i >= 0 {
+				entry += ","
+				at = i
 			}
-			body = append(body, line)
+			body = append(body[:at:at], append([]string{entry}, body[at:]...)...)
 		}
 		out := append([]string{}, lines[:start+1]...)
 		out = append(out, body...)

@@ -150,7 +150,12 @@ func installHermesMCP(exe string, uninstall bool) (installResult, error) {
 	}
 	next := removeHermesMCPBlock(lfText(old))
 	if !uninstall {
-		entry := "  deja:\n    command: " + yamlQuote(exe) + "\n    args:\n      - mcp\n    enabled: true\n"
+		pad, ok := hermesBlockIndent(next)
+		if !ok {
+			pad = "  "
+		}
+		entry := pad + "deja:\n" + pad + pad + "command: " + yamlQuote(exe) + "\n" +
+			pad + pad + "args:\n" + pad + pad + pad + "- mcp\n" + pad + pad + "enabled: true\n"
 		if i := strings.Index(next, "\nmcp_servers:\n"); i >= 0 {
 			at := i + len("\nmcp_servers:\n")
 			next = next[:at] + entry + next[at:]
@@ -171,7 +176,10 @@ func installHermesMCP(exe string, uninstall bool) (installResult, error) {
 			forgetBlockAdded(path, "mcp_servers")
 		}
 	}
-	a, werr := writeIfChanged(path, old, []byte(next))
+	// The file's own final newline, the way both goose writers keep it: this
+	// was the only writer that did not, so a config whose deja block ended it
+	// came back without one (#2606, #2730).
+	a, werr := writeIfChanged(path, old, []byte(keepTrailingNewline(lfText(old), next)))
 	return installResult{Path: path, Action: a}, werr
 }
 
@@ -180,21 +188,80 @@ func installHermesMCP(exe string, uninstall bool) (installResult, error) {
 func removeHermesMCPBlock(s string) string {
 	lines := strings.Split(s, "\n")
 	var out []string
-	skipping := false
-	for _, l := range lines {
-		if skipping {
-			if strings.HasPrefix(l, "    ") || strings.TrimSpace(l) == "" && len(out) > 0 && strings.HasPrefix(out[len(out)-1], "    ") {
-				continue
-			}
-			skipping = false
-		}
-		if strings.TrimSpace(l) == "deja:" && strings.HasPrefix(l, "  ") && !strings.HasPrefix(l, "   ") {
-			skipping = true
+	// Inside `mcp_servers:` and at its own child indent — nothing else. Reading
+	// `deja:` at any depth emptied a server of somebody else's whose env holds
+	// a key by that name, which is a config deja broke while claiming to
+	// uninstall itself (#2730).
+	inBlock := false
+	child := -1
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		if strings.TrimSpace(line) == "mcp_servers:" && yamlIndentWidth(line) == 0 {
+			inBlock, child = true, -1
+			out = append(out, line)
 			continue
 		}
-		out = append(out, l)
+		if inBlock && strings.TrimSpace(line) != "" && yamlIndentWidth(line) == 0 {
+			inBlock, child = false, -1
+		}
+		if inBlock && child < 0 && strings.TrimSpace(line) != "" {
+			child = yamlIndentWidth(line)
+		}
+		if !inBlock || strings.TrimSpace(line) != "deja:" || yamlIndentWidth(line) != child {
+			out = append(out, line)
+			continue
+		}
+		pad := yamlIndentWidth(line)
+		i++
+		for i < len(lines) {
+			if strings.TrimSpace(lines[i]) == "" {
+				// A blank line is inside the block only if the block goes on
+				// after it. The one that separates deja's block from what
+				// follows belongs to the file, and eating it made a second
+				// install differ from the first.
+				j := i
+				for j < len(lines) && strings.TrimSpace(lines[j]) == "" {
+					j++
+				}
+				if j < len(lines) && yamlIndentWidth(lines[j]) > pad {
+					i = j
+					continue
+				}
+				break
+			}
+			if yamlIndentWidth(lines[i]) <= pad {
+				break
+			}
+			i++
+		}
+		i--
 	}
 	return strings.Join(out, "\n")
+}
+
+// hermesBlockIndent is the indent the servers under `mcp_servers:` are written
+// at, and whether there is a block to read one from. deja wrote its own entry
+// at two whatever the file used, so on a config indented at three or four the
+// entry landed shallower than its siblings — and the uninstall that reads
+// "indented further than deja's key" then took those siblings with it (#2730).
+func hermesBlockIndent(s string) (string, bool) {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "mcp_servers:" || yamlIndentWidth(line) != 0 {
+			continue
+		}
+		for _, next := range lines[i+1:] {
+			if strings.TrimSpace(next) == "" {
+				continue
+			}
+			if yamlIndentWidth(next) == 0 {
+				return "", false
+			}
+			return next[:len(next)-len(strings.TrimLeft(next, " \t"))], true
+		}
+		return "", false
+	}
+	return "", false
 }
 
 // setHermesPluginEnabled adds or removes deja from plugins.enabled, touching
@@ -218,6 +285,16 @@ func setHermesPluginEnabled(on bool) error {
 		return nil
 	case !on:
 		s = strings.Replace(s, "\n    - deja", "", 1)
+		// And the block itself, when deja is what put it there. Taking back
+		// only the entry left `plugins:\n  enabled:` behind on every machine
+		// that had no plugins block — an empty key that parses as null — while
+		// the MCP writer one function above already drops what it created
+		// (#2604, #2672). A block the reader wrote stays, empty or not.
+		if blockWasAdded(path, "plugins") {
+			s = strings.Replace(s, "\nplugins:\n  enabled:\n", "\n", 1)
+			s = strings.TrimSuffix(s, "\n\n") + "\n"
+			forgetBlockAdded(path, "plugins")
+		}
 	case strings.Contains(s, "\nplugins:\n  enabled:\n"):
 		s = strings.Replace(s, "\nplugins:\n  enabled:\n", "\nplugins:\n  enabled:\n    - deja\n", 1)
 	case strings.Contains(s, "\nplugins:\n  enabled: []\n"):
@@ -227,6 +304,7 @@ func setHermesPluginEnabled(on bool) error {
 			s += "\n"
 		}
 		s += "\nplugins:\n  enabled:\n    - deja\n"
+		noteBlockAdded(path, "plugins")
 	}
 	_, err = writeIfChanged(path, old, []byte(s))
 	return err

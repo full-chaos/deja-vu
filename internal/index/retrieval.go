@@ -1437,19 +1437,28 @@ func Recent(dir string, n int) ([]model.Session, error) {
 }
 
 func RecentMatching(dir string, n int, o query.Options) ([]model.Session, error) {
+	ss, _, err := RecentMatchingCounted(dir, n, o)
+	return ss, err
+}
+
+// RecentMatchingCounted is RecentMatching with the number of sessions that
+// matched before the cut. The listing shows ten and said nothing about the
+// rest, which reads as the whole answer — the misread #1632 closed for search
+// (#2638) — and the count is already in hand here.
+func RecentMatchingCounted(dir string, n int, o query.Options) ([]model.Session, int, error) {
 	if dir == "" {
 		dir = DefaultDir()
 	}
 	unlock, ok, err := tryLockDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if ok {
 		defer unlock()
 	}
 	m, err := readManifestCached(dir)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	out := make([]model.Session, 0, len(m.Sessions))
 	for _, meta := range m.Sessions {
@@ -1464,10 +1473,11 @@ func RecentMatching(dir string, n int, o query.Options) ([]model.Session, error)
 	// every ranked surface filtered it out (#2541).
 	out = ignoredByPolicy(out)
 	sort.Slice(out, func(i, j int) bool { return newestFirstSession(out[i], out[j]) })
+	total := len(out)
 	if n > 0 && len(out) > n {
 		out = out[:n]
 	}
-	return out, nil
+	return out, total, nil
 }
 
 // displayPath contracts the home directory to ~ in user-facing messages.
@@ -1637,6 +1647,36 @@ func ignoredByPolicy(ss []model.Session) []model.Session {
 			continue
 		}
 		out = append(out, s)
+	}
+	return out
+}
+
+// ProjectsTouchedByIgnore names the projects holding at least one session the
+// ignore rule keeps out of recall.
+//
+// For the callers that read the commands table rather than the sessions. That
+// table keys by project, and the rule matches on the session's path or its
+// project — measured on a real store under the default `*/.claude/jobs/*`, all
+// 305 ignored sessions matched by path and none by project, and the project
+// they sit in is called "run". So a table keyed by project cannot apply the
+// rule exactly, and the honest approximation is to drop a project the rule
+// touches at all: a project mixing ignored and kept sessions is under-reported,
+// which is the right way to be wrong for a line that speaks without being asked
+// (#2652).
+func ProjectsTouchedByIgnore(dir string) map[string]bool {
+	if dir == "" {
+		dir = DefaultDir()
+	}
+	metas, err := AllMeta(dir)
+	if err != nil {
+		return nil
+	}
+	pol := policy.Load()
+	out := map[string]bool{}
+	for _, meta := range metas {
+		if pol.Ignored(meta.Path, meta.Project) {
+			out[meta.Project] = true
+		}
 	}
 	return out
 }
@@ -2303,7 +2343,7 @@ func scanRecordsWithVariants(dir string, m Manifest, o query.Options, offsets []
 		if o.Harness != "" && !harnessMatches(meta.Harness, o.Harness) {
 			return
 		}
-		if o.Project != "" && !strings.Contains(strings.ToLower(meta.Project), strings.ToLower(o.Project)) {
+		if !query.ProjectMatches(meta.Project, meta.From, o.Project) {
 			return
 		}
 		if !fromMatches(meta.From, o.From) {
@@ -2470,7 +2510,7 @@ func sessionMetaMatches(meta SessionMeta, o query.Options) bool {
 	if o.Harness != "" && !harnessMatches(meta.Harness, o.Harness) {
 		return false
 	}
-	if o.Project != "" && !strings.Contains(strings.ToLower(meta.Project), strings.ToLower(o.Project)) {
+	if !query.ProjectMatches(meta.Project, meta.From, o.Project) {
 		return false
 	}
 	if !fromMatches(meta.From, o.From) {

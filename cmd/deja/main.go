@@ -259,6 +259,28 @@ func run(args []string) error {
 	if cmd, ok := commands[args[0]]; ok {
 		return cmd(dir, args[1:])
 	}
+	// A `hook-…` this build does not have is a line in a config an older deja
+	// wrote, not a query: reading it as one ran a search on every session
+	// start — and built the whole index to answer it — while stdout, where a
+	// hook's output is read from, stayed empty (#2718). commandHint already
+	// treats these names as plumbing nobody types.
+	//
+	// Only when a harness is calling: at a terminal this is somebody who
+	// mistyped `hook-context`, and telling them a config calls it is a claim
+	// about their machine that is not true — they keep the search and the near
+	// miss every other mistyped word gets (#674). And only when it is the whole
+	// command line: `deja hook-session timeout` is a query somebody typed, and
+	// no harness passes a retired hook extra arguments.
+	if len(args) == 1 && strings.HasPrefix(args[0], "hook-") && !stdinIsTerminal() {
+		// On stderr: a harness reads stdout as the hook's answer, and on some
+		// of them a bare line there lands in the model's context. This is a
+		// note for whoever reads the logs, not something to inject.
+		// What to do, and only what is true: install writes the hooks this
+		// build has and leaves a line under a name it does not recognise where
+		// it is (#2719), so pointing at it would be advice that does nothing.
+		fmt.Fprintf(os.Stderr, "deja: %q is not a hook this build has — a config still calls it on every session; that line is safe to delete\n", args[0])
+		return nil
+	}
 	return runBareSearch(dir, args, sourceInstance)
 }
 
@@ -919,7 +941,12 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 	if err := checkRole(o.Role); err != nil {
 		return err
 	}
-	ss, err := recentMatching(dir, n, o)
+	// Uncut, because the count the reader is told about has to be the count
+	// they would get by asking again — and the trust policy filters below,
+	// after the cut, so a total taken before it promised rows the policy would
+	// not hand over (#2638). RecentMatching builds the whole matching set
+	// before cutting anyway, so nothing is read twice.
+	ss, _, err := recentMatchingCounted(dir, 0, o)
 	if err != nil {
 		return err
 	}
@@ -928,6 +955,10 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 	// consulted it, while `search` under the same rule refused and said so
 	// (#937). Listing counts as browsing: the search activation governs it.
 	ss, policyHidden := policyFilterSessionsCounted(policy.ActivationSearch, ss)
+	total := len(ss)
+	if n > 0 && len(ss) > n {
+		ss = ss[:n]
+	}
 	// Printing nothing at all and exiting 0 leaves no way to tell whether the
 	// command worked, found nothing, or failed silently — which is what a
 	// fresh install sees. blame already answers this shape of question.
@@ -972,6 +1003,13 @@ func cmdLast(dir string, rest []string, sourceInstance string) error {
 	}
 	if o.JSON {
 		return printRecentJSONWithheld(os.Stdout, ss, sourceInstance, policyHidden)
+	}
+	// The cut is silent everywhere else on this screen: ten rows read as the
+	// whole answer, and the two rules that withhold rows here already have a
+	// line above the list. `last` takes its count as a bare argument, so that
+	// is the form the way out takes (#2638).
+	if total > len(ss) {
+		fmt.Fprintf(os.Stderr, "deja: showing %d of %d — `deja last %d` shows the rest\n", len(ss), total, total)
 	}
 	for _, s := range ss {
 		// A session whose timestamp was missing or unparseable carries the Go
@@ -1242,6 +1280,9 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 			fmt.Fprintf(os.Stderr, "deja: %q matched nothing under %s\n", o.Query, activeFilters(o, sinceRaw, harnessRaw))
 			fmt.Fprint(os.Stderr, emptyRoleNote(dir, o.Role))
 			fmt.Fprint(os.Stderr, olderThanWindow(dir, o.Since))
+			// This branch does not go through printNoMatches, which is where
+			// the line lives for the other miss, so it says it itself.
+			fmt.Fprint(os.Stderr, ignoredHiddenNoteFor("answer", index.IgnoredWithAllTerms(dir, query.Tokens(o.Query))))
 		default:
 			printNoMatches(os.Stderr, dir, o.Query, o.Regex)
 		}
@@ -1265,8 +1306,14 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 	// The answer can also be short for a reason no flag lifts. Counted over the
 	// sessions holding every term, so an ordinary search in a store with a big
 	// ignored tree stays quiet (#2562).
-	if note := ignoredHiddenNoteFor("answer", index.IgnoredWithAllTerms(dir, query.Tokens(o.Query))); note != "" {
-		fmt.Fprint(os.Stderr, note)
+	//
+	// Only where there is an answer to be short: printNoMatches says the same
+	// thing on the way to "try fewer words", and a miss printed it twice
+	// (#2632).
+	if len(hits) > 0 {
+		if note := ignoredHiddenNoteFor("answer", index.IgnoredWithAllTerms(dir, query.Tokens(o.Query))); note != "" {
+			fmt.Fprint(os.Stderr, note)
+		}
 	}
 	// The window this is being printed into, so the lines can be budgeted
 	// rather than assumed 80 wide. Only for a terminal: a pipe gets the whole
@@ -1489,10 +1536,18 @@ func printNoMatches(w io.Writer, dir, q string, regex bool) {
 	// a trust rule the two differ, and "no matches in 1 indexed session — try
 	// fewer words" sent the reader after a wording problem in a session the
 	// rule never let search open (#986).
-	if reach, total, ok := reachableSessionCount(dir); ok && reach == 0 && total > 0 {
+	if reach, trusted, total, ok := reachableSessionCount(dir); ok && reach == 0 && total > 0 {
 		fmt.Fprintf(w, "deja: no matches for %q\n", q)
-		fmt.Fprintf(w, "deja: the trust policy withholds every indexed session from this path (%s: %s) — see %s\n",
-			policy.ActivationSearch, policy.Load().Describe(policy.ActivationSearch), policy.Path())
+		// Which rule emptied the path. Counting the ignore rule here (#2707)
+		// put a store hidden by a path pattern under a sentence about the
+		// trust policy, quoting a trust rule that allows everything.
+		if trusted == 0 {
+			fmt.Fprintf(w, "deja: the trust policy withholds every indexed session from this path (%s: %s) — see %s\n",
+				policy.ActivationSearch, policy.Load().Describe(policy.ActivationSearch), policy.Path())
+		} else {
+			fmt.Fprintf(w, "deja: the ignore rule withholds every indexed session from this path (%s) — see %s\n",
+				strings.Join(policy.Load().IgnorePatterns(), ", "), policy.Path())
+		}
 		return
 	} else if ok {
 		fmt.Fprintf(w, "deja: no matches in %d indexed session%s — try fewer words or --re (query %q)\n", reach, pluralS(reach), q)
@@ -1520,9 +1575,122 @@ func printNoMatches(w io.Writer, dir, q string, regex bool) {
 	if hint := commandHint(q); hint != "" {
 		fmt.Fprint(w, hint)
 	}
+	// Last of the reasons a miss is not a miss, and the only one where deja is
+	// holding the answer rather than withholding it.
+	if hint := roleServedHint(dir, q); hint != "" {
+		fmt.Fprint(w, hint)
+	}
 	if note := hiddenByOwnSettings(); note != "" {
 		fmt.Fprint(w, note)
 	}
+}
+
+// roleServedHint names the answer deja is holding but ranking will never
+// return.
+//
+// Commands, file lists and edits are 38% of the record log and none of it
+// reaches ranking, on purpose: a path that happens to contain the words of a
+// question is not an answer to it. `how` and `blame` serve those roles when
+// asked for by role — so a word that lives only in a command or a filename
+// misses here while both of them answer it, and "try fewer words" is counsel no
+// rewording can follow, the same wrong turn #2562 and #686 closed for the other
+// reasons a miss is not a miss (#2634).
+//
+// Neither half costs a record-log scan: the commands table is a prebuilt
+// artefact and the touched-file lists are one metadata read.
+func roleServedHint(dir, q string) string {
+	terms := query.Tokens(q)
+	if len(terms) == 0 {
+		return ""
+	}
+	var out strings.Builder
+	if n := commandsMatchingWords(dir, terms); n > 0 {
+		match := "match"
+		if n == 1 {
+			match = "matches"
+		}
+		fmt.Fprintf(&out, "deja: %d command%s this machine ran %s it — `deja how %s`\n",
+			n, pluralS(n), match, q)
+	}
+	if n, name := sessionsTouchingWords(dir, terms); n > 0 {
+		fmt.Fprintf(&out, "deja: %d session%s touched %s — `deja blame %s`\n", n, pluralS(n), name, name)
+	}
+	return out.String()
+}
+
+// commandsMatchingWords counts the commands in the recurring-command table that
+// hold every one of these words.
+//
+// Commands rather than sessions, because the table cannot give an honest
+// session count here: one session that ran two matching commands appears under
+// both, ByProject is capped at commandProjectCap, and summing either would
+// state a number that is wrong in a direction the reader cannot see. How many
+// commands match is exact, and it is the number that decides whether `deja how`
+// is worth typing.
+//
+// The trust policy keys on the project, which is what the table carries, so a
+// command is counted only where a project this path may read has it. The ignore
+// rule matches on path or project and the table has no path, so a session
+// ignored by path alone is not excluded here — the same gap `hook-tool` has.
+func commandsMatchingWords(dir string, terms []string) int {
+	pol := policy.Load()
+	n := 0
+	for _, u := range index.ReadCommands(dir) {
+		low := strings.ToLower(u.Command)
+		matched := true
+		for _, t := range terms {
+			if !commandMentions(low, strings.ToLower(t)) {
+				matched = false
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		for proj := range u.ByProject {
+			if pol.Allows(policy.ActivationSearch, proj) && !pol.Ignored("", proj) {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+// sessionsTouchingWords counts the sessions that touched a file whose name
+// holds every one of these words, and names one such file so the reader has
+// something to hand to blame.
+func sessionsTouchingWords(dir string, terms []string) (int, string) {
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return 0, ""
+	}
+	pol := policy.Load()
+	n, name := 0, ""
+	for _, meta := range metas {
+		if !pol.Allows(policy.ActivationSearch, meta.Project) || pol.Ignored(meta.Path, meta.Project) {
+			continue
+		}
+		for _, p := range meta.Touched {
+			base := filepath.Base(filepath.FromSlash(p))
+			low := strings.ToLower(base)
+			matched := true
+			for _, t := range terms {
+				if !strings.Contains(low, strings.ToLower(t)) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				n++
+				if name == "" {
+					name = base
+				}
+				break
+			}
+		}
+	}
+	return n, name
 }
 
 // hiddenByOwnSettings names the states the reader created themselves and can
@@ -1701,7 +1869,9 @@ func olderThanWindow(dir string, since time.Duration) string {
 	if since <= 0 {
 		return ""
 	}
-	ov, err := index.Overview(dir)
+	// Servable: this is advice on a search that came back empty, so the
+	// sessions it counts have to be the ones search could have read (#2650).
+	ov, err := index.OverviewServable(dir)
 	if err != nil || ov.Sessions == 0 || ov.Newest.IsZero() {
 		return ""
 	}
@@ -1801,6 +1971,13 @@ func activeFilters(o search.Options, sinceRaw, harnessRaw string) string {
 	}
 	if o.Session != "" {
 		parts = append(parts, fmt.Sprintf("session %q", o.Session))
+	}
+	// The one filter this did not know about, and the one most likely to match
+	// nothing: --from exists for the multi-machine case, and the name a reader
+	// types comes off another machine. Unnamed, it fell through to "no sessions
+	// indexed yet — run `deja index`" on a store that was fine (#2642).
+	if o.From != "" {
+		parts = append(parts, fmt.Sprintf("from %q", o.From))
 	}
 	// The same predicate filterRecentSources uses. parseDur accepts a negative
 	// duration, and a negative Since filters nothing — naming it would report a
@@ -1956,6 +2133,13 @@ func recent(dir string, n int) ([]model.Session, error) {
 }
 
 func recentMatching(dir string, n int, o search.Options) ([]model.Session, error) {
+	ss, _, err := recentMatchingCounted(dir, n, o)
+	return ss, err
+}
+
+// recentMatchingCounted is recentMatching with how many matched before the cut,
+// so the listing can say what it left out (#2638).
+func recentMatchingCounted(dir string, n int, o search.Options) ([]model.Session, int, error) {
 	if err := index.Ensure(dir, "", false, os.Stderr); err == nil {
 		if o.Role != "" {
 			// The role has to travel into the index query, not just the filter
@@ -1966,17 +2150,17 @@ func recentMatching(dir string, n int, o search.Options) ([]model.Session, error
 			ss, err := index.SearchWithRecovery(dir, search.Options{All: true, Role: o.Role}, io.Discard)
 			if err == nil {
 				ss = filterRecentSources(ss, o)
-				return search.Recent(ss, n), nil
+				return search.Recent(ss, n), len(ss), nil
 			}
-		} else if ss, err := index.RecentMatching(dir, n, o); err == nil {
-			return ss, nil
+		} else if ss, total, err := index.RecentMatchingCounted(dir, n, o); err == nil {
+			return ss, total, nil
 		}
 	}
 	ss := filterRecentSources(loadFileSources(), o)
 	if o.Harness == "" || o.Harness == "opencode" {
 		ss = append(ss, filterRecentSources(sources.LoadOpencodeRecent(n), o)...)
 	}
-	return search.Recent(ss, n), nil
+	return search.Recent(ss, n), len(ss), nil
 }
 
 func parseLast(args []string) (int, search.Options, string, error) {
@@ -2322,6 +2506,15 @@ func runBlame(dir string, args []string) error {
 			fmt.Fprint(os.Stderr, note)
 			return nil
 		}
+		// And the other rule that empties this answer, which said nothing here
+		// while the listing and search both named it (#2632). Before the count
+		// below, for the same reason it goes before "try fewer words": a
+		// denominator that includes the ignored sessions reads as a store that
+		// was searched and came back empty.
+		if note := ignoredHiddenNoteFor("answer", ignoredTouching(dir, target)); note != "" {
+			fmt.Fprint(os.Stderr, note)
+			return nil
+		}
 		// "run deja index" is advice for an empty store. With sessions in the
 		// index it is advice for a state the tool is not in — indexing changes
 		// nothing and doctor reports the stores as found — and it sends the
@@ -2390,6 +2583,33 @@ func blameHits(dir string, target search.BlameTarget, o search.BlameOptions, act
 // manifest. Measured on 500 sessions all touching one file: 0.08s uncapped
 // against 0.02s capped, with the same ten at the top.
 const blameToucherCap = 50
+
+// ignoredTouching counts the sessions that touched this file and are covered by
+// the ignore rule. Not IgnoredWithAllTerms, which the other surfaces use: that
+// reads the text postings, and a file path reaches the index as a `files`
+// record, which is served by role and never ranked — so the count for a blame
+// has to come from the same Touched lists blame itself reads (#2632).
+func ignoredTouching(dir string, target search.BlameTarget) int {
+	metas, err := index.AllMeta(dir)
+	if err != nil {
+		return 0
+	}
+	pol := policy.Load()
+	base := strings.ToLower(filepath.Base(target.FullPath))
+	n := 0
+	for _, meta := range metas {
+		if !pol.Ignored(meta.Path, meta.Project) {
+			continue
+		}
+		for _, p := range meta.Touched {
+			if strings.ToLower(filepath.Base(filepath.FromSlash(p))) == base {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
 
 // withFileTouchers adds the sessions that edited or opened the file but never
 // said its name.
@@ -2800,6 +3020,14 @@ func runForget(dir string, args []string) error {
 				}
 			}
 		default:
+			// An id is not a flag, and every other command that takes one
+			// takes it bare — `show`, `handoff` and `ctx` all do. forget asks
+			// for --session because it is the destructive one, and saying so
+			// is the whole difference between a dead end and one more word to
+			// type (#2656, the lesson #2191 recorded for --harness).
+			if !strings.HasPrefix(args[i], "-") {
+				return fmt.Errorf("forget: a session id goes after --session — `deja forget --session %s`", args[i])
+			}
 			return fmt.Errorf("forget: unknown flag %q", args[i])
 		}
 	}
@@ -3930,21 +4158,30 @@ func forgetKeyOf(dir string, o index.ForgetOptions) string {
 	return ""
 }
 
-// reachableSessionCount reports how many indexed sessions the search
-// activation may read, and how many are indexed in all.
-func reachableSessionCount(dir string) (int, int, bool) {
+// reachableSessionCount reports how many indexed sessions this path may read,
+// how many of those the trust policy alone allows, and how many there are.
+//
+// Both rules withhold, so both are counted (#2707): the trust policy was here
+// from the start (#986) and the ignore rule was not counted at all, which had
+// the empty answer naming twice the history search would open. The trust-only
+// figure is kept because the reader has to be told which of the two emptied
+// their search.
+func reachableSessionCount(dir string) (reach, trusted, total int, ok bool) {
 	metas, err := index.AllMeta(dir)
 	if err != nil {
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
 	pol := policy.Load()
-	reach := 0
 	for _, m := range metas {
-		if pol.Allows(policy.ActivationSearch, m.Project) {
+		if !pol.Allows(policy.ActivationSearch, m.Project) {
+			continue
+		}
+		trusted++
+		if !pol.Ignored(m.Path, m.Project) {
 			reach++
 		}
 	}
-	return reach, len(metas), true
+	return reach, trusted, len(metas), true
 }
 
 // joinCapped lists at most n items and says how many it left out, so a refusal

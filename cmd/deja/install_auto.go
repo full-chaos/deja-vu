@@ -52,7 +52,7 @@ func installCodexHooks(exe string, uninstall bool) (installResult, error) {
 	if hooks, _ := root["hooks"].(map[string]any); len(hooks) == 0 {
 		delete(root, "hooks")
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -410,7 +410,7 @@ func installSettingsHookRetiring(path, event, matcher string, timeout int, cmd s
 	if len(hooks) == 0 {
 		delete(root, "hooks")
 	}
-	next, err := json.MarshalIndent(root, "", "  ")
+	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
 	}

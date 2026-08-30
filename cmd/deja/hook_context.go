@@ -191,6 +191,13 @@ func rewireNote(targets []string) string {
 	return fmt.Sprintf("deja rewrote its wiring for %s after an upgrade — `deja install` is what writes those commands", strings.Join(targets, ", "))
 }
 
+// recallIsOff reports the documented kill switch. One reader rather than a
+// string compare per call site: the second site is what let the environment
+// block past it (#2699).
+func recallIsOff() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("DEJA_RECALL")), search.RecallOff)
+}
+
 // buildNotice is what a session start says while a build runs: the published
 // progress if there is any, the bare promise if the build was only just asked
 // for, and the reason instead when the index cannot be written at all. It is
@@ -296,6 +303,8 @@ func runHookContext(dir string, plain bool) error {
 		// checkout — and exactly where knowing what this machine is missing
 		// helps most. The block is about the machine, not the project, so it
 		// does not depend on the digest having found anything.
+		// The block answers for the switch itself since #2701 — the guard that
+		// stood here is what taught it to.
 		if env, from := environmentBlockFrom(dir, policy.ActivationAuto); env != "" {
 			out := frameRecall(env)
 			// The block is about the machine and names no project, so without
@@ -451,12 +460,19 @@ func runHookContext(dir string, plain bool) error {
 				sessions, plural, why, teaching, svc, polNote, earned)+
 				fmt.Sprintf(" · %s of context", humanBytes(int64(len(digest))))))
 	}
-	// Nothing to recall yet because the index is still being built: say so
-	// rather than starting in silence. The build runs detached, so the agent
-	// is already usable — this only explains why memory is not here yet.
-	if resp.SystemMessage == "" {
-		if st := readWarmupStatus(dir); st != nil {
-			resp.SystemMessage = joinNotes(rewireNote(rewired), joinNotes(stuckWiringNote(stuckWiring), st.line()))
+	// A build under way is said whether or not there is a receipt. Gating it on
+	// an empty message covered the session with nothing to recall and left out
+	// the one that has something: the digest there came from the cache, which
+	// is the user's own history and right to serve (#874), while the store
+	// behind it cannot answer a term until the build lands. What that session
+	// printed was "the agent starts already knowing them" and nothing else
+	// (#2697) — the silence #927 fixed on the environment-facts path, reached
+	// from the other side.
+	if note := buildNotice(dir); note != "" {
+		if resp.SystemMessage == "" {
+			resp.SystemMessage = joinNotes(rewireNote(rewired), joinNotes(stuckWiringNote(stuckWiring), note))
+		} else {
+			resp.SystemMessage = joinNotes(resp.SystemMessage, note)
 		}
 	}
 	if note := unreadableStoreNote(dir); storeNoteIsNews(dir, note) {
@@ -675,7 +691,7 @@ func cachedHookDigest(dir string) (string, int, int64, []string, int, []string, 
 // in the same process with the first one's project (#2182, #2185).
 func cachedHookDigestFor(dir, fromPayload string) (string, int, int64, []string, int, []string, []string) {
 	cwd := hookCWD(fromPayload)
-	if strings.ToLower(strings.TrimSpace(os.Getenv("DEJA_RECALL"))) == search.RecallOff {
+	if recallIsOff() {
 		return "", 0, 0, nil, 0, nil, nil
 	}
 	// Before the cache read: a hit returns without reaching the version guard
