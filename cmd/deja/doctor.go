@@ -982,6 +982,16 @@ func doctorMCP(w io.Writer) {
 			status = "plugin"
 		}
 		fmt.Fprintf(w, "  %-12s %-14s guidance %-11s %s\n", c.name, status, guidanceStatus(guidanceHarness(c.name)), reportPath(c.path))
+		// One "wired" can be two registrations: a hand add under another name
+		// — the project is called deja-vu, after all — plus the `deja` a later
+		// install wrote beside it. Each session then starts the server twice
+		// and carries the tool schema twice, and the boolean above cannot say
+		// so (#2269).
+		if status == "wired" && c.dupes != nil {
+			if keys := c.dupes(c.path); len(keys) >= 2 {
+				fmt.Fprintf(w, "  %-12s %s\n", "", doctorMCPDuplicateNote(keys))
+			}
+		}
 		// "Wired" says the server is declared, not that it can start. A config
 		// naming a binary that is gone — a restored backup, a hand edit, a
 		// machine where deja moved and one file was fixed by hand — read as
@@ -996,6 +1006,22 @@ func doctorMCP(w io.Writer) {
 			fmt.Fprintf(w, "  %-12s %s\n", "", note)
 		}
 	}
+}
+
+// doctorMCPDuplicateNote is the line a duplicated setup never got to read: it
+// names every key so the reader can decide which one is theirs. Which one to
+// remove is not deja's call — one of them may be a hand add carrying fields
+// deja does not know about (#2269).
+func doctorMCPDuplicateNote(keys []string) string {
+	quoted := make([]string, len(keys))
+	for i, key := range keys {
+		quoted[i] = "`" + strings.ReplaceAll(key, "`", "'") + "`"
+	}
+	names := strings.Join(quoted, ", ")
+	if len(keys) == 2 {
+		return fmt.Sprintf("two entries in this config run deja (%s) — every session starts the server twice", names)
+	}
+	return fmt.Sprintf("%d entries in this config run deja (%s) — every session starts the server %d times", len(keys), names, len(keys))
 }
 
 // dejaCommandMissing returns the deja binary a config names when that file is
@@ -1116,27 +1142,31 @@ type doctorMCPConfig struct {
 	name  string
 	path  string
 	wired func(string) bool
+	// dupes lists every key in the config that runs deja, so doctorMCP can say
+	// when "wired" is really two registrations (#2269). Nil where the format
+	// has no counting probe — the boolean is then all doctor can promise.
+	dupes func(string) []string
 }
 
 func doctorMCPConfigs() []doctorMCPConfig {
 	return []doctorMCPConfig{
-		{"claude-code", sources.ClaudeJSONPath(), doctorJSONWired("mcpServers")},
-		{"codex", filepath.Join(sources.CodexHome(), "config.toml"), doctorTOMLWired},
-		{"opencode", doctorOpencodeConfigPath(), doctorJSONWired("mcp")},
-		{"cursor", filepath.Join(sources.CursorCLIHome(), "mcp.json"), doctorJSONWired("mcpServers")},
-		{"gemini", filepath.Join(sources.GeminiHome(), "settings.json"), doctorJSONWired("mcpServers")},
-		{"antigravity", filepath.Join(antigravityConfigHome(), "mcp_config.json"), doctorJSONWired("mcpServers")},
-		{"grok", filepath.Join(sources.GrokHome(), "config.toml"), doctorTOMLWired},
-		{"qwen", filepath.Join(sources.QwenConfigDir(), "settings.json"), doctorJSONWired("mcpServers")},
-		{"kimi", filepath.Join(sources.KimiConfigDir(), "mcp.json"), doctorJSONWired("mcpServers")},
-		{"cline", sources.ClineMCPSettingsPath(), doctorJSONWired("mcpServers")},
-		{"pi", filepath.Join(sources.PiConfigDir(), "mcp.json"), doctorJSONWired("mcpServers")},
-		{"omp", filepath.Join(sources.OmpConfigDir(), "mcp.json"), doctorJSONWired("mcpServers")},
-		{"openclaw", filepath.Join(sources.OpenClawStateDir(), "openclaw.json"), doctorOpenClawWired},
-		{"copilot", guidancePath("copilot"), doctorFileWired},
-		{"hermes", filepath.Join(sources.HermesHome(), "config.yaml"), doctorHermesWired},
-		{"goose", filepath.Join(gooseConfigDir(), "config.yaml"), doctorGooseWired},
-		{"zed", sources.ZedSettingsPath(), doctorZedWired},
+		{"claude-code", sources.ClaudeJSONPath(), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"codex", filepath.Join(sources.CodexHome(), "config.toml"), doctorTOMLWired, doctorTOMLDejaKeys},
+		{"opencode", doctorOpencodeConfigPath(), doctorJSONWired("mcp"), doctorJSONDejaKeys("mcp")},
+		{"cursor", filepath.Join(sources.CursorCLIHome(), "mcp.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"gemini", filepath.Join(sources.GeminiHome(), "settings.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"antigravity", filepath.Join(antigravityConfigHome(), "mcp_config.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"grok", filepath.Join(sources.GrokHome(), "config.toml"), doctorTOMLWired, doctorTOMLDejaKeys},
+		{"qwen", filepath.Join(sources.QwenConfigDir(), "settings.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"kimi", filepath.Join(sources.KimiConfigDir(), "mcp.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"cline", sources.ClineMCPSettingsPath(), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"pi", filepath.Join(sources.PiConfigDir(), "mcp.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"omp", filepath.Join(sources.OmpConfigDir(), "mcp.json"), doctorJSONWired("mcpServers"), doctorJSONDejaKeys("mcpServers")},
+		{"openclaw", filepath.Join(sources.OpenClawStateDir(), "openclaw.json"), doctorOpenClawWired, nil},
+		{"copilot", guidancePath("copilot"), doctorFileWired, nil},
+		{"hermes", filepath.Join(sources.HermesHome(), "config.yaml"), doctorHermesWired, nil},
+		{"goose", filepath.Join(gooseConfigDir(), "config.yaml"), doctorGooseWired, nil},
+		{"zed", sources.ZedSettingsPath(), doctorZedWired, nil},
 	}
 }
 
@@ -1217,9 +1247,43 @@ func doctorJSONWired(key string) func(string) bool {
 	}
 }
 
+// doctorJSONDejaKeys lists every key in the config's server block that runs
+// deja: the literal `deja` first, then the hand-named rest in sorted order, so
+// the duplicate line reads the same on every run (#2269). Nil on a file that
+// will not parse — the substring fallback above can say "wired", but it
+// cannot count.
+func doctorJSONDejaKeys(key string) func(string) []string {
+	return func(path string) []string {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var root map[string]any
+		if json.Unmarshal(b, &root) != nil {
+			return nil
+		}
+		m, _ := root[key].(map[string]any)
+		if m == nil {
+			return nil
+		}
+		var out []string
+		if _, ok := m["deja"]; ok {
+			out = append(out, "deja")
+		}
+		var rest []string
+		for name, entry := range m {
+			if name != "deja" && mcpEntryRunsDeja(entry) {
+				rest = append(rest, name)
+			}
+		}
+		sort.Strings(rest)
+		return append(out, rest...)
+	}
+}
+
 // mcpEntryRunsDeja reports whether an MCP server entry launches deja, in any
-// of the shapes clients accept: a bare command, a command plus args, or a
-// nested transport object.
+// of the shapes clients accept: a bare command, a command plus args, a command
+// written as one list, or a nested transport object.
 func mcpEntryRunsDeja(v any) bool {
 	m, _ := v.(map[string]any)
 	if m == nil {
@@ -1230,9 +1294,18 @@ func mcpEntryRunsDeja(v any) bool {
 			return true
 		}
 	}
-	cmd, _ := m["command"].(string)
-	if commandIsDeja(cmd) {
-		return true
+	switch cmd := m["command"].(type) {
+	case string:
+		if commandIsDeja(cmd) {
+			return true
+		}
+	case []any:
+		// Opencode's entry keeps the command as one list, written by deja's own installer.
+		for _, word := range cmd {
+			if s, ok := word.(string); ok && commandIsDeja(s) {
+				return true
+			}
+		}
 	}
 	// Windows and npx-style wiring puts the binary in args instead.
 	args, _ := m["args"].([]any)
@@ -1258,26 +1331,61 @@ func commandIsDeja(cmd string) bool {
 }
 
 func doctorTOMLWired(path string) bool {
+	return len(doctorTOMLDejaKeys(path)) > 0
+}
+
+// doctorTOMLDejaKeys is the TOML side of the same count: every
+// `[mcp_servers.X]` block that runs deja, the literal `deja` first (its header
+// alone is enough — deja wrote it), then the hand-named rest sorted (#2269).
+// Same reasoning as the JSON probe for the names: a hand-wired server under
+// another name still runs deja. Attribution is per block rather than the old
+// whole-file scan, because a `command` line elsewhere in this config — a hook,
+// say — is not MCP wiring; and args count as well as command, since Windows
+// wiring runs deja behind a `cmd /c` shim.
+func doctorTOMLDejaKeys(path string) []string {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return nil
 	}
-	if strings.Contains(string(b), "[mcp_servers.deja]") {
-		return true
-	}
-	// Same reasoning as the JSON probe: a hand-wired server under another
-	// name still runs deja. The TOML here is small and flat enough that
-	// finding a command line naming the binary is enough.
+	found := map[string]bool{}
+	current := ""
 	for _, line := range strings.Split(string(b), "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if !ok || strings.TrimSpace(key) != "command" {
+		if key, ok := tomlMCPHeader(line); ok {
+			current = key
+			if key == "deja" {
+				found[key] = true
+			}
 			continue
 		}
-		if commandIsDeja(strings.Trim(strings.TrimSpace(value), `"`)) {
-			return true
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			current = ""
+			continue
+		}
+		if current == "" || found[current] {
+			continue
+		}
+		key, value, ok := tomlLineKeyValue(line)
+		if !ok || (key != "command" && key != "args") {
+			continue
+		}
+		for _, value := range tomlStringValues(value) {
+			if commandIsDeja(value) {
+				found[current] = true
+				break
+			}
 		}
 	}
-	return false
+	var out []string
+	if found["deja"] {
+		out = append(out, "deja")
+		delete(found, "deja")
+	}
+	rest := make([]string, 0, len(found))
+	for key := range found {
+		rest = append(rest, key)
+	}
+	sort.Strings(rest)
+	return append(out, rest...)
 }
 
 // indexFormatDirection is a variable so a test can put doctor in front of an
