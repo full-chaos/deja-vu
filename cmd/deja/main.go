@@ -150,7 +150,7 @@ var commands = map[string]command{
 	"remember":      runRemember,
 	"promote":       func(dir string, rest []string) error { return runPromote(dir, rest, os.Stdout) },
 	"forget":        runForget,
-	"mcp":           func(dir string, _ []string) error { return serveMCP(dir, os.Stdin, os.Stdout) },
+	"mcp":           func(dir string, _ []string) error { return serveMCPProcess(dir, os.Stdin, os.Stdout) },
 	"hook-prompt": func(dir string, rest []string) error {
 		if sayIfTypedByHand("hook-prompt") {
 			return nil
