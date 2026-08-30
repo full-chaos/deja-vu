@@ -107,6 +107,13 @@ type Event struct {
 	// only the newest could be named, through --last (#2307). It is the other
 	// direction from SessionIDs: what was served, and to whom.
 	Into string `json:"into,omitempty"`
+	// Unreadable marks an injection whose host sent a payload deja could not
+	// decode. The memory still goes out — an agent that asked for context gets
+	// it — and without this the row is identical to one from a host that sent
+	// nothing at all (#2161). It says nothing about the receiver: a decode
+	// that fails on one field keeps the ones it read, so `into` can be there
+	// beside it.
+	Unreadable bool `json:"unreadable,omitempty"`
 }
 
 type Summary struct {
@@ -226,6 +233,12 @@ func recordFull(indexDir, kind string, bytes, sessions int, empty bool, raw int6
 // time.Now() calls left the two logs disagreeing by microseconds about the same
 // injection, and nothing else joins them (#2294).
 func recordFullAt(indexDir, kind string, bytes, sessions int, empty bool, raw int64, ids []string, into string, at time.Time) {
+	recordFullAtUnread(indexDir, kind, bytes, sessions, empty, raw, ids, into, at, false)
+}
+
+// recordFullAtUnread is recordFullAt for an injection whose receiver was in a
+// payload deja could not decode (#2161).
+func recordFullAtUnread(indexDir, kind string, bytes, sessions int, empty bool, raw int64, ids []string, into string, at time.Time, unreadable bool) {
 	p := Path(indexDir)
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return
@@ -246,7 +259,7 @@ func recordFullAt(indexDir, kind string, bytes, sessions int, empty bool, raw in
 		return
 	}
 	defer func() { _ = f.Close() }()
-	b, err := json.Marshal(Event{Time: at, Kind: kind, Bytes: bytes, Sessions: sessions, Empty: empty, RawBytes: raw, SessionIDs: ids, Into: into})
+	b, err := json.Marshal(Event{Time: at, Kind: kind, Bytes: bytes, Sessions: sessions, Empty: empty, RawBytes: raw, SessionIDs: ids, Into: into, Unreadable: unreadable})
 	if err != nil {
 		return
 	}
