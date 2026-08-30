@@ -144,25 +144,46 @@ func runHow(dir string, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "no command on this machine mentions %q\n", strings.Join(terms, " "))
 		return nil
 	}
+	writeHowEntries(stdout, entries, limit, " · last ")
+	// The cap said nothing, so eight of thirteen ways to run the tests read as
+	// thirteen — the misread the search screen already avoids (#1632). On
+	// stderr, where search puts the same line: stdout stays the list.
+	if note := howCapNote(len(entries), limit, "raise --limit for the rest"); note != "" {
+		fmt.Fprintf(os.Stderr, "deja: %s\n", note)
+	}
+	return nil
+}
+
+// writeHowEntries is the answer both surfaces print. The MCP tool used to
+// build its own copy of this loop, so what the CLI learned to say the agent
+// never heard — and the cap note was the drift showing (#1634). The one
+// difference that is real stays a parameter: the separator before the date.
+func writeHowEntries(w io.Writer, entries []howEntry, limit int, lastSep string) {
 	for i, e := range entries {
 		if i >= limit {
 			break
 		}
 		when := ""
 		if !e.Last.IsZero() {
-			when = " · last " + e.Last.Local().Format("2006-01-02")
+			when = lastSep + e.Last.Local().Format("2006-01-02")
 		}
-		fmt.Fprintf(stdout, "%s\n", search.SafeCommand(e.Command))
-		fmt.Fprintf(stdout, "  ran %s in %s%s%s\n",
+		// The command itself, kept the way a person would copy it, folded onto
+		// one line so a newline in it cannot forge a row of deja's (#1863).
+		fmt.Fprintf(w, "%s\n", search.SafeCommand(e.Command))
+		fmt.Fprintf(w, "  ran %s in %s%s%s\n",
 			pluralRuns(e.Runs), pluralSessions(len(e.Sessions)), when, e.failureNote())
 	}
-	// The cap said nothing, so eight of thirteen ways to run the tests read as
-	// thirteen — the misread the search screen already avoids (#1632). On
-	// stderr, where search puts the same line: stdout stays the list.
-	if len(entries) > limit {
-		fmt.Fprintf(os.Stderr, "deja: showing %d of %d — raise --limit for the rest\n", limit, len(entries))
+}
+
+// howCapNote is the sentence that says the list was cut, or empty when it was
+// not. One sentence, so the agent and the reader are told the same thing —
+// except for how to see the rest, which is a flag at a terminal and another
+// call over MCP, where there is no flag to raise.
+func howCapNote(found, limit int, raise string) string {
+	if found <= limit {
+		return ""
 	}
-	return nil
+	return fmt.Sprintf("showing %d of %d — %s", limit, found, raise)
 }
 
 // howEntries groups the commands that mention every term, so the same
