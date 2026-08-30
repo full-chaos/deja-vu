@@ -146,7 +146,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	// Say so and name the one command that restores it, rather than silently
 	// clearing a tombstone the reader set on purpose.
 	if noteID := "deja-note-" + strings.ReplaceAll(src, ":", "-"); index.Tombstoned("deja:" + noteID) {
-		fmt.Fprintf(os.Stderr, "deja: the note is written but stays hidden — %s was forgotten, and its tombstone lifts only through `deja forget --unforget deja:%s`\n", noteID, noteID)
+		fmt.Fprint(os.Stderr, tombstoneHint("the note is written", noteID))
 	}
 	if exportPath != "" {
 		masked, err := exportPromoted(exportPath, title, text, src, state, s.Updated)
@@ -154,7 +154,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 			// The note is already written by this point, so failing with a bare
 			// syscall told the reader their decision was lost when it was not
 			// — and named a path with nothing to do about it (#871).
-			fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, search.SafeNote(title))
+			fmt.Fprintf(stdout, "promoted %s as %s: %s\n", safeForStatusline(src, 200), state, search.SafeNote(title))
 			return fmt.Errorf("the note is kept, but %s could not be written (%s) — export it somewhere you can, or read the note back with `deja show %s`",
 				exportPath, exportFailureReason(err), "deja-note-"+strings.ReplaceAll(src, ":", "-"))
 		}
@@ -164,7 +164,7 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 		// rewritten — the warning is what was missing (#848).
 		fmt.Fprintf(os.Stderr, "deja: %d secret%s masked in this file. pattern redaction is a floor — review before sending; rotate anything that leaked.\n", masked, pluralS(masked))
 	}
-	fmt.Fprintf(stdout, "promoted %s as %s: %s\n", src, state, search.SafeNote(title))
+	fmt.Fprintf(stdout, "promoted %s as %s: %s\n", safeForStatusline(src, 200), state, search.SafeNote(title))
 	if line := markTakenBack(src, state, prior); line != "" {
 		fmt.Fprintln(stdout, line)
 	}
@@ -197,7 +197,8 @@ func runPromote(dir string, args []string, stdout io.Writer) error {
 	// The id deja resolved, not the one the reader typed: a prefix that stood
 	// for several sessions would send the correction to whichever is newest —
 	// measured, that was a different session from the one just marked (#884).
-	fmt.Fprintln(stdout, "the note now outranks the raw transcript in recall; corrections append with `deja promote", s.ID, "--state <state>`")
+	quoted := pasteSafe(s.ID)
+	fmt.Fprintf(stdout, "the note now outranks the raw transcript in recall; corrections append with `deja promote %s --state <state>`%s\n", quoted, pasteSafeCaveat(quoted))
 	return nil
 }
 
