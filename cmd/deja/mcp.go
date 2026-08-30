@@ -333,9 +333,20 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		if line := buildingNowForAgent(dir); line != "" {
 			return frameRecall(line), nil
 		}
-		text, sessions, raw, ids, projects, err := recallContextResultFrom(dir, a.Query, a.Harness)
+		text, sessions, raw, ids, projects, note, err := recallContextResultFrom(dir, a.Query, a.Harness)
 		if err == nil {
-			text = frameRecall(fitContextDigest(text, a.Query, contextMCPBudget-recallFrameOverhead))
+			// Above the frame, the way the resource reader puts its own note:
+			// inside it, deja's statement of fact would read as recalled text
+			// the agent has just been told not to trust. Its room comes out of
+			// the budget before the trim, not after — added afterwards it put
+			// the reply over the size this tool documents, which is what
+			// #1797 fixed for the frame itself.
+			lead := ""
+			if note != "" {
+				lead = "deja: " + note + "\n\n"
+			}
+			text = frameRecall(fitContextDigest(text, a.Query, contextMCPBudget-recallFrameOverhead-len(lead)))
+			text = lead + text
 			usage.RecordServedFrom(dir, usage.KindContext, text, sessions, raw, ids, projects, policy.Load().Describe(policy.ActivationMCP))
 		}
 		return text, err
@@ -1252,6 +1263,11 @@ func recallContext(dir, q string) (string, error) {
 type idContext struct {
 	session string
 	size    int64
+	// note is deja's own word about the session — today, that it was
+	// forgotten. It travels beside the text rather than inside it, because
+	// the frame the text goes into tells the reader to treat what it holds as
+	// untrusted, and this is not recalled content (#1624).
+	note string
 }
 
 // contextByID answers from the session an id-prefix names, for the tool an
@@ -1280,27 +1296,35 @@ func contextByID(dir, q string) (string, idContext, bool) {
 	}
 	var b bytes.Buffer
 	search.PrintContext(&b, whole, "")
-	return b.String(), idContext{session: whole.ID, size: rawSize([]model.Session{whole})}, true
+	// The fact before the content, the way the CLI prints it: an agent handed
+	// the note promoted from a session it named has to be told the session was
+	// forgotten (#1624). It travels out of band — see idContext.note — because
+	// deja's own words do not belong inside a frame that tells the reader to
+	// treat what it holds as untrusted.
+	return b.String(), idContext{session: whole.ID, size: rawSize([]model.Session{whole}),
+		// FindByPrefix resolved this session from the selector, so a prefix
+		// here is honest by construction.
+		note: forgottenSourceNote(whole, q, true)}, true
 }
 
 // recallContextResult keeps the four-value shape its callers and tests read.
 func recallContextResult(dir, q, harness string) (string, int, int64, []string, error) {
-	text, sessions, raw, ids, _, err := recallContextResultFrom(dir, q, harness)
+	text, sessions, raw, ids, _, _, err := recallContextResultFrom(dir, q, harness)
 	return text, sessions, raw, ids, err
 }
 
 // recallContextResultFrom is recallContextResult plus the project behind the
 // session it served, for the reason recallTextResultFrom exists (#2324).
-func recallContextResultFrom(dir, q, harness string) (string, int, int64, []string, []string, error) {
+func recallContextResultFrom(dir, q, harness string) (string, int, int64, []string, []string, string, error) {
 	o := search.Options{Query: nfcfold.Compose(q), Harness: harness, All: true, RecallWorn: usage.WornSessions(dir)}
 	if stale, err := index.EnsureForSearchStale(dir, o, mcpProgress()); err != nil {
-		return "", 0, 0, nil, nil, err
+		return "", 0, 0, nil, nil, "", err
 	} else if stale {
 		requestWarmup(dir)
 	}
 	result, err := index.SearchWithRecoveryDetailed(dir, o, mcpProgress())
 	if err != nil {
-		return "", 0, 0, nil, nil, err
+		return "", 0, 0, nil, nil, "", err
 	}
 	ss := result.Sessions
 	o.Tier = result.Tier
@@ -1319,7 +1343,7 @@ func recallContextResultFrom(dir, q, harness string) (string, int, int64, []stri
 	} else if result.Tier == search.TierRelevance {
 		hits = search.RelevanceHitsWeighted(ss, index.RelevanceMatchTerms(q), result.TermIDF)
 	} else if hits, err = search.Run(ss, o); err != nil {
-		return "", 0, 0, nil, nil, err
+		return "", 0, 0, nil, nil, "", err
 	}
 	hits, policyHidden := policyFilterHitsCounted(policy.ActivationMCP, hits)
 	var semantic bool
@@ -1338,9 +1362,9 @@ func recallContextResultFrom(dir, q, harness string) (string, int, int64, []stri
 		// After the search, like the CLI does since #1614: there is no answer
 		// left for the id to shadow.
 		if text, id, ok := contextByID(dir, q); ok {
-			return text, 1, id.size, []string{id.session}, nil, nil
+			return text, 1, id.size, []string{id.session}, nil, id.note, nil
 		}
-		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil, nil
+		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil, "", nil
 	}
 	// The same order the search screen shows: this handed the agent a session
 	// the reader had rejected, while search demoted it and said why (#1099).
@@ -1360,7 +1384,10 @@ func recallContextResultFrom(dir, q, harness string) (string, int, int64, []stri
 	if hits[0].Tier != search.TierExact {
 		text = "[" + hits[0].Tier + "]\n" + text
 	}
-	return text, 1, rawSize([]model.Session{whole}), []string{whole.ID}, projectsOf(whole), nil
+	return text, 1, rawSize([]model.Session{whole}), []string{whole.ID}, projectsOf(whole),
+		// The search path reaches a promoted note as often as the id path
+		// does — the note carries the id in its own text.
+		forgottenSourceNote(whole, q, false), nil
 }
 
 func mcpProgress() io.Writer {
