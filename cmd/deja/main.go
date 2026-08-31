@@ -119,6 +119,72 @@ func loadFileSources() []model.Session {
 	return ss
 }
 
+// worksWithNoHome names the commands that never write under a home directory
+// they cannot find: they print, or they diagnose the very state the guard is
+// about, or they carry their own refusal.
+//
+// `version` and `help` write nothing at all and are what a packager runs;
+// `completion` is sourced from a shell rc file; `update` replaces the binary
+// and is how somebody gets out of a broken state; `doctor` and `sources` are
+// where every other message sends the reader to find out what deja can see;
+// and install carries #1690's own guard, whose advice is the right one for it.
+var worksWithNoHome = map[string]bool{
+	"version": true, "--version": true, "-version": true,
+	"help": true, "--help": true, "-h": true,
+	"completion": true, "update": true,
+	"doctor": true, "sources": true,
+	"install": true, "uninstall": true,
+}
+
+// dispatchKnows reports whether a word is a command deja runs, from either
+// half of the dispatcher: the map, and the switch above it that holds the five
+// commands taking their own argument parsing.
+func dispatchKnows(name string) bool {
+	if _, ok := commands[name]; ok {
+		return true
+	}
+	switch name {
+	case "show", "last", "search", "aider", "goose":
+		return true
+	}
+	return false
+}
+
+// homelessRefusal answers what to do when deja cannot find a home directory
+// and nothing else says where its index goes.
+//
+// A command somebody typed says why it cannot run. A hook does not: it runs
+// unattended on every prompt, a refusal would cost the turn, and the whole
+// design of the hooks is to fail open and stay quiet (#1692). Either way
+// nothing is written, which is the part that matters — the index is a database,
+// and it was landing in whatever repository the agent was working in.
+func homelessRefusal(name string) (bool, error) {
+	// Both roots: the index answers to DEJA_INDEX_DIR, and the config
+	// directory to XDG_CONFIG_HOME, so one of them being absolute says
+	// nothing about the other.
+	if filepath.IsAbs(index.DefaultDir()) && filepath.IsAbs(xdgConfigHome()) {
+		return false, nil
+	}
+	if worksWithNoHome[name] {
+		// Only a name the dispatcher will actually take: `-v` is not a
+		// command, so allowlisting it let it through the guard, miss the map
+		// and land in the bare-query path — which builds an index (#1692).
+		if _, known := commands[name]; known {
+			return false, nil
+		}
+	}
+	if strings.HasPrefix(name, "hook-") || name == "statusline" || name == "warmup-status" {
+		return true, nil
+	}
+	// The command's own name, or deja's: for a bare query the first word is
+	// the reader's, and "retry cannot find your home directory" reads as if
+	// `retry` were a command.
+	if !dispatchKnows(name) {
+		name = "deja"
+	}
+	return true, fmt.Errorf("%s cannot find your home directory — set HOME, or DEJA_INDEX_DIR and XDG_CONFIG_HOME to absolute paths", name)
+}
+
 type command func(dir string, rest []string) error
 
 var commands = map[string]command{
@@ -226,6 +292,19 @@ var commands = map[string]command{
 
 func run(args []string) error {
 	dir := index.DefaultDir()
+	// Before anything reads or writes: every path deja writes hangs off the
+	// home directory, and it answers "" when there is none, so
+	// `filepath.Join("", ".cache", "deja")` is `.cache/deja` — deja built its
+	// index in whatever directory it happened to be run from, on the commands
+	// an agent runs unattended as much as on the ones a person types. #1690
+	// fixed install; this is the rest (#1692).
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	}
+	if stop, err := homelessRefusal(name); stop {
+		return err
+	}
 	if len(args) == 0 {
 		// briefWanted, not logoWanted: a reader who turned colour off still
 		// has an index and a terminal, and the brief is what that reader came
@@ -240,7 +319,10 @@ func run(args []string) error {
 	warnBrokenPolicy(args[0], os.Stderr)
 	if wantsHelp(args[1:]) {
 		if h := helpForCommand(args[0]); h != "" {
-			fmt.Print(h)
+			// The same width the page itself respects: `deja last --help`
+			// quotes the widest line in it, so a single command's help was
+			// the one most likely to wrap (#1661).
+			fmt.Print(wrapUsage(h, printableWidth(os.Stdout)))
 			return nil
 		}
 	}
@@ -891,7 +973,7 @@ func cmdCtx(dir string, rest []string) error {
 	// A short selector never reaches the id branch above, so a forgotten
 	// session's note arrives as an ordinary hit — and the answer still has to
 	// say the session is gone (#971).
-	noteForgottenSource(hits[0].Session, q)
+	noteForgottenSource(hits[0].Session, q, false)
 	// The hit carries the matching snippets, not the session: for a promoted
 	// note that meant the correction — which rarely repeats the words of the
 	// decision — was missing, and the command whose whole job is packaging
@@ -1229,9 +1311,9 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 			// "run:" is the name of a function, and the reader of this line is
 			// someone who mistyped a pattern (#2286). The only error that
 			// reaches here in practice is the regexp compile, so it says which
-			// input to look at.
+			// input to look at, in the words the other bad flags use (#1602).
 			if o.Regex {
-				return fmt.Errorf("--re pattern: %w", rerr)
+				return rePatternError(o.Query, rerr)
 			}
 			return rerr
 		}
@@ -1542,11 +1624,11 @@ func printNoMatches(w io.Writer, dir, q string, regex bool) {
 		// put a store hidden by a path pattern under a sentence about the
 		// trust policy, quoting a trust rule that allows everything.
 		if trusted == 0 {
-			fmt.Fprintf(w, "deja: the trust policy withholds every indexed session from this path (%s: %s) — see %s\n",
-				policy.ActivationSearch, policy.Load().Describe(policy.ActivationSearch), policy.Path())
+			fmt.Fprintf(w, "deja: the trust policy withholds every indexed session from this path (%s: %s)%s\n",
+				policy.ActivationSearch, policy.Load().Describe(policy.ActivationSearch), seePolicyFile())
 		} else {
-			fmt.Fprintf(w, "deja: the ignore rule withholds every indexed session from this path (%s) — see %s\n",
-				strings.Join(policy.Load().IgnorePatterns(), ", "), policy.Path())
+			fmt.Fprintf(w, "deja: the ignore rule withholds every indexed session from this path (%s)%s\n",
+				strings.Join(policy.Load().IgnorePatterns(), ", "), seePolicyFile())
 		}
 		return
 	} else if ok {
@@ -2104,7 +2186,7 @@ func findByPrefix(dir, p string) (model.Session, bool, error) {
 	if err := index.Ensure(dir, "", false, os.Stderr); err == nil {
 		if s, ok, err := index.FindByPrefix(dir, p); err == nil {
 			if ok {
-				noteForgottenSource(s, p)
+				noteForgottenSource(s, p, true)
 			}
 			return s, ok, nil
 		}
@@ -2527,6 +2609,11 @@ func runBlame(dir string, args []string) error {
 		return nil
 	}
 	search.PrintBlame(os.Stdout, hits, false)
+	// The name the reader has is the one in their editor, and a rename drops
+	// everything said under the old one out of this answer (#1627).
+	if note := earlierNameNote(dir, path, target); note != "" {
+		fmt.Fprint(os.Stderr, note)
+	}
 	// blame answers "who touched this file". Ten blocks and nothing else reads
 	// as all of them, the misread search already avoids with the same sentence
 	// (#2299). --json keeps its bare array: a machine consumer reading a total
@@ -3061,7 +3148,8 @@ func runForget(dir string, args []string) error {
 			fmt.Fprintln(os.Stderr, "deja: nothing is forgotten on this machine")
 		}
 		if len(keys) > 0 {
-			fmt.Fprintf(os.Stderr, "deja: `deja forget --unforget %s` brings one back and rebuilds the index\n", keys[0])
+			quoted := pasteSafe(keys[0])
+			fmt.Fprintf(os.Stderr, "deja: `deja forget --unforget %s` brings one back and rebuilds the index%s\n", quoted, pasteSafeCaveat(quoted))
 		}
 		return nil
 	}
@@ -3117,7 +3205,11 @@ func runForget(dir string, args []string) error {
 			// The ids, not just the count: this is the moment someone checks
 			// that they got back exactly what they lost, and both the list and
 			// the ambiguity refusal name them a step earlier (#1095, #1014).
-			fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index — %s\n", back, pluralS(back), joinCapped(names, 5))
+			// Prose, not a command: the names are read, not pasted, so they
+			// are neutralised rather than quoted. Raw, an escape byte in a
+			// project name landed here on the line after the hint that told
+			// the reader to run this (#1794).
+			fmt.Fprintf(os.Stdout, "restored %d session%s and rebuilt the index — %s\n", back, pluralS(back), safeForStatusline(joinCapped(names, 5), 200))
 		}
 		for _, line := range unforgetGoneLines(missing) {
 			fmt.Fprintln(os.Stdout, line)
@@ -3439,7 +3531,7 @@ var helpHidden = map[string]bool{
 }
 
 func printUsage() {
-	fmt.Print(usageText())
+	fmt.Print(wrapUsage(usageText(), printableWidth(os.Stdout)))
 }
 
 // usageText renders the usage block so `--help` on a single command can quote
@@ -4114,30 +4206,75 @@ func sharedRowsAmong(dir string, keys []string) int {
 // session that has been forgotten. Asking for the session by the id you
 // remember answered with the note and said nothing, so the reply looked like
 // the session itself until you noticed the id had changed (#971).
-func noteForgottenSource(s model.Session, selector string) {
+func noteForgottenSource(s model.Session, selector string, resolved bool) {
+	if line := forgottenSourceNote(s, selector, resolved); line != "" {
+		fmt.Fprintf(os.Stderr, "deja: %s\n", line)
+	}
+}
+
+// forgottenSourceNote is the sentence itself, so every surface can carry it.
+// resolved says the selector reached this session through a prefix lookup: on
+// that path any prefix is honest by construction, and a length rule would only
+// guess at what the resolver already answered.
+// It lived inside the printer, which meant the CLI said a session was
+// forgotten and the MCP tools handed an agent the same note with the fact
+// removed — and "forgotten" is a decision the reader made about that session,
+// which is the kind of fact recall exists to carry (#1624).
+func forgottenSourceNote(s model.Session, selector string, resolved bool) string {
 	if s.Harness != "deja" || !strings.HasPrefix(s.ID, "deja-note-") {
-		return
+		return ""
 	}
 	src, ok := strings.CutPrefix(s.ID, "deja-note-")
 	if !ok || src == "" {
-		return
+		return ""
 	}
 	// The selector named the source, not the note: a reader who typed the note
 	// id knows what they asked for.
 	if strings.HasPrefix(s.ID, selector) {
-		return
+		return ""
 	}
 	key := strings.Replace(src, "-", ":", 1)
 	// Only when the reader named that session: an ordinary topical query that
 	// happens to land on the note is not asking about the forgotten source, and
 	// the line would be noise on every such search.
-	if selector == "" || !strings.Contains(key, selector) {
-		return
+	//
+	// Named means named. Testing the selector as a substring of the key fired
+	// on "claude" — the harness name is in every key — and on any single
+	// character, while the reverse case never fired at all: over MCP the
+	// selector is usually a sentence, and "what did we decide in s15" is a
+	// reader naming the session as plainly as `s15` is (#1624).
+	if !selectorNamesSession(selector, key, resolved) {
+		return ""
 	}
 	if !index.Tombstoned(key) {
-		return
+		return ""
 	}
-	fmt.Fprintf(os.Stderr, "deja: %s is forgotten — this is the note promoted from it; `deja forget --list` names what is gone\n", key)
+	return fmt.Sprintf("%s is forgotten — this is the note promoted from it; `deja forget --list` names what is gone", key)
+}
+
+// selectorNamesSession reports whether the reader's selector names this
+// session: the whole key, an id prefix long enough to mean it, or one of the
+// words of a sentence being either of those.
+func selectorNamesSession(selector, key string, resolved bool) bool {
+	if strings.TrimSpace(selector) == "" {
+		return false
+	}
+	_, id, _ := strings.Cut(key, ":")
+	for _, word := range strings.Fields(selector) {
+		if word == key || word == id {
+			return true
+		}
+		// A prefix counts only where something resolved it: `deja ctx 3f2a9c`
+		// reached this session and nothing else. Where nothing resolved — a
+		// search query — a prefix is a guess, and the ids real harnesses write
+		// make it a bad one: codex ids start with a year, cline ids start with
+		// the harness name, so "what did we ship in 2026" and "cline" would
+		// each name a session (#1624).
+		if resolved && strings.HasPrefix(id, word) {
+			return true
+		}
+	}
+	return false
 }
 
 // forgetKeyOf names the exact session a selector reached, so a failed forget

@@ -39,7 +39,10 @@ func installCodexHooks(exe string, uninstall bool) (installResult, error) {
 	// codex home gets its hooks written where codex actually reads them. Every
 	// other codex path already goes through it (e.g. doctor.go). See #850.
 	path := filepath.Join(sources.CodexHome(), "hooks.json")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	if len(bytes.TrimSpace(old)) == 0 {
 		root = map[string]any{}
@@ -153,7 +156,10 @@ func installOpencodePlugin(exe string, uninstall bool) (installResult, error) {
 		}
 		return installResult{Path: path, Action: "removed"}, nil
 	}
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	next := []byte(opencodePluginJS(exe))
 	a, err := writeIfChanged(path, old, next)
 	return installResult{Path: path, Action: a}, err
@@ -333,12 +339,34 @@ func installSettingsHookCmd(path, event, matcher string, timeout int, cmd string
 // no longer uses. Without it a generator fix ships and the old, dead entry
 // keeps firing next to the new one for everyone who installed before.
 func installSettingsHookRetiring(path, event, matcher string, timeout int, cmd string, uninstall bool, retire map[string]bool) (installResult, error) {
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
-	if len(bytes.TrimSpace(old)) == 0 {
+	// A settings file carrying comments cannot be rewritten without losing
+	// them, and a hook entry is an element in an event array rather than a key
+	// in an object, so the text path the MCP writers take does not reach here
+	// (#2744). What it can do is answer honestly: read the file with its
+	// comments blanked, and when there is nothing of deja's to change, say
+	// unchanged rather than refuse a file it was never going to touch.
+	jsonc := configIsJSONC(old)
+	source := old
+	if jsonc {
+		source = []byte(stripJSONComments(string(old)))
+	}
+	if len(bytes.TrimSpace(source)) == 0 {
 		root = map[string]any{}
-	} else if err := json.Unmarshal(old, &root); err != nil {
+	} else if err := json.Unmarshal(source, &root); err != nil {
 		return installResult{}, configParseError(path, err)
+	}
+	before := ""
+	if jsonc {
+		b, err := json.Marshal(root)
+		if err != nil {
+			return installResult{}, err
+		}
+		before = string(b)
 	}
 	hooks, _ := root["hooks"].(map[string]any)
 	if hooks == nil {
@@ -410,6 +438,18 @@ func installSettingsHookRetiring(path, event, matcher string, timeout int, cmd s
 	if len(hooks) == 0 {
 		delete(root, "hooks")
 	}
+	if jsonc {
+		after, err := json.Marshal(root)
+		if err != nil {
+			return installResult{}, err
+		}
+		if string(after) == before {
+			// Nothing of deja's here either way: leave the reader's comments
+			// where they are and report the truth.
+			return installResult{Path: path, Action: "unchanged"}, nil
+		}
+		return installResult{}, fmt.Errorf("%s: deja cannot edit hooks in a file that carries comments — add or remove the hook by hand, or take the comments out", path)
+	}
 	next, err := marshalConfigLike(old, root)
 	if err != nil {
 		return installResult{}, err
@@ -434,7 +474,10 @@ const kimiHookMarker = "# deja: auto-recall (managed by `deja install kimi-auto`
 // this look like a harness that cannot take context at all.
 func installKimiAuto(exe string, uninstall bool) (installResult, error) {
 	path := filepath.Join(sources.KimiConfigDir(), "config.toml")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	s := strings.TrimRight(removeKimiHookBlock(lfText(old)), "\n")
 	if !uninstall {
 		block := kimiHookMarker + "\n[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = " +

@@ -144,25 +144,46 @@ func runHow(dir string, args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "no command on this machine mentions %q\n", strings.Join(terms, " "))
 		return nil
 	}
+	writeHowEntries(stdout, entries, limit, " · last ")
+	// The cap said nothing, so eight of thirteen ways to run the tests read as
+	// thirteen — the misread the search screen already avoids (#1632). On
+	// stderr, where search puts the same line: stdout stays the list.
+	if note := howCapNote(len(entries), limit, "raise --limit for the rest"); note != "" {
+		fmt.Fprintf(os.Stderr, "deja: %s\n", note)
+	}
+	return nil
+}
+
+// writeHowEntries is the answer both surfaces print. The MCP tool used to
+// build its own copy of this loop, so what the CLI learned to say the agent
+// never heard — and the cap note was the drift showing (#1634). The one
+// difference that is real stays a parameter: the separator before the date.
+func writeHowEntries(w io.Writer, entries []howEntry, limit int, lastSep string) {
 	for i, e := range entries {
 		if i >= limit {
 			break
 		}
 		when := ""
 		if !e.Last.IsZero() {
-			when = " · last " + e.Last.Local().Format("2006-01-02")
+			when = lastSep + e.Last.Local().Format("2006-01-02")
 		}
-		fmt.Fprintf(stdout, "%s\n", search.SafeCommand(e.Command))
-		fmt.Fprintf(stdout, "  ran %s in %s%s%s\n",
+		// The command itself, kept the way a person would copy it, folded onto
+		// one line so a newline in it cannot forge a row of deja's (#1863).
+		fmt.Fprintf(w, "%s\n", search.SafeCommand(e.Command))
+		fmt.Fprintf(w, "  ran %s in %s%s%s\n",
 			pluralRuns(e.Runs), pluralSessions(len(e.Sessions)), when, e.failureNote())
 	}
-	// The cap said nothing, so eight of thirteen ways to run the tests read as
-	// thirteen — the misread the search screen already avoids (#1632). On
-	// stderr, where search puts the same line: stdout stays the list.
-	if len(entries) > limit {
-		fmt.Fprintf(os.Stderr, "deja: showing %d of %d — raise --limit for the rest\n", limit, len(entries))
+}
+
+// howCapNote is the sentence that says the list was cut, or empty when it was
+// not. One sentence, so the agent and the reader are told the same thing —
+// except for how to see the rest, which is a flag at a terminal and another
+// call over MCP, where there is no flag to raise.
+func howCapNote(found, limit int, raise string) string {
+	if found <= limit {
+		return ""
 	}
-	return nil
+	return fmt.Sprintf("showing %d of %d — %s", limit, found, raise)
 }
 
 // howEntries groups the commands that mention every term, so the same
@@ -180,6 +201,9 @@ func runHow(dir string, args []string, stdout io.Writer) error {
 // hid, and an agent told nothing exists invents something.
 func howEntries(dir string, terms []string, project, activation string) ([]howEntry, int, int, error) {
 	pol := policy.Load()
+	// Sessions, not records: the sentence this feeds says "matching sessions",
+	// and one withheld session that ran a command five times was reported as
+	// five (#1641, the shape #1639 fixed for friction).
 	hidden := map[string]bool{}
 	// The other rule that takes sessions out of an answer. It is applied inside
 	// retrieval, and this screen reads the record log instead of ranking, so it
@@ -189,15 +213,6 @@ func howEntries(dir string, terms []string, project, activation string) ([]howEn
 	ignored := map[string]bool{}
 	byCmd := map[string]*howEntry{}
 	err := index.EachRecordOfRole(dir, "command", func(meta index.SessionMeta, r index.Record) {
-		// Whether the record is withheld is decided here; whether it was ever
-		// an answer to *this* question is decided below, and the counts are
-		// taken there. Counted here, they were store-wide: `how terraform` on
-		// a machine whose hidden sessions only ever ran `go test` said three
-		// matching sessions were being kept back, and "matching" is the word
-		// the sentence uses (#2766). `files` already scopes its number this
-		// way, by counting over hits that were searched.
-		denied := !pol.Allows(activation, meta.Project)
-		ign := !denied && pol.Ignored(meta.Path, meta.Project)
 		if project != "" && !strings.Contains(strings.ToLower(meta.Project), strings.ToLower(project)) {
 			return
 		}
@@ -215,14 +230,18 @@ func howEntries(dir string, terms []string, project, activation string) ([]howEn
 				return
 			}
 		}
-		// In scope for the question, so now it is worth saying it is withheld.
-		// Sessions rather than records, which is the noun the line uses: two
-		// commands of one hidden session read as two hidden sessions.
-		if denied {
+		// The rules after the question, not before it: the sentence says the
+		// policy "hides N matching sessions", and counting every withheld
+		// session that ran any command at all made that number about the
+		// store rather than about what was asked — `deja how terraform` said
+		// three were hidden on a machine whose hidden sessions only ever ran
+		// `go test` (#2766). `files` is the shape this follows: it counts
+		// from what was already searched.
+		if !pol.Allows(activation, meta.Project) {
 			hidden[meta.Harness+":"+meta.ID] = true
 			return
 		}
-		if ign {
+		if pol.Ignored(meta.Path, meta.Project) {
 			ignored[meta.Harness+":"+meta.ID] = true
 			return
 		}

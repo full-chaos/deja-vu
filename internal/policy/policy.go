@@ -44,9 +44,19 @@ func Path() string {
 	if p := os.Getenv("DEJA_POLICY_FILE"); p != "" {
 		return p
 	}
+	// A relative XDG_CONFIG_HOME is ignored rather than followed — the spec
+	// says so, and it is what this repository's own xdgConfigHome does.
 	base := os.Getenv("XDG_CONFIG_HOME")
-	if base == "" {
+	if !filepath.IsAbs(base) {
 		base = filepath.Join(sources.Home(), ".config")
+	}
+	// And nowhere, rather than somewhere relative: Home() answers "" when
+	// there is no home directory, so this was `.config/deja/policy.json` —
+	// deja read whatever a checkout happened to have there as the reader's own
+	// trust policy, which is the wrong direction for the file that decides
+	// what recall may hand over (#2785).
+	if !filepath.IsAbs(base) {
+		return ""
 	}
 	return filepath.Join(base, "deja", "policy.json")
 }
@@ -203,6 +213,9 @@ func Filter[T any](p Policy, activation string, items []T, projectOf func(T) str
 // one mechanism separating local memory from imported (#661).
 func Diagnose() (exists bool, unknown []string, err error) {
 	path := Path()
+	if path == "" {
+		return false, nil, nil
+	}
 	b, rerr := os.ReadFile(path)
 	if rerr != nil {
 		if os.IsNotExist(rerr) {

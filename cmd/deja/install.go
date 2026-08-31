@@ -606,16 +606,25 @@ func existingTargets() []string {
 func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	switch target {
 	case "claude-auto":
+		if err := readableStrictJSON(filepath.Join(sources.ClaudeConfigDir(), "settings.json")); err != nil {
+			return installResult{}, err
+		}
 		return installClaudeAuto(exe, uninstall)
 	case "claude-code", "claude":
 		return installClaude(exe, uninstall)
 	case "codex":
 		return installCodex(exe, uninstall)
 	case "codex-auto":
+		if err := readableStrictJSON(filepath.Join(sources.CodexHome(), "hooks.json")); err != nil {
+			return installResult{}, err
+		}
 		return installCodexAuto(exe, uninstall)
 	case "cursor":
 		return installCursor(exe, uninstall)
 	case "cursor-auto":
+		if err := readableStrictJSON(filepath.Join(sources.CursorCLIHome(), "hooks.json")); err != nil {
+			return installResult{}, err
+		}
 		return installCursorAuto(exe, uninstall)
 	case "gemini":
 		return installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall)
@@ -625,10 +634,12 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 		// without the tools: its own `gemini mcp list` said "No MCP servers
 		// configured" on a machine that had just run `deja install --auto`.
 		// grok-auto pairs them the same way.
-		if _, err := installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall); err != nil {
+		// Same file, same reason as qwen-auto: whichever half may refuse goes
+		// first (#2745).
+		if _, err := installGeminiAuto(exe, uninstall); err != nil {
 			return installResult{}, err
 		}
-		return installGeminiAuto(exe, uninstall)
+		return installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall)
 	case "antigravity":
 		return installMCPJSON(filepath.Join(antigravityConfigHome(), "mcp_config.json"), exe, uninstall)
 	case "antigravity-auto":
@@ -636,6 +647,15 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	case "grok":
 		return installGrok(exe, uninstall)
 	case "grok-auto":
+		probe := []string{filepath.Join(sources.GrokHome(), "user-settings.json")}
+		if !uninstall {
+			// Uninstall removes the hook file rather than reading it, so a
+			// file it can still take is not one to refuse over.
+			probe = append(probe, grokHooksPath())
+		}
+		if err := readableStrictJSON(probe...); err != nil {
+			return installResult{}, err
+		}
 		if _, err := installGrok(exe, uninstall); err != nil {
 			return installResult{}, err
 		}
@@ -643,10 +663,14 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	case "qwen":
 		return installMCPJSON(filepath.Join(sources.QwenConfigDir(), "settings.json"), exe, uninstall)
 	case "qwen-auto":
-		if _, err := installMCPJSON(filepath.Join(sources.QwenConfigDir(), "settings.json"), exe, uninstall); err != nil {
+		// The hook first: it lives in the same file as the MCP entry, and a
+		// refusal after the entry was written left the target reported as
+		// refused with half its wiring in the file and a .bak beside it
+		// (#2745, the shape #2744 was about).
+		if _, err := installQwenAuto(exe, uninstall); err != nil {
 			return installResult{}, err
 		}
-		return installQwenAuto(exe, uninstall)
+		return installMCPJSON(filepath.Join(sources.QwenConfigDir(), "settings.json"), exe, uninstall)
 	case "kimi":
 		return installMCPJSON(filepath.Join(sources.KimiConfigDir(), "mcp.json"), exe, uninstall)
 	case "kimi-auto":
@@ -1049,7 +1073,33 @@ func matchFinalNewline(old, next []byte) []byte {
 	return bytes.TrimSuffix(next, []byte("\r"))
 }
 
+// readConfig reads a config a writer is about to edit.
+//
+// Every writer used to read it with `old, _ := os.ReadFile`, so a file that
+// exists but cannot be read was empty to all of them and deja wrote a config
+// holding only deja over it. A file that is not there is still empty — that is
+// the ordinary first install — but anything else is the reader's config, and
+// deja cannot edit what it cannot read (#2751).
+func readConfig(path string) ([]byte, error) {
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	return b, nil
+}
+
 func writeIfChanged(path string, old, next []byte) (string, error) {
+	// The last guard for a file deja could not read: the writers go through
+	// readConfig now, but this also covers the ones that write a file they
+	// never read. An unreadable config used to be an empty one here, and
+	// backupOnce hid it — it takes one snapshot per file and returns early
+	// once a `.bak` is beside it, which is the ordinary state after any
+	// earlier install (#2751).
+	if f, err := os.Open(path); err == nil {
+		_ = f.Close()
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
 	// Before the comparison, not after: a CRLF config converted afterwards
 	// would differ from `old` on every run, so each repeat install would
 	// rewrite the file and report it changed.
@@ -1188,11 +1238,16 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 
 func installClaude(exe string, uninstall bool) (installResult, error) {
 	path := sources.ClaudeJSONPath()
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	var note string
 	if len(bytes.TrimSpace(old)) == 0 {
 		root = map[string]any{}
+	} else if configIsJSONC(old) {
+		return writeJSONCEntry(path, old, "mcpServers", mcpServerEntry(exe), uninstall)
 	} else if err := json.Unmarshal(old, &root); err != nil {
 		return installResult{}, configParseError(path, err)
 	}
@@ -1272,7 +1327,10 @@ var claudeHookWiring = []struct{ Event, Sub, Matcher string }{
 
 func installClaudeHook(exe string, uninstall bool) (installResult, error) {
 	path := filepath.Join(sources.ClaudeConfigDir(), "settings.json")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	if len(bytes.TrimSpace(old)) == 0 {
 		root = map[string]any{}
@@ -1283,7 +1341,13 @@ func installClaudeHook(exe string, uninstall bool) (installResult, error) {
 	for _, h := range claudeHookWiring {
 		nextRoot = updateClaudeHook(nextRoot, h.Event, exe+" "+h.Sub, h.Matcher, uninstall)
 	}
-	next, err := json.MarshalIndent(nextRoot, "", "  ")
+	// In the shape the reader wrote it, like every other JSON writer: this was
+	// the last one still marshalling straight, so an install that added hooks
+	// also alphabetised their keys, reindented the file and expanded every
+	// block they had written on one line — in the file that holds their
+	// permissions and their model (#1665, the shape #2641 and #2704 gave the
+	// others).
+	next, err := marshalConfigLike(old, nextRoot)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -1581,7 +1645,10 @@ func combinedStatusline(existing, exe string) string {
 // ccstatusline or their own script) — printing how to combine instead.
 func installStatusline(exe string, uninstall bool) (installResult, error) {
 	path := filepath.Join(sources.ClaudeConfigDir(), "settings.json")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	if len(bytes.TrimSpace(old)) == 0 {
 		root = map[string]any{}
@@ -1671,7 +1738,10 @@ type tomlMCPBlock struct {
 }
 
 func installTOML(path, block string, uninstall bool) (installResult, error) {
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	text := lfText(old)
 	blocks := tomlMCPBlocks(text)
 	hasDeja := false
@@ -2257,23 +2327,6 @@ func commandListRunsMCP(words []any) bool {
 	return false
 }
 
-// entryIsOff reports whether the reader has switched an MCP entry off, in
-// either spelling the configs use. The note about leaving one off was keyed to
-// `disabled`, and opencode, grok and openclaw all write `enabled` — so on those
-// files install reported success on a config where deja will not run (#2757).
-//
-// Only an explicit off. An entry with neither key is on, which is what every
-// entry deja writes looks like.
-func entryIsOff(entry map[string]any) bool {
-	if off, ok := entry["disabled"].(bool); ok && off {
-		return true
-	}
-	if on, ok := entry["enabled"].(bool); ok && !on {
-		return true
-	}
-	return false
-}
-
 // mergeDejaEntry writes deja's wiring onto the entry that was already there.
 // deja owns the command, the args and the type; an env pointing at a store on
 // another disk, a timeout, a `disabled` the reader set — those are theirs, and
@@ -2304,7 +2357,7 @@ func mergeDejaEntry(prev any, entry map[string]any) (map[string]any, string) {
 	if _, ok := out["command"]; ok {
 		delete(out, "transport")
 	}
-	if entryIsOff(out) {
+	if entrySwitchedOff(out) {
 		// Switching it back on silently would undo a decision deja was not
 		// asked to revisit; leaving it off without a word looks like a install
 		// that worked.
@@ -2314,6 +2367,22 @@ func mergeDejaEntry(prev any, entry map[string]any) (map[string]any, string) {
 		note += "left the entry switched off, the way it was — deja will not answer until you turn it back on"
 	}
 	return out, note
+}
+
+// entrySwitchedOff reports whether the reader has turned this entry off.
+//
+// One switch, two spellings: most hosts write `disabled: true`, opencode
+// writes `enabled: false`. The note was keyed to the first, so a config
+// carrying the second reported a clean install for wiring that will never run
+// (#2757).
+func entrySwitchedOff(entry map[string]any) bool {
+	if off, ok := entry["disabled"].(bool); ok && off {
+		return true
+	}
+	if on, ok := entry["enabled"].(bool); ok && !on {
+		return true
+	}
+	return false
 }
 
 // sameEntry compares an entry read out of a config with the one deja is about
@@ -2380,7 +2449,10 @@ func installCursor(exe string, uninstall bool) (installResult, error) {
 // mcpServers shape: entries carry a type and an enabled-tools list.
 func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 	path := filepath.Join(sources.Home(), ".copilot", "mcp-config.json")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	var note string
 	if len(bytes.TrimSpace(old)) == 0 {
@@ -2438,7 +2510,10 @@ func installCopilotMCP(exe string, uninstall bool) (installResult, error) {
 // servers under mcp.servers, not the common mcpServers root.
 func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 	path := filepath.Join(sources.OpenClawStateDir(), "openclaw.json")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	var note string
 	if len(bytes.TrimSpace(old)) == 0 {
@@ -2498,12 +2573,111 @@ func installOpenClawMCP(exe string, uninstall bool) (installResult, error) {
 	return installResult{Path: path, Action: a, Note: note}, err
 }
 
+// firstDirThatTakesAWrite is the directory a write would actually land in: the
+// config's own directory once it exists, and otherwise the nearest parent that
+// does, since install creates what is missing under it. os.Stat rather than a
+// Lstat: the write follows a symlinked directory, so the question has to
+// follow it too.
+func firstDirThatTakesAWrite(dir string) string {
+	for {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+		dir = parent
+	}
+}
+
+// mcpConfigReadable asks only whether the config can be read and parsed —
+// deliberately not whether its block is a shape deja edits. On the way out,
+// a block deja never wrote is left alone and reported unchanged (#2399), so
+// naming it as a host deja gave up on would be wrong.
+func mcpConfigReadable(path string) error {
+	old, err := readConfig(path)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(old)) == 0 {
+		return nil
+	}
+	_, err = parseConfigRoot(path, old)
+	return err
+}
+
+// parseConfigRoot decodes a config the writers edit, comments and all. It
+// returns a nil root only for an empty file; `null` is an error, since it
+// decodes into a nil map without one and the writer then assigns into it.
+func parseConfigRoot(path string, old []byte) (map[string]any, error) {
+	text := string(old)
+	if configIsJSONC(old) {
+		text = stripJSONComments(text)
+	}
+	var root map[string]any
+	if err := json.Unmarshal([]byte(text), &root); err != nil {
+		return nil, configParseError(path, err)
+	}
+	if root == nil {
+		return nil, configParseError(path, errors.New("the file holds null, not an object"))
+	}
+	return root, nil
+}
+
+// mcpEntryWritable asks whether installMCPJSON could write its entry into this
+// config, without writing anything.
+//
+// It has to accept exactly what the writer accepts: a comment is not a broken
+// file (#1664), so a JSONC config passes here and is edited as text. What it
+// catches is the config the writer would refuse — one that does not parse, or
+// whose block is something other than an object.
+func mcpEntryWritable(path, blockKey string) error {
+	old, err := readConfig(path)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(old)) == 0 {
+		return nil
+	}
+	jsonc := configIsJSONC(old)
+	root, err := parseConfigRoot(path, old)
+	if err != nil {
+		return err
+	}
+	if jsonc {
+		// The text writer inserts rather than replaces, so a key holding
+		// anything but an object would end up in the file twice with the
+		// reader's value winning — writeJSONCEntry refuses those, and so must
+		// this (#2740). It also needs a top-level object to insert into.
+		if v, present := root[blockKey]; present {
+			if _, isObject := v.(map[string]any); !isObject {
+				return fmt.Errorf("%s: %q is not an object deja can edit — left as it was", path, blockKey)
+			}
+		}
+		if zedTopLevelOpen(string(old)) < 0 {
+			return fmt.Errorf("%s: does not look like a settings object; add %q by hand", path, blockKey)
+		}
+	}
+	_, _, err = mcpBlock(root, blockKey, path)
+	return err
+}
+
 func installMCPJSON(path, exe string, uninstall bool) (installResult, error) {
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var root map[string]any
 	var note string
 	if len(bytes.TrimSpace(old)) == 0 {
 		root = map[string]any{}
+	} else if configIsJSONC(old) {
+		// A comment is not a broken file, and refusing the target over one is
+		// how somebody who annotated their config could not install deja at
+		// all (#1664).
+		command, args := mcpCommandArgs(exe)
+		return writeJSONCEntry(path, old, "mcpServers", map[string]any{"command": command, "args": args}, uninstall)
 	} else if err := json.Unmarshal(old, &root); err != nil {
 		return installResult{}, configParseError(path, err)
 	}
@@ -2561,11 +2735,16 @@ func installOpencode(exe string, uninstall bool) (installResult, error) {
 			path = filepath.Join(dir, "opencode.jsonc")
 		}
 	}
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return installResult{}, err
+	}
 	var next []byte
 	var note string
-	var err error
-	if strings.HasSuffix(path, ".jsonc") {
+	// The content, not the name: opencode reads either file as JSONC, and
+	// picking the writer by extension meant the same commented config was
+	// edited as text under one name and refused under the other (#1664).
+	if strings.HasSuffix(path, ".jsonc") || configIsJSONC(old) {
 		next, note, err = updateOpencodeJSONC(old, exe, uninstall)
 	} else {
 		next, note, err = updateOpencodeJSON(old, path, exe, uninstall)
@@ -2803,6 +2982,124 @@ func jsoncCodeOf(line string, inBlock bool) (code string, stillInBlock bool, end
 	return strings.TrimSpace(b.String()), inBlock, end
 }
 
+// openInlineBlock rewrites `"key": { … }` written on one line into the
+// multi-line shape the rest of this writer reads, keeping whatever the line
+// already held. A line carrying a comment is left alone: the split would have
+// to decide which side of it the entry belongs on, and refusing is the honest
+// answer for a shape nobody writes.
+func openInlineBlock(lines []string, key string) ([]string, bool) {
+	inBlock := false
+	for i, l := range lines {
+		// The comment state carries between lines: read on its own, a line
+		// inside a /* … */ looks like code, and splitting it rewrote a block
+		// the reader had commented out.
+		code, next, _ := jsoncCodeOf(l, inBlock)
+		inBlock = next
+		if !strings.Contains(code, `"`+key+`"`) || !strings.Contains(code, "{") {
+			continue
+		}
+		if jsoncBraceDelta(code) > 0 {
+			// The block spans lines, but its first server may sit on the
+			// opening line — `"mcp": { "a": {…}` — and then the lines between
+			// the ends hold nothing, so deja's entry went in with no comma
+			// after the reader's and the file stopped parsing.
+			open := braceOutsideString(l, '{')
+			if open < 0 {
+				return lines, false
+			}
+			// What a parser reads, not what the line holds: a comment after the
+			// opening brace — `"mcp": { // my servers` — is not a server on
+			// the opening line, and refusing it took an ordinary shape away
+			// from exactly the readers #1664 was opened for.
+			codeOpen := braceOutsideString(code, '{')
+			if codeOpen < 0 || strings.TrimSpace(code[codeOpen+1:]) == "" {
+				return lines, true
+			}
+			rest := strings.TrimSpace(l[open+1:])
+			if strings.TrimSpace(code) != strings.TrimSpace(l) {
+				return lines, false
+			}
+			indent := l[:len(l)-len(strings.TrimLeft(l, " \t"))]
+			out := append([]string{}, lines[:i]...)
+			out = append(out, l[:open+1], indent+"  "+rest)
+			return append(out, lines[i+1:]...), true
+		}
+		if strings.TrimSpace(code) != strings.TrimSpace(l) {
+			// A comment on the line the block opens and closes on. Splitting
+			// it would have to decide which side of the comment the entry
+			// belongs on, and there is no answer that keeps the reader's
+			// meaning — so the caller refuses rather than writing past the
+			// block, which is what a silent pass-through did (#2777).
+			return lines, false
+		}
+		open := braceOutsideString(l, '{')
+		end := matchingBrace(l, open)
+		if open < 0 || end < 0 {
+			return lines, false
+		}
+		indent := l[:len(l)-len(strings.TrimLeft(l, " \t"))]
+		inner := strings.TrimSpace(l[open+1 : end])
+		out := append([]string{}, lines[:i]...)
+		out = append(out, l[:open+1])
+		if inner != "" {
+			out = append(out, indent+"  "+inner)
+		}
+		out = append(out, indent+l[end:])
+		return append(out, lines[i+1:]...), true
+	}
+	return lines, true
+}
+
+// matchingBrace is the `}` that closes the `{` at open, counting depth and
+// skipping strings. Taking the first structural `}` instead split a non-empty
+// inline block inside its first server: it still parsed, but it left the
+// reader's file reindented into something that reads as broken.
+func matchingBrace(line string, open int) int {
+	if open < 0 || open >= len(line) || line[open] != '{' {
+		return -1
+	}
+	depth, inString, escaped := 0, false, false
+	for i := open; i < len(line); i++ {
+		switch c := line[i]; {
+		case escaped:
+			escaped = false
+		case c == '\\' && inString:
+			escaped = true
+		case c == '"':
+			inString = !inString
+		case inString:
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// braceOutsideString is the index of the first brace of that kind a parser
+// would read as structure — a path holding one is ordinary (#2475).
+func braceOutsideString(line string, want byte) int {
+	inString, escaped := false, false
+	for i := 0; i < len(line); i++ {
+		switch c := line[i]; {
+		case escaped:
+			escaped = false
+		case c == '\\' && inString:
+			escaped = true
+		case c == '"':
+			inString = !inString
+		case inString:
+		case c == want:
+			return i
+		}
+	}
+	return -1
+}
+
 // jsoncBraceDelta counts the braces of one line's code that a parser reads as
 // structure. Comments are already out — jsoncCodeOf strips them, and keeps
 // string contents because the `"deja"` match and the comma offset both need
@@ -2854,6 +3151,20 @@ func mergedJSONCEntryLine(dropped []string, key, exe string) (string, string) {
 		return plain, ""
 	}
 	merged, note := mergeDejaEntry(was, next)
+	if sameEntry(merged, was) {
+		// Merging changed nothing, so the reader's own bytes are the answer:
+		// re-encoding reorders the keys, and a repeat install then rewrote a
+		// config it had nothing to say about and reported having replaced
+		// somebody's entry — deja's own, from the run before (#2757).
+		//
+		// The switch line still holds: what is on file is still off, and that
+		// is true whether or not this run changed anything.
+		off := ""
+		if entrySwitchedOff(merged) {
+			off = "left the entry switched off, the way it was — deja will not answer until you turn it back on"
+		}
+		return strings.TrimSuffix(strings.TrimRight(strings.Join(dropped, "\n"), " \t"), ","), off
+	}
 	b, err := json.Marshal(merged)
 	if err != nil {
 		return plain, ""
@@ -2871,6 +3182,20 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, string
 		return []byte("{\n  \"mcp\": {\n" + line + "\n  }\n}\n"), "", nil
 	}
 	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	// A block that opens and closes on one line has no end line to find, so
+	// the insert landed after its closing brace and the config stopped
+	// parsing (#2777). `"mcp": {}` is what a config nobody has added a server
+	// to looks like.
+	lines, canOpen := openInlineBlock(lines, "mcp")
+	if !canOpen {
+		if uninstall {
+			// The file as it was, byte for byte: this is a config deja has
+			// just declined to edit, and rejoining the lines wrote the split
+			// back out — and gave a file with no trailing newline one.
+			return old, "", nil
+		}
+		return nil, "", fmt.Errorf("opencode config has an \"mcp\" block deja could not edit without risking it — add the deja server by hand")
+	}
 	start, end := -1, -1
 	sameLine := false
 	inBlock := false
@@ -2960,6 +3285,12 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, string
 			}
 		}
 		note := ""
+		// This path merges the whole entry (mergedJSONCEntryLine above), so
+		// whatever the reader had on it — an env pointing at a store on
+		// another disk, a switch they set — comes across with it, and
+		// mergeDejaEntry says so in its own note. The hunt branch carried the
+		// switch alone through the text; merging carries it and the rest.
+		entryLine := line
 		if uninstall {
 			note = leftDejaEntriesNote(servers)
 		} else {
@@ -2980,7 +3311,7 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, string
 			// else's line needed — not on an opening brace, not after a
 			// trailing comment, not inside a block comment (#1695) — stop
 			// applying at all.
-			entry := line
+			entry := entryLine
 			at := len(body)
 			if i := jsoncFirstCodeLine(body); i >= 0 {
 				entry += ","
@@ -3005,6 +3336,12 @@ func updateOpencodeJSONC(old []byte, exe string, uninstall bool) ([]byte, string
 		return nil, "", fmt.Errorf("opencode config has an \"mcp\" block deja could not edit without risking it — add the deja server by hand")
 	}
 	insert := len(lines) - 1
+	// The block is spliced in above the file's closing brace, so the file has
+	// to have one of its own on that line. On a config written as a single
+	// line the splice put the new block *before* the object (#2777).
+	if insert < 1 || strings.TrimSpace(stripJSONComments(lines[insert])) != "}" {
+		return nil, "", fmt.Errorf("opencode config is not laid out in a way deja can add to — add the deja server by hand")
+	}
 	comma := ""
 	for i := insert - 1; i >= 0; i-- {
 		trim := strings.TrimSpace(lines[i])
@@ -3037,6 +3374,61 @@ func replacedJSONCLineNote(dropped []string, line string) string {
 		return "replaced the deja entry that was already here"
 	}
 	return fmt.Sprintf("replaced the deja entry that was already here, which ran %s", safeForStatusline(was, 200))
+}
+
+// jsoncEntrySwitch reads an off switch out of the entry text, and returns it
+// the way it will be written back — `"enabled":false` or `"disabled":true`.
+// Empty when the entry is on.
+//
+// Text rather than JSON, for the same reason jsoncEntryCommand is: the block
+// may carry comments and trailing commas.
+func jsoncEntrySwitch(text string) string {
+	// The reader's comments come out first: a line reading
+	// `// "enabled": false when I travel` is a note about the entry, not the
+	// entry, and reading it switched off a server that was running.
+	code := stripJSONComments(text)
+	for _, sw := range []struct{ key, off string }{
+		{"enabled", "false"},
+		{"disabled", "true"},
+	} {
+		if at := jsoncEntryKeyValue(code, sw.key); strings.HasPrefix(at, sw.off) {
+			return `"` + sw.key + `":` + sw.off
+		}
+	}
+	return ""
+}
+
+// jsoncEntryKeyValue returns what follows `"key":` in the entry's own object,
+// or empty when the key is not there. Its own: a nested block carries its own
+// settings, and taking the first match anywhere let `"options":{"enabled":
+// false}` switch off an entry that says it is on.
+func jsoncEntryKeyValue(code, key string) string {
+	depth, inString, escaped := 0, false, false
+	for i := 0; i < len(code); i++ {
+		switch c := code[i]; {
+		case escaped:
+			escaped = false
+		case c == '\\' && inString:
+			escaped = true
+		case c == '"' && !inString:
+			inString = true
+			// The entry is `"deja": { … }`, so its own keys sit one brace in.
+			if depth == 1 && strings.HasPrefix(code[i:], `"`+key+`"`) {
+				rest := strings.TrimSpace(code[i+len(key)+2:])
+				if strings.HasPrefix(rest, ":") {
+					return strings.TrimSpace(rest[1:])
+				}
+			}
+		case c == '"':
+			inString = false
+		case inString:
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+		}
+	}
+	return ""
 }
 
 // jsoncEntryCommand pulls the command out of an entry deja did not write. It

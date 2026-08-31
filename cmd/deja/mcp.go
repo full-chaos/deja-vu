@@ -333,9 +333,20 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 		if line := buildingNowForAgent(dir); line != "" {
 			return frameRecall(line), nil
 		}
-		text, sessions, raw, ids, projects, err := recallContextResultFrom(dir, a.Query, a.Harness)
+		text, sessions, raw, ids, projects, note, err := recallContextResultFrom(dir, a.Query, a.Harness)
 		if err == nil {
-			text = frameRecall(fitContextDigest(text, a.Query, contextMCPBudget-recallFrameOverhead))
+			// Above the frame, the way the resource reader puts its own note:
+			// inside it, deja's statement of fact would read as recalled text
+			// the agent has just been told not to trust. Its room comes out of
+			// the budget before the trim, not after — added afterwards it put
+			// the reply over the size this tool documents, which is what
+			// #1797 fixed for the frame itself.
+			lead := ""
+			if note != "" {
+				lead = "deja: " + note + "\n\n"
+			}
+			text = frameRecall(fitContextDigest(text, a.Query, contextMCPBudget-recallFrameOverhead-len(lead)))
+			text = lead + text
 			usage.RecordServedFrom(dir, usage.KindContext, text, sessions, raw, ids, projects, policy.Load().Describe(policy.ActivationMCP))
 		}
 		return text, err
@@ -475,19 +486,17 @@ func callMCPTool(dir, name string, raw json.RawMessage) (string, error) {
 			limit = 8
 		}
 		var hb strings.Builder
-		for i, e := range entries {
-			if i >= limit {
-				break
-			}
-			when := ""
-			if !e.Last.IsZero() {
-				when = ", last " + e.Last.Local().Format("2006-01-02")
-			}
-			// The same note the CLI prints: the agent reading this is the
-			// one most likely to run the command back without looking.
-			fmt.Fprintf(&hb, "%s\n  ran %s in %s%s%s\n", commandListingLine(e.Command), pluralRuns(e.Runs), pluralSessions(len(e.Sessions)), when, e.failureNote())
+		// The same lines the CLI prints, from the same writer: this tool used
+		// to keep its own copy of the loop, so a note the CLI learned never
+		// reached the agent (#1634).
+		writeHowEntries(&hb, entries, limit, ", last ")
+		out := strings.TrimRight(hb.String(), "\n")
+		if note := howCapNote(len(entries), limit, "call again with a higher limit for the rest"); note != "" {
+			// The agent cannot ask a follow-up of its own, so the cut has to
+			// travel with the answer rather than to a terminal it never sees.
+			out += "\n\n" + note
 		}
-		return strings.TrimRight(hb.String(), "\n"), nil
+		return out, nil
 	case "remember":
 		var a struct {
 			Text    string   `json:"text"`
@@ -872,6 +881,39 @@ func recallText(dir, q, harness string, limit, budget int) (string, error) {
 	return text, err
 }
 
+// recallCountLine introduces the sessions below it.
+//
+// It said "deja recall for <the query>" whatever the tier, so an answer whose
+// first line says no session is about this went on to head the payload with
+// the question itself — and an agent read three unrelated sessions as the
+// answer to it. On the relevance tier the line says what they are instead
+// (#2074).
+func recallCountLine(q, tier string, offset, served, total int) string {
+	q = clampEcho(q)
+	switch {
+	case tier == search.TierRelevance && offset > 0:
+		// The tier before the page: page two of an answer to a question
+		// nothing is about is still not a page of matches, and saying so only
+		// on page one was the same contradiction one line further down.
+		return fmt.Sprintf("nearest by wording to %q (%d-%d of %d ranked, none about it)\n", q, offset+1, offset+served, total)
+	case offset > 0:
+		return fmt.Sprintf("deja recall for %q (matches %d-%d of %d)\n", q, offset+1, offset+served, total)
+	case tier == search.TierRelevance && served < total:
+		return fmt.Sprintf("nearest by wording to %q (%d of %d ranked, none about it)\n", q, served, total)
+	case tier == search.TierRelevance:
+		return fmt.Sprintf("nearest by wording to %q (%d ranked, none about it)\n", q, served)
+	case served < total:
+		// How many came back is not how many matched, and the agent is the
+		// reader that cannot ask a human. "(5 match(es))" reads as five exist,
+		// which is a different answer from sixteen thousand matched and here
+		// are five — one is worth acting on, the other is a sample that will
+		// fill a context window with whatever ranked highest (#1308).
+		return fmt.Sprintf("deja recall for %q (%d of %d matched)\n", q, served, total)
+	default:
+		return fmt.Sprintf("deja recall for %q (%d match(es))\n", q, served)
+	}
+}
+
 // wholeSessionForMCP reads one session for a caller that must not wait.
 //
 // `findByPrefix` is the CLI helper and opens with a blocking `index.Ensure` —
@@ -891,12 +933,23 @@ func wholeSessionForMCP(dir string, s model.Session) (model.Session, bool, error
 	return index.FindByIdentity(dir, s.Harness, s.ID)
 }
 
-// recallCountLineReserve is what the two lines around the hits cost — the
-// count above them and the "N more, call again with offset=N" below — kept out
-// of the budget the hits spend. Both are written after the loop, and the final
-// trim cut the navigation line off the end, which is the one line an agent
-// needs precisely when the answer was too big to fit.
-const recallCountLineReserve = 160
+// recallCountLineReserve is what the "N more, call again with offset=N" line
+// below the hits costs, kept out of the budget the hits spend. It is written
+// after the loop, and the final trim cut the navigation line off the end,
+// which is the one line an agent needs precisely when the answer was too big
+// to fit.
+//
+// The count line above the hits is measured rather than guessed: it carries
+// the query, and a constant that fitted a short one stopped covering an error
+// string pasted in whole — which is exactly what the tool description asks
+// agents to send.
+const recallCountLineReserve = 64
+
+// recallHeaderReserve is that plus the count line this answer will actually
+// print.
+func recallHeaderReserve(q, tier string, offset, limit, total int) int {
+	return recallCountLineReserve + len(recallCountLine(q, tier, offset, limit, total))
+}
 
 // twinSessionsFor pairs each session with the same session as it exists on
 // another machine, so a page holding both copies can say so. One manifest read
@@ -984,7 +1037,11 @@ func recallTextResultFrom(dir, q, harness string, limit, offset, budget int) (st
 	demoted := demoteRejected(hits)
 	if offset > 0 {
 		if offset >= total {
-			return fmt.Sprintf("No more matches for %q: %d total, offset %d.", clampEcho(q), total, offset), 0, 0, nil, nil, nil
+			what := "matches"
+			if result.Tier == search.TierRelevance {
+				what = "sessions ranked by wording"
+			}
+			return fmt.Sprintf("No more %s for %q: %d total, offset %d.", what, clampEcho(q), total, offset), 0, 0, nil, nil, nil
 		}
 		hits = hits[offset:]
 	}
@@ -1010,7 +1067,7 @@ func recallTextResultFrom(dir, q, harness string, limit, offset, budget int) (st
 		// questions about subjects this machine has never held — eight of
 		// eight came back with sessions rather than nothing, and the tool
 		// description promises an empty result means no record (#2074).
-		fmt.Fprintln(&b, "No session is about this. Nothing matched the query, so the sessions below are the nearest by wording — treat them as leads to check, not as a record, and say plainly if none of them answers.")
+		fmt.Fprintln(&b, nothingIsAboutThis+" so the sessions below are the nearest by wording — treat them as leads to check, not as a record, and say plainly if none of them answers.")
 	}
 	if note := demotedNote(hits, demoted); note != "" {
 		fmt.Fprintln(&b, note+" — read the order as the user's judgement, not as recency.")
@@ -1020,7 +1077,7 @@ func recallTextResultFrom(dir, q, harness string, limit, offset, budget int) (st
 	// the token budget: the header promised fifteen while nine arrived, and the
 	// follow-up line was trimmed off the end (#1308).
 	var hb strings.Builder
-	headerRoom := b.Len() + recallCountLineReserve
+	headerRoom := b.Len() + recallHeaderReserve(q, result.Tier, offset, limit, total)
 	for i, h := range hits {
 		fmt.Fprintf(&hb, "\n%d. [%s] %s · %s · %d matches", i+1,
 			recallListingLine(h.Session.Harness), recallListingLine(h.Session.Project), recallListingLine(h.Session.ID), h.Count)
@@ -1139,38 +1196,20 @@ func recallTextResultFrom(dir, q, harness string, limit, offset, budget int) (st
 	// From what was served, not from the limit: the loop also stops on the
 	// token budget, and then this said "2 more" while five were left — the
 	// agent asks for offset=served and the arithmetic has to hold.
-	switch {
-	case result.Tier == search.TierRelevance:
-		// Nothing matched, and the header is the line an agent reads as the
-		// answer's title. "deja recall for <query>" one line under "no session
-		// is about this" contradicts it, and with an offset the old header
-		// called them matches outright — the two shapes #2074 measured an
-		// agent inventing facts from.
-		if offset > 0 {
-			fmt.Fprintf(&b, "deja recall: no session about %q; nearest by wording, %d-%d of %d ranked\n",
-				q, offset+1, offset+served, total)
-			break
-		}
-		fmt.Fprintf(&b, "deja recall: no session about %q; nearest by wording (%d of %d ranked)\n", q, served, total)
-	case offset > 0:
-		fmt.Fprintf(&b, "deja recall for %q (matches %d-%d of %d)\n", q, offset+1, offset+served, total)
-	case served < total:
-		// How many came back is not how many matched, and the agent is the
-		// reader that cannot ask a human. "(5 match(es))" reads as five exist,
-		// which is a different answer from sixteen thousand matched and here
-		// are five — one is worth acting on, the other is a sample that will
-		// fill a context window with whatever ranked highest (#1308).
-		fmt.Fprintf(&b, "deja recall for %q (%d of %d matched)\n", q, served, total)
-	default:
-		fmt.Fprintf(&b, "deja recall for %q (%d match(es))\n", q, served)
-	}
+	b.WriteString(recallCountLine(q, result.Tier, offset, served, total))
 	b.WriteString(hb.String())
 	// From what was served, not from the limit: the loop also stops on the
 	// token budget, and then this said "2 more" while five were left — the
 	// agent asks for offset=served and the arithmetic has to hold.
 	more := ""
 	if left := total - offset - served; left > 0 {
-		more = fmt.Sprintf("\n%d more match(es) — call recall again with offset=%d.\n", left, offset+served)
+		what := "match(es)"
+		if result.Tier == search.TierRelevance {
+			// Nothing matched, so there are no more matches to offer — only
+			// more of the nearest wording.
+			what = "ranked by wording"
+		}
+		more = fmt.Sprintf("\n%d more %s — call recall again with offset=%d.\n", left, what, offset+served)
 	}
 	// The paging line is the instruction, not the evidence: appending it before
 	// the trim made a full page drop the one thing that says how to reach the
@@ -1262,6 +1301,11 @@ func recallContext(dir, q string) (string, error) {
 type idContext struct {
 	session string
 	size    int64
+	// note is deja's own word about the session — today, that it was
+	// forgotten. It travels beside the text rather than inside it, because
+	// the frame the text goes into tells the reader to treat what it holds as
+	// untrusted, and this is not recalled content (#1624).
+	note string
 }
 
 // contextByID answers from the session an id-prefix names, for the tool an
@@ -1290,27 +1334,35 @@ func contextByID(dir, q string) (string, idContext, bool) {
 	}
 	var b bytes.Buffer
 	search.PrintContext(&b, whole, "")
-	return b.String(), idContext{session: whole.ID, size: rawSize([]model.Session{whole})}, true
+	// The fact before the content, the way the CLI prints it: an agent handed
+	// the note promoted from a session it named has to be told the session was
+	// forgotten (#1624). It travels out of band — see idContext.note — because
+	// deja's own words do not belong inside a frame that tells the reader to
+	// treat what it holds as untrusted.
+	return b.String(), idContext{session: whole.ID, size: rawSize([]model.Session{whole}),
+		// FindByPrefix resolved this session from the selector, so a prefix
+		// here is honest by construction.
+		note: forgottenSourceNote(whole, q, true)}, true
 }
 
 // recallContextResult keeps the four-value shape its callers and tests read.
 func recallContextResult(dir, q, harness string) (string, int, int64, []string, error) {
-	text, sessions, raw, ids, _, err := recallContextResultFrom(dir, q, harness)
+	text, sessions, raw, ids, _, _, err := recallContextResultFrom(dir, q, harness)
 	return text, sessions, raw, ids, err
 }
 
 // recallContextResultFrom is recallContextResult plus the project behind the
 // session it served, for the reason recallTextResultFrom exists (#2324).
-func recallContextResultFrom(dir, q, harness string) (string, int, int64, []string, []string, error) {
+func recallContextResultFrom(dir, q, harness string) (string, int, int64, []string, []string, string, error) {
 	o := search.Options{Query: nfcfold.Compose(q), Harness: harness, All: true, RecallWorn: usage.WornSessions(dir)}
 	if stale, err := index.EnsureForSearchStale(dir, o, mcpProgress()); err != nil {
-		return "", 0, 0, nil, nil, err
+		return "", 0, 0, nil, nil, "", err
 	} else if stale {
 		requestWarmup(dir)
 	}
 	result, err := index.SearchWithRecoveryDetailed(dir, o, mcpProgress())
 	if err != nil {
-		return "", 0, 0, nil, nil, err
+		return "", 0, 0, nil, nil, "", err
 	}
 	ss := result.Sessions
 	o.Tier = result.Tier
@@ -1329,7 +1381,7 @@ func recallContextResultFrom(dir, q, harness string) (string, int, int64, []stri
 	} else if result.Tier == search.TierRelevance {
 		hits = search.RelevanceHitsWeighted(ss, index.RelevanceMatchTerms(q), result.TermIDF)
 	} else if hits, err = search.Run(ss, o); err != nil {
-		return "", 0, 0, nil, nil, err
+		return "", 0, 0, nil, nil, "", err
 	}
 	hits, policyHidden := policyFilterHitsCounted(policy.ActivationMCP, hits)
 	var semantic bool
@@ -1348,9 +1400,9 @@ func recallContextResultFrom(dir, q, harness string) (string, int, int64, []stri
 		// After the search, like the CLI does since #1614: there is no answer
 		// left for the id to shadow.
 		if text, id, ok := contextByID(dir, q); ok {
-			return text, 1, id.size, []string{id.session}, nil, nil
+			return text, 1, id.size, []string{id.session}, nil, id.note, nil
 		}
-		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil, nil
+		return emptyRecallAnswerPolicy(dir, q, policyHidden), 0, 0, nil, nil, "", nil
 	}
 	// The same order the search screen shows: this handed the agent a session
 	// the reader had rejected, while search demoted it and said why (#1099).
@@ -1368,9 +1420,32 @@ func recallContextResultFrom(dir, q, harness string) (string, int, int64, []stri
 	search.PrintContext(&b, whole, q)
 	text := b.String()
 	if hits[0].Tier != search.TierExact {
-		text = "[" + hits[0].Tier + "]\n" + text
+		text = contextTierLead(hits[0].Tier) + text
 	}
-	return text, 1, rawSize([]model.Session{whole}), []string{whole.ID}, projectsOf(whole), nil
+	return text, 1, rawSize([]model.Session{whole}), []string{whole.ID}, projectsOf(whole),
+		// The search path reaches a promoted note as often as the id path
+		// does — the note carries the id in its own text.
+		forgottenSourceNote(whole, q, false), nil
+}
+
+// nothingIsAboutThis is the half both surfaces share. The wording was tuned in
+// #2074 and then written twice — once in the plural over a page of sessions,
+// once in the singular over one — so an edit to either would have drifted from
+// the other without anything noticing.
+const nothingIsAboutThis = "No session is about this. Nothing matched the query,"
+
+// contextTierLead says what the session below it is, for a tier that is not an
+// exact match.
+//
+// A bare `[relevance]` marker was all an agent got above a whole session that
+// matched nothing — recall says "No session is about this" in a sentence, and
+// this tool, which returns far more text, said it in one word that reads like
+// a label on an answer (#2787, the shape #2074 fixed for the counted page).
+func contextTierLead(tier string) string {
+	if tier == search.TierRelevance {
+		return nothingIsAboutThis + " so the session below is the nearest by wording — treat it as a lead to check, not as a record, and say plainly if it does not answer.\n"
+	}
+	return "[" + tier + "]\n"
 }
 
 func mcpProgress() io.Writer {
