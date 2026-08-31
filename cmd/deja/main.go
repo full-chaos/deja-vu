@@ -119,6 +119,72 @@ func loadFileSources() []model.Session {
 	return ss
 }
 
+// worksWithNoHome names the commands that never write under a home directory
+// they cannot find: they print, or they diagnose the very state the guard is
+// about, or they carry their own refusal.
+//
+// `version` and `help` write nothing at all and are what a packager runs;
+// `completion` is sourced from a shell rc file; `update` replaces the binary
+// and is how somebody gets out of a broken state; `doctor` and `sources` are
+// where every other message sends the reader to find out what deja can see;
+// and install carries #1690's own guard, whose advice is the right one for it.
+var worksWithNoHome = map[string]bool{
+	"version": true, "--version": true, "-version": true,
+	"help": true, "--help": true, "-h": true,
+	"completion": true, "update": true,
+	"doctor": true, "sources": true,
+	"install": true, "uninstall": true,
+}
+
+// dispatchKnows reports whether a word is a command deja runs, from either
+// half of the dispatcher: the map, and the switch above it that holds the five
+// commands taking their own argument parsing.
+func dispatchKnows(name string) bool {
+	if _, ok := commands[name]; ok {
+		return true
+	}
+	switch name {
+	case "show", "last", "search", "aider", "goose":
+		return true
+	}
+	return false
+}
+
+// homelessRefusal answers what to do when deja cannot find a home directory
+// and nothing else says where its index goes.
+//
+// A command somebody typed says why it cannot run. A hook does not: it runs
+// unattended on every prompt, a refusal would cost the turn, and the whole
+// design of the hooks is to fail open and stay quiet (#1692). Either way
+// nothing is written, which is the part that matters — the index is a database,
+// and it was landing in whatever repository the agent was working in.
+func homelessRefusal(name string) (bool, error) {
+	// Both roots: the index answers to DEJA_INDEX_DIR, and the config
+	// directory to XDG_CONFIG_HOME, so one of them being absolute says
+	// nothing about the other.
+	if filepath.IsAbs(index.DefaultDir()) && filepath.IsAbs(xdgConfigHome()) {
+		return false, nil
+	}
+	if worksWithNoHome[name] {
+		// Only a name the dispatcher will actually take: `-v` is not a
+		// command, so allowlisting it let it through the guard, miss the map
+		// and land in the bare-query path — which builds an index (#1692).
+		if _, known := commands[name]; known {
+			return false, nil
+		}
+	}
+	if strings.HasPrefix(name, "hook-") || name == "statusline" || name == "warmup-status" {
+		return true, nil
+	}
+	// The command's own name, or deja's: for a bare query the first word is
+	// the reader's, and "retry cannot find your home directory" reads as if
+	// `retry` were a command.
+	if !dispatchKnows(name) {
+		name = "deja"
+	}
+	return true, fmt.Errorf("%s cannot find your home directory — set HOME, or DEJA_INDEX_DIR and XDG_CONFIG_HOME to absolute paths", name)
+}
+
 type command func(dir string, rest []string) error
 
 var commands = map[string]command{
@@ -226,6 +292,19 @@ var commands = map[string]command{
 
 func run(args []string) error {
 	dir := index.DefaultDir()
+	// Before anything reads or writes: every path deja writes hangs off the
+	// home directory, and it answers "" when there is none, so
+	// `filepath.Join("", ".cache", "deja")` is `.cache/deja` — deja built its
+	// index in whatever directory it happened to be run from, on the commands
+	// an agent runs unattended as much as on the ones a person types. #1690
+	// fixed install; this is the rest (#1692).
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	}
+	if stop, err := homelessRefusal(name); stop {
+		return err
+	}
 	if len(args) == 0 {
 		// briefWanted, not logoWanted: a reader who turned colour off still
 		// has an index and a terminal, and the brief is what that reader came
