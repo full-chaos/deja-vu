@@ -3376,61 +3376,6 @@ func replacedJSONCLineNote(dropped []string, line string) string {
 	return fmt.Sprintf("replaced the deja entry that was already here, which ran %s", safeForStatusline(was, 200))
 }
 
-// jsoncEntrySwitch reads an off switch out of the entry text, and returns it
-// the way it will be written back — `"enabled":false` or `"disabled":true`.
-// Empty when the entry is on.
-//
-// Text rather than JSON, for the same reason jsoncEntryCommand is: the block
-// may carry comments and trailing commas.
-func jsoncEntrySwitch(text string) string {
-	// The reader's comments come out first: a line reading
-	// `// "enabled": false when I travel` is a note about the entry, not the
-	// entry, and reading it switched off a server that was running.
-	code := stripJSONComments(text)
-	for _, sw := range []struct{ key, off string }{
-		{"enabled", "false"},
-		{"disabled", "true"},
-	} {
-		if at := jsoncEntryKeyValue(code, sw.key); strings.HasPrefix(at, sw.off) {
-			return `"` + sw.key + `":` + sw.off
-		}
-	}
-	return ""
-}
-
-// jsoncEntryKeyValue returns what follows `"key":` in the entry's own object,
-// or empty when the key is not there. Its own: a nested block carries its own
-// settings, and taking the first match anywhere let `"options":{"enabled":
-// false}` switch off an entry that says it is on.
-func jsoncEntryKeyValue(code, key string) string {
-	depth, inString, escaped := 0, false, false
-	for i := 0; i < len(code); i++ {
-		switch c := code[i]; {
-		case escaped:
-			escaped = false
-		case c == '\\' && inString:
-			escaped = true
-		case c == '"' && !inString:
-			inString = true
-			// The entry is `"deja": { … }`, so its own keys sit one brace in.
-			if depth == 1 && strings.HasPrefix(code[i:], `"`+key+`"`) {
-				rest := strings.TrimSpace(code[i+len(key)+2:])
-				if strings.HasPrefix(rest, ":") {
-					return strings.TrimSpace(rest[1:])
-				}
-			}
-		case c == '"':
-			inString = false
-		case inString:
-		case c == '{':
-			depth++
-		case c == '}':
-			depth--
-		}
-	}
-	return ""
-}
-
 // jsoncEntryCommand pulls the command out of an entry deja did not write. It
 // reads the text rather than the JSON: the block may carry comments and
 // trailing commas, which is why this writer exists at all.
