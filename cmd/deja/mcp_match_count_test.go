@@ -98,13 +98,13 @@ func TestRelevanceHitsAreNotCalledMatches(t *testing.T) {
 	// already, and the test went quiet instead of saying so.
 	// The sentinel is the tier's own words, and they changed when the line
 	// stopped reading as "here is what I found about it" (#2074).
-	if !strings.Contains(text, "nearest by wording") {
+	if !strings.Contains(text, "No session is about this") {
 		t.Fatalf("the fixture no longer reaches the relevance tier, so this test guards nothing:\n%s", firstLines(text, 3))
 	}
 	if strings.Contains(text, "matched)") {
 		t.Errorf("relevance-tier sessions were reported as matches:\n%s", firstLines(text, 4))
 	}
-	if !strings.Contains(text, "ranked)") {
+	if !strings.Contains(text, "ranked, none about it)") {
 		t.Errorf("the count line does not say what the number is:\n%s", firstLines(text, 4))
 	}
 }

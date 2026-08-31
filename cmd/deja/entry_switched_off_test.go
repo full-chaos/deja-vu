@@ -5,34 +5,158 @@ import (
 	"testing"
 )
 
-// An entry the reader switched off stays off, which is right — and the note
-// says so, so nobody wires deja and then wonders why nothing recalls. That note
-// was keyed to `disabled`, and opencode, grok and openclaw all write `enabled`,
-// so on those files install reported success and said nothing (#2757).
-func TestMergeNamesAnEntryLeftSwitchedOff(t *testing.T) {
-	next := map[string]any{"type": "local", "command": []string{"/bin/deja", "mcp"}}
-
+// The line that says deja was left switched off was keyed to one spelling.
+// opencode writes `enabled: false`, and a config carrying that reported a
+// clean install for wiring that will never run (#2757).
+func TestAnEntrySwitchedOffIsReportedWhicheverWayItIsSpelt(t *testing.T) {
 	for _, off := range []map[string]any{
-		{"command": []any{"/old/deja", "mcp"}, "disabled": true},
-		{"command": []any{"/old/deja", "mcp"}, "enabled": false},
+		{"disabled": true},
+		{"enabled": false},
 	} {
-		merged, note := mergeDejaEntry(off, next)
-		if !strings.Contains(note, "turn it back on") {
-			t.Errorf("nothing said the entry is still off for %v: %q", off, note)
+		name := "disabled"
+		if _, ok := off["enabled"]; ok {
+			name = "enabled false"
 		}
-		if _, ok := merged["disabled"]; ok {
-			if merged["disabled"] != true {
-				t.Errorf("switched the entry back on: %v", merged)
+		t.Run(name, func(t *testing.T) {
+			prev := map[string]any{"command": "/old/deja", "args": []any{"mcp"}}
+			for k, v := range off {
+				prev[k] = v
 			}
+			merged, note := mergeDejaEntry(prev, map[string]any{"command": "/new/deja", "args": []string{"mcp"}})
+			for k, v := range off {
+				if merged[k] != v {
+					t.Errorf("the switch was not carried through: %v", merged)
+				}
+			}
+			if !strings.Contains(note, "switched off") {
+				t.Errorf("the reader is not told the entry is off: %q", note)
+			}
+		})
+	}
+}
+
+// And an entry that is on says nothing, whichever way that is spelt.
+func TestAnEntryThatIsOnSaysNothingAboutASwitch(t *testing.T) {
+	for _, on := range []map[string]any{
+		{},
+		{"disabled": false},
+		{"enabled": true},
+	} {
+		prev := map[string]any{"command": "/old/deja", "args": []any{"mcp"}}
+		for k, v := range on {
+			prev[k] = v
 		}
-		if v, ok := merged["enabled"]; ok && v != false {
-			t.Errorf("switched the entry back on: %v", merged)
+		_, note := mergeDejaEntry(prev, map[string]any{"command": "/new/deja", "args": []string{"mcp"}})
+		if strings.Contains(note, "switched off") {
+			t.Errorf("%v: an entry that is on was reported as off: %q", on, note)
 		}
 	}
+}
 
-	// An entry that is on says nothing of the sort.
-	_, note := mergeDejaEntry(map[string]any{"command": []any{"/old/deja", "mcp"}, "enabled": true}, next)
-	if strings.Contains(note, "turn it back on") {
-		t.Errorf("called a live entry switched off: %q", note)
+// opencode.jsonc is written by a second writer that rewrites deja's entry as
+// one line, so a switch the reader had set went out with the old line and the
+// entry came back on with install reporting success (#2757).
+func TestTheOpencodeJSONCWriterKeepsASwitchTheReaderSet(t *testing.T) {
+	for _, sw := range []string{`"enabled":false`, `"disabled":true`} {
+		t.Run(sw, func(t *testing.T) {
+			old := "{\n  \"mcp\": {\n    \"deja\": {\"type\":\"local\",\"command\":[\"/old/deja\",\"mcp\"]," + sw + "}\n  }\n}\n"
+			next, note, err := updateOpencodeJSONC([]byte(old), "/new/deja", false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(next), sw) {
+				t.Errorf("the switch was dropped:\n%s", next)
+			}
+			if !strings.Contains(string(next), "/new/deja") {
+				t.Errorf("the entry was not updated:\n%s", next)
+			}
+			if !strings.Contains(note, "switched off") {
+				t.Errorf("the reader is not told the entry is off: %q", note)
+			}
+		})
+	}
+}
+
+// An entry that is on keeps its shape and says nothing.
+func TestTheOpencodeJSONCWriterSaysNothingAboutAnEntryThatIsOn(t *testing.T) {
+	for _, on := range []string{"", `,"enabled":true`, `,"disabled":false`} {
+		old := "{\n  \"mcp\": {\n    \"deja\": {\"type\":\"local\",\"command\":[\"/old/deja\",\"mcp\"]" + on + "}\n  }\n}\n"
+		next, note, err := updateOpencodeJSONC([]byte(old), "/new/deja", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(note, "switched off") {
+			t.Errorf("%q: an entry that is on was reported as off: %q", on, note)
+		}
+		if strings.Contains(string(next), "\"enabled\":false") || strings.Contains(string(next), "\"disabled\":true") {
+			t.Errorf("%q: an entry that is on was written off:\n%s", on, next)
+		}
+	}
+}
+
+// The switch is read out of the entry, not out of the reader's words about it
+// and not out of a block nested inside it: both switched a running server off
+// and said deja had left it as it was.
+func TestTheOpencodeJSONCWriterReadsTheEntrysOwnSwitch(t *testing.T) {
+	for _, entry := range []string{
+		`"deja": {"type":"local","command":["/old/deja","mcp"]} // "enabled": false when I travel`,
+		`"deja": {"type":"local","command":["/old/deja","mcp"]} /* "disabled": true once */`,
+		`"deja": {"type":"local","command":["/old/deja","mcp"],"enabled":"false"}`,
+		// A comment inside the entry, at the depth its own keys sit at.
+		"\"deja\": {\"type\":\"local\", // \"enabled\": false when I travel\n      \"command\":[\"/old/deja\",\"mcp\"]}",
+		"\"deja\": {\"type\":\"local\", /* \"disabled\": true once */ \"command\":[\"/old/deja\",\"mcp\"]}",
+	} {
+		old := "{\n  \"mcp\": {\n    " + entry + "\n  }\n}\n"
+		next, note, err := updateOpencodeJSONC([]byte(old), "/new/deja", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(next), `"enabled":false`) || strings.Contains(string(next), `"disabled":true`) {
+			t.Errorf("%s\n  was switched off:\n%s", entry, next)
+		}
+		if strings.Contains(note, "switched off") {
+			t.Errorf("%s\n  was reported off: %q", entry, note)
+		}
+	}
+}
+
+// A switch nested inside the entry is not the entry's switch — and it is the
+// reader's field, so the writer that merges deja's wiring onto the entry keeps
+// it rather than dropping it the way the line-rewriting one did.
+func TestASwitchNestedInsideTheEntryIsNeitherReadNorDropped(t *testing.T) {
+	old := "{\n  \"mcp\": {\n    " +
+		`"deja": {"type":"local","command":["/old/deja","mcp"],"options":{"enabled":false},"enabled":true}` +
+		"\n  }\n}\n"
+	next, note, err := updateOpencodeJSONC([]byte(old), "/new/deja", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(note, "switched off") {
+		t.Errorf("a nested switch was read as the entry's own: %q", note)
+	}
+	if !strings.Contains(string(next), `"options":{"enabled":false}`) {
+		t.Errorf("the reader's own nested block was dropped:\n%s", next)
+	}
+	if !strings.Contains(string(next), `"enabled":true`) {
+		t.Errorf("the entry's own switch was dropped:\n%s", next)
+	}
+}
+
+// deja's own switched-off entry is not a stranger's on the next install: the
+// note compares against what deja writes, switch and all.
+func TestASwitchedOffEntryOfDejasIsNotReportedReplacedEveryRun(t *testing.T) {
+	old := []byte("{\n  \"mcp\": {\n    \"deja\": {\"type\":\"local\",\"command\":[\"/bin/deja\",\"mcp\"],\"enabled\":false}\n  }\n}\n")
+	next, note, err := updateOpencodeJSONC(old, "/bin/deja", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(note, "replaced") {
+		t.Errorf("deja's own entry was reported as somebody else's: %q", note)
+	}
+	if !strings.Contains(note, "switched off") {
+		t.Errorf("the entry is still off and nothing says so: %q", note)
+	}
+	if string(next) != string(old) {
+		t.Errorf("a repeat install rewrote the entry:\n%s", next)
 	}
 }

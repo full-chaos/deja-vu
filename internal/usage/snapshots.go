@@ -35,6 +35,12 @@ type Snapshot struct {
 	// to say — measured on a real store, that sentence appears after 22 of 1218
 	// injections, which measures reporting rather than use.
 	Into string `json:"into,omitempty"`
+	// Unreadable marks an injection whose host sent a payload deja could not
+	// decode. The row is written either way — the memory did go out — and
+	// without this it is identical to a row from a host that sent nothing at
+	// all (#2161). A decode that fails on one field keeps the ones it read, so
+	// this can stand beside a receiver rather than instead of one.
+	Unreadable bool `json:"unreadable,omitempty"`
 	// Projects names the projects the digest was built from. The trust policy
 	// answers for a project name with no index at all, so a record that names
 	// its own projects can be checked against a rule tightened after it was
@@ -195,6 +201,32 @@ func RecordDigestPolicySessionsFrom(indexDir, kind, digest, into string, session
 	snapshotWriteIntoAt(indexDir, kind, digest, into, sessions, policyName, nil, projects, at)
 }
 
+// RecordDigestFromUnread is RecordDigestFrom for a hook whose payload could
+// not be decoded. A decode that fails on one field keeps the ones it read, so
+// the receiver — when the payload did name one — travels as it does anywhere
+// else; the flag is about the payload (#2773, the shape #2161 fixed for the
+// session-start hook).
+func RecordDigestFromUnread(indexDir, kind, digest, into string, sessions int, raw int64, terms, projects, ids []string) {
+	at := time.Now().UTC()
+	recordFullAtUnread(indexDir, kind, len(digest), sessions, sessions == 0, raw, ids, into, at, true)
+	snapshotWriteAt(indexDir, kind, digest, into, sessions, "", terms, projects, at, true)
+}
+
+// RecordDigestPolicySessionsUnread is RecordDigestPolicySessionsFrom for a
+// hook whose payload could not be decoded. The memory goes out regardless — an
+// agent that asked for context gets it — and the row says the payload was
+// unreadable rather than looking exactly like a row from a host that sent
+// nothing (#2161).
+//
+// into is still passed: a decode that fails on one field keeps the ones it
+// read, so a payload naming its session and mistyping something else has a
+// receiver worth recording.
+func RecordDigestPolicySessionsUnread(indexDir, kind, digest, into string, sessions int, raw int64, policyName string, ids, projects []string) {
+	at := time.Now().UTC()
+	recordFullAtUnread(indexDir, kind, len(digest), sessions, sessions == 0, raw, ids, into, at, true)
+	snapshotWriteAt(indexDir, kind, digest, into, sessions, policyName, nil, projects, at, true)
+}
+
 // SnapshotOnly stores the digest text without writing a counting event, for
 // callers that already recorded one with extra fields.
 func SnapshotOnly(indexDir, kind, digest string, sessions int) {
@@ -264,6 +296,15 @@ func snapshotWriteInto(indexDir, kind, digest, into string, sessions int, policy
 // snapshotWriteIntoAt is snapshotWriteInto with the instant supplied, so a
 // caller writing both logs for one injection can stamp them alike (#2294).
 func snapshotWriteIntoAt(indexDir, kind, digest, into string, sessions int, policyName string, terms, projects []string, at time.Time) {
+	snapshotWriteAt(indexDir, kind, digest, into, sessions, policyName, terms, projects, at, false)
+}
+
+// snapshotWriteAt is snapshotWriteIntoAt for a caller that knows the payload
+// naming the receiver could not be read. The injection still happened, so the
+// row is written either way; what it carries is the difference between "no
+// session was named" and "the session was in a payload deja could not decode"
+// (#2161).
+func snapshotWriteAt(indexDir, kind, digest, into string, sessions int, policyName string, terms, projects []string, at time.Time, unreadable bool) {
 	if digest == "" {
 		return
 	}
@@ -273,7 +314,7 @@ func snapshotWriteIntoAt(indexDir, kind, digest, into string, sessions int, poli
 	}
 	b, err := marshalSnapshot(Snapshot{Time: at, Kind: kind, Sessions: sessions,
 		Bytes: len(digest), Policy: policyName, Terms: terms, Into: into,
-		Projects: projects, Digest: clipDigest(digest)})
+		Unreadable: unreadable, Projects: projects, Digest: clipDigest(digest)})
 	if err != nil {
 		return
 	}

@@ -292,7 +292,12 @@ func runHookContext(dir string, plain bool) error {
 		SessionID string `json:"session_id"`
 		CWD       string `json:"cwd"`
 	}
-	_ = json.Unmarshal(readHookStdin(), &input)
+	// Best effort, as every hook is — but not silent about it. A payload deja
+	// cannot decode carries the session this injection went to, and losing it
+	// without a word left the audit log unable to tell that case from a host
+	// that sent nothing at all (#2161).
+	payload := readHookStdin()
+	unreadable := len(bytes.TrimSpace(payload)) > 0 && json.Unmarshal(payload, &input) != nil
 	// The harness tells us which project this is; deja read only the
 	// environment, so a host that sends the payload without exporting
 	// CLAUDE_PROJECT_DIR got no memory at all — indistinguishable from having
@@ -310,7 +315,11 @@ func runHookContext(dir string, plain bool) error {
 			// The block is about the machine and names no project, so without
 			// the projects behind its walls a forget of one of them could not
 			// reach the stored text (#2349).
-			usage.RecordDigestPolicyFrom(dir, usage.KindHook, out, input.SessionID, 0, 0, from, policy.Load().Describe(policy.ActivationAuto))
+			if unreadable {
+				usage.RecordDigestPolicySessionsUnread(dir, usage.KindHook, out, input.SessionID, 0, 0, policy.Load().Describe(policy.ActivationAuto), nil, from)
+			} else {
+				usage.RecordDigestPolicyFrom(dir, usage.KindHook, out, input.SessionID, 0, 0, from, policy.Load().Describe(policy.ActivationAuto))
+			}
 			if plain {
 				fmt.Fprintln(os.Stdout, out)
 				return nil
@@ -382,7 +391,11 @@ func runHookContext(dir string, plain bool) error {
 	}
 	digest = frameRecall(digest)
 	polName := policy.Load().Describe(policy.ActivationAuto)
-	usage.RecordDigestPolicySessionsFrom(dir, usage.KindHook, digest, input.SessionID, sessions, raw, polName, servedIDs, servedProjects)
+	if unreadable {
+		usage.RecordDigestPolicySessionsUnread(dir, usage.KindHook, digest, input.SessionID, sessions, raw, polName, servedIDs, servedProjects)
+	} else {
+		usage.RecordDigestPolicySessionsFrom(dir, usage.KindHook, digest, input.SessionID, sessions, raw, polName, servedIDs, servedProjects)
+	}
 	// What this project was told, so the next session start can say something
 	// else. Without this the novelty ordering has nothing to read and every
 	// start serves the same three sessions (#2038).
@@ -1139,15 +1152,40 @@ func limitHandoffTip(dir string) string {
 // serviceReceipt appends today's tally when there is one — the moment memory
 // lands is the moment to say what it has been doing all day.
 func serviceReceipt(dir string) string {
-	recalls, bytes, _ := usage.TodayWithInjections(dir)
-	if recalls < 2 || bytes == 0 {
+	// The same two counts the statusline prints, and the same names for them:
+	// what an agent asked for and got is a recall, and what deja sent unasked
+	// is memory arriving. Folding the second into the first made the receipt
+	// and the statusline disagree in one session, and the receipt is the one
+	// that rides into the model's context (#1575, following #1569).
+	n := usage.StatusCounters(dir)
+	served, bytes := n.Recalls, n.Bytes+n.Injected
+	if served+n.Injections < 2 || bytes == 0 {
 		return ""
 	}
-	raw := usage.TodayRaw(dir)
-	if raw/int64(bytes) < 2 {
-		return fmt.Sprintf(" · today: %d recall%s", recalls, pluralS(recalls))
+	var parts []string
+	if served > 0 {
+		parts = append(parts, fmt.Sprintf("%d recall%s", served, pluralS(served)))
 	}
-	return fmt.Sprintf(" · today: %d recall%s, %s distilled from %s", recalls, pluralS(recalls), humanBytes(int64(bytes)), humanBytes(raw))
+	if n.Injections > 0 {
+		parts = append(parts, fmt.Sprintf("memory arrived %s", timesToday(n.Injections)))
+	}
+	tail := ""
+	if n.RawToday/int64(bytes) >= 2 {
+		tail = fmt.Sprintf(", %s distilled from %s", humanBytes(int64(bytes)), humanBytes(n.RawToday))
+	}
+	return " · today: " + strings.Join(parts, ", ") + tail
+}
+
+// timesToday counts arrivals in words, so the receipt reads as a sentence
+// rather than a gauge: "memory arrived twice" beats "memory arrived 2 times".
+func timesToday(n int) string {
+	switch n {
+	case 1:
+		return "once"
+	case 2:
+		return "twice"
+	}
+	return fmt.Sprintf("%d times", n)
 }
 
 // staleReadOnlyNote is the one line for an index that is behind and cannot

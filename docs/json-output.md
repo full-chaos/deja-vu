@@ -548,7 +548,11 @@ start on a checkout with no sessions of its own injects the environment block,
 which is about the machine rather than the project, so that event is `empty`
 and carries its `bytes`. `into` names the agent session an injection went to,
 as the harness names it, and is absent when the writer did not know one — an
-MCP recall answers a tool call, not a session start.
+MCP recall answers a tool call, not a session start. `unreadable` is true when
+a hook was sent a payload deja could not decode: the memory went out anyway, so
+the row exists, and without this it is identical to one from a host that sent
+nothing at all. It says nothing about `into` — a decode that fails on one field
+keeps the ones it read, so a payload that named its session carries both.
 
 A line needs both `t` and `kind` to appear here at all: a half-written line, or
 one from something that is not deja, is skipped rather than shown with a missing
@@ -559,7 +563,8 @@ never disagree about whether something happened.
 injected digest itself. It carries `t` and `kind` as above, the `digest` text,
 `bytes`, and — each omitted when empty — `sessions`, the `policy` that allowed
 the injection, the `terms` behind a déjà vu firing, `into`, the agent session
-it went to, and `projects`, the projects the digest was built from. `projects`
+it went to, `unreadable` for an injection whose payload could not be decoded,
+and `projects`, the projects the digest was built from. `projects`
 is absent on records written before it existed and on injections whose writer
 does not know them. It is `null` when no digest has been recorded: one object is the
 shape, and that is how a missing one is spelled.

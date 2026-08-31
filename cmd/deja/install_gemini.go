@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
@@ -54,7 +53,10 @@ func installGeminiExtension(exe string, uninstall bool) (installResult, error) {
 		return installResult{}, err
 	}
 	manifestPath := filepath.Join(dir, "gemini-extension.json")
-	oldManifest, _ := os.ReadFile(manifestPath)
+	oldManifest, err := readConfig(manifestPath)
+	if err != nil {
+		return installResult{}, err
+	}
 	if _, err := writeIfChanged(manifestPath, oldManifest, append(manifest, '\n')); err != nil {
 		return installResult{}, err
 	}
@@ -86,7 +88,10 @@ func installGeminiExtension(exe string, uninstall bool) (installResult, error) {
 		return installResult{}, err
 	}
 	hooksPath := filepath.Join(dir, "hooks", "hooks.json")
-	oldHooks, _ := os.ReadFile(hooksPath)
+	oldHooks, err := readConfig(hooksPath)
+	if err != nil {
+		return installResult{}, err
+	}
 	a, err := writeIfChanged(hooksPath, oldHooks, append(hooks, '\n'))
 	if err != nil {
 		return installResult{}, err
@@ -106,7 +111,7 @@ func geminiHooksEnabled() bool {
 		return false
 	}
 	var root map[string]any
-	if err := json.Unmarshal(b, &root); err != nil {
+	if err := json.Unmarshal([]byte(stripJSONComments(string(b))), &root); err != nil {
 		return false
 	}
 	cfg, _ := root["hooksConfig"].(map[string]any)
@@ -118,27 +123,20 @@ func geminiHooksEnabled() bool {
 // loaded and its hooks are never run.
 func enableGeminiHooks() error {
 	path := filepath.Join(sources.GeminiHome(), "settings.json")
-	old, _ := os.ReadFile(path)
+	old, err := readConfig(path)
+	if err != nil {
+		return err
+	}
 	var root map[string]any
 	if len(bytes.TrimSpace(old)) == 0 {
 		root = map[string]any{}
+	} else if configIsJSONC(old) {
+		// The same file the MCP entry went into a moment ago. Refusing it here
+		// left the target reported as refused with half its wiring written and
+		// a .bak beside it (#2744).
+		return enableGeminiHooksJSONC(path, old)
 	} else if err := json.Unmarshal(old, &root); err != nil {
-		// The MCP entry went in through the text path, which keeps comments,
-		// and then this refused the same file for having them — after it had
-		// been edited, with a .bak left beside it (#2744). Read past them: if
-		// hooks are already on there is nothing to write, and if they are not,
-		// say what to switch on rather than quoting a parser at somebody about
-		// their own comment.
-		var stripped map[string]any
-		if json.Unmarshal(jsoncStripped(old), &stripped) != nil {
-			return fmt.Errorf("gemini settings: %w", err)
-		}
-		if cfg, _ := stripped["hooksConfig"].(map[string]any); cfg != nil {
-			if on, ok := cfg["enabled"].(bool); ok && on {
-				return nil
-			}
-		}
-		return fmt.Errorf("gemini settings has comments deja will not rewrite — set \"hooksConfig\": {\"enabled\": true} in %s by hand", path)
+		return fmt.Errorf("gemini settings: %w", err)
 	}
 	cfg, _ := root["hooksConfig"].(map[string]any)
 	if cfg == nil {
@@ -157,15 +155,35 @@ func enableGeminiHooks() error {
 	return err
 }
 
-// jsoncStripped blanks the comments out of a config so it can be read as JSON,
-// leaving the bytes around them where they were.
-func jsoncStripped(b []byte) []byte {
-	lines := strings.Split(string(b), "\n")
-	inBlock := false
-	for i, l := range lines {
-		code, next, _ := jsoncCodeOf(l, inBlock)
-		inBlock = next
-		lines[i] = code
+// enableGeminiHooksJSONC is enableGeminiHooks for a settings file carrying
+// comments: the same decision, read from the file with its comments blanked,
+// and the switch written by text so everything else stays put.
+func enableGeminiHooksJSONC(path string, old []byte) error {
+	var root map[string]any
+	if err := json.Unmarshal([]byte(stripJSONComments(string(old))), &root); err != nil {
+		return fmt.Errorf("gemini settings: %w", err)
 	}
-	return []byte(strings.Join(lines, "\n"))
+	cfg, _ := root["hooksConfig"].(map[string]any)
+	if enabled, ok := cfg["enabled"].(bool); ok && enabled {
+		return nil
+	}
+	// A key holding something else — a list, a string, null. zedFindKey does
+	// not match those either, so the write would fall through to inserting a
+	// second `hooksConfig` and the reader's value would win (#2745, the shape
+	// #2740 closed for entries).
+	if v, present := root["hooksConfig"]; present && cfg == nil {
+		_ = v
+		return fmt.Errorf("gemini settings: %q is not an object deja can edit — left as it was", "hooksConfig")
+	}
+	if v, present := cfg["enabled"]; present {
+		if _, ok := v.(bool); !ok {
+			return fmt.Errorf("gemini settings: %q is not a switch deja can turn on — left as it was", "hooksConfig.enabled")
+		}
+	}
+	next, err := jsoncSetFlag(string(old), "hooksConfig", "enabled", true)
+	if err != nil {
+		return fmt.Errorf("gemini settings: %w", err)
+	}
+	_, err = writeIfChanged(path, old, []byte(next))
+	return err
 }
