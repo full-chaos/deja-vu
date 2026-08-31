@@ -707,7 +707,7 @@ func printSpawnEdges(w io.Writer, dir string, s model.Session) {
 		if s.Agent != "" {
 			by = " as " + s.Agent
 		}
-		fmt.Fprintf(w, "deja: spawned from %s%s — `deja show %s`\n", digest.Short(s.Parent), by, digest.Short(s.Parent))
+		fmt.Fprintf(w, "deja: spawned from %s%s — `deja show %s`\n", digest.Short(s.Parent), by, pasteSafe(digest.Short(s.Parent)))
 	} else if s.Kind != "" {
 		// A kind with no parent is all the harness recorded; saying which
 		// session asked for it would be a guess.
@@ -1001,7 +1001,9 @@ func clearedNoteIDs(keys []string) string {
 		if _, ok := known[id]; !ok {
 			continue
 		}
-		ids = append(ids, id)
+		// Quoted one by one: the join renders them as separate code spans, so
+		// quoting the finished list made every id one shell word (#2768).
+		ids = append(ids, pasteSafe(id))
 	}
 	sort.Strings(ids)
 	const shown = 3
@@ -1691,11 +1693,11 @@ func roleServedHint(dir, q string) string {
 		if n == 1 {
 			match = "matches"
 		}
-		fmt.Fprintf(&out, "deja: %d command%s this machine ran %s it — `deja how %s`\n",
-			n, pluralS(n), match, q)
+		out.WriteString(howOfferLine(n, match, terms))
 	}
 	if n, name := sessionsTouchingWords(dir, terms); n > 0 {
-		fmt.Fprintf(&out, "deja: %d session%s touched %s — `deja blame %s`\n", n, pluralS(n), name, name)
+		fmt.Fprintf(&out, "deja: %d session%s touched %s — `deja blame %s`\n",
+			n, pluralS(n), search.SafeLine(name), pasteSafe(name))
 	}
 	return out.String()
 }
@@ -1737,6 +1739,28 @@ func commandsMatchingWords(dir string, terms []string) int {
 		}
 	}
 	return n
+}
+
+// howOfferLine is the half of the hint that offers `deja how`.
+//
+// The words go over as words: `deja how` ANDs its arguments and a quoted
+// phrase becomes one term it then requires contiguously, so quoting the whole
+// query handed over a command that answers "no command on this machine
+// mentions …" under a line that had just counted three (#2768).
+func howOfferLine(n int, match string, terms []string) string {
+	// A term can start with a dash — someone asking about `-run` or `--limit`
+	// — and `deja how` would read it as a flag it does not have, or as one it
+	// does and swallow the next word. The command's own escape says the rest
+	// is the query.
+	dashed := ""
+	for _, t := range terms {
+		if strings.HasPrefix(t, "-") {
+			dashed = "-- "
+			break
+		}
+	}
+	return fmt.Sprintf("deja: %d command%s this machine ran %s it — `deja how %s%s`\n",
+		n, pluralS(n), match, dashed, pasteSafeWords(terms))
 }
 
 // sessionsTouchingWords counts the sessions that touched a file whose name
@@ -3043,7 +3067,8 @@ func forgetScopeRefusal(selector string, matches int, allMatches bool) error {
 	if strings.Contains(selector, "…") {
 		return fmt.Errorf("%q matches %d sessions — the ids differ in the middle the line elides; `deja last` prints them whole", selector, matches)
 	}
-	return fmt.Errorf("%q is a prefix of %d sessions — `deja forget --session %s --dry-run` lists what would go; add --all-matches to drop them all", selector, matches, selector)
+	return fmt.Errorf("%q is a prefix of %d sessions — `deja forget --session %s --dry-run` lists what would go; add --all-matches to drop them all",
+		selector, matches, pasteSafe(selector))
 }
 
 func runForget(dir string, args []string) error {
@@ -3113,7 +3138,7 @@ func runForget(dir string, args []string) error {
 			// is the whole difference between a dead end and one more word to
 			// type (#2656, the lesson #2191 recorded for --harness).
 			if !strings.HasPrefix(args[i], "-") {
-				return fmt.Errorf("forget: a session id goes after --session — `deja forget --session %s`", args[i])
+				return fmt.Errorf("forget: a session id goes after --session — `deja forget --session %s`", pasteSafe(args[i]))
 			}
 			return fmt.Errorf("forget: unknown flag %q", args[i])
 		}
@@ -4249,7 +4274,10 @@ func forgottenSourceNote(s model.Session, selector string, resolved bool) string
 	if !index.Tombstoned(key) {
 		return ""
 	}
-	return fmt.Sprintf("%s is forgotten — this is the note promoted from it; `deja forget --list` names what is gone", key)
+	// Prose, not a command: the key is read here rather than pasted — the
+	// command in this sentence takes no argument — so it is neutralised the
+	// way every other echo is.
+	return fmt.Sprintf("%s is forgotten — this is the note promoted from it; `deja forget --list` names what is gone", safeForStatusline(key, 200))
 }
 
 // selectorNamesSession reports whether the reader's selector names this
