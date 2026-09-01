@@ -459,6 +459,73 @@ from a machine a moment ahead — or an NTP step landing between the write and t
 read — is not a clock worth reporting, while a session's stamp comes from a
 transcript deja did not write.
 
+## `deja friction --json`
+
+What this machine keeps tripping over, machine-readable:
+
+```json
+{
+  "schema_version": 2,
+  "sessions_read": 506,
+  "min_sessions": 3,
+  "total": 8,
+  "truncated": true,
+  "rows": [
+    {
+      "error": "command not found: shellcheck",
+      "sessions": 11,
+      "harnesses": ["claude", "codex"],
+      "last": "2026-08-30T09:14:02Z"
+    }
+  ]
+}
+```
+
+`sessions_read` is the denominator the prose header states — sessions that
+recorded tool output, after the trust policy and ignore rules have taken theirs.
+`min_sessions` is the threshold a row had to clear: without it a consumer cannot
+tell an empty result meaning "nothing recurs here" from one meaning "nothing
+recurred *twice*", which are different facts about the same store.
+
+`total` counts the recurring errors found before `--limit` was applied and
+`truncated` says whether the cap hid any, on the same reasoning as the version 2
+search envelope: reading `rows.length` answers neither question once a limit is
+in play.
+
+The empty result is the same shape with an empty `rows` array, never a different
+one. The prose path answers "nothing recurring" five ways depending on which
+rule emptied the store, and a script cannot branch on prose.
+
+`last` is omitted rather than zero-valued when a row carries no recorded time.
+
+## `deja fix <error> --json`
+
+The commands sessions on this machine ran after that error:
+
+```json
+{
+  "schema_version": 2,
+  "fixes": [
+    {
+      "error": "command not found: shellcheck",
+      "command": "brew install shellcheck",
+      "candidate": false,
+      "when": "2026-08-29T18:02:44Z"
+    }
+  ]
+}
+```
+
+`candidate` is the half-evidence flag the prose renders as *"ran next,
+unconfirmed"*: one session ran this after the error and nothing has confirmed it
+worked. A caller acting on a fix automatically needs to know which half it is
+holding, so it is a field rather than a wording difference.
+
+As with `friction`, an empty result keeps the envelope and returns `fixes: []`.
+The prose path distinguishes "held but unconfirmed", "nothing recorded for that
+line" and "no session ran a command after that error" in three different
+sentences; the JSON says only that there is nothing to act on.
+
 ## `deja stats --impact --json`
 
 What deja has actually served on this machine, measured from the usage log:

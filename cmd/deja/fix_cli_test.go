@@ -15,8 +15,18 @@ func TestFixRejectsFlagMistakes(t *testing.T) {
 	writeClaudeFixture(t, filepath.Join(os.Getenv("DEJA_CLAUDE_ROOT"), "p", "s.jsonl"), "s", []string{
 		`{"type":"user","sessionId":"s","timestamp":"2026-01-02T03:04:05Z","message":{"role":"user","content":"hi"}}`,
 	})
-	if _, err := captureRun(t, "fix", "boom", "--json"); err == nil {
-		t.Error("unknown flag --json was accepted and folded into the query")
+	// --json is answered now rather than refused (#1932). What must not come back is
+	// the bug this test was written for: the flag being folded into the searched text.
+	// So it is asserted as a flag on both counts - accepted beside a query, and NOT
+	// treated as one when it stands alone.
+	if _, err := captureRun(t, "fix", "boom", "--json"); err != nil {
+		t.Errorf("fix --json refused: %v", err)
+	}
+	if _, err := captureRun(t, "fix", "--json"); err == nil {
+		t.Error("--json alone was accepted; the flag became the query")
+	}
+	if _, err := captureRun(t, "fix", "boom", "--jsonn"); err == nil {
+		t.Error("unknown flag --jsonn was accepted and folded into the query")
 	}
 	if _, err := captureRun(t, "fix", "boom", "--limit"); err == nil {
 		t.Error("--limit with no value was accepted")

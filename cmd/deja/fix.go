@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vshulcz/deja-vu/internal/index"
+	"github.com/vshulcz/deja-vu/internal/jsonout"
 	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/search"
 )
@@ -23,9 +25,15 @@ import (
 
 func runFix(dir string, args []string, stdout io.Writer) error {
 	limit := 3
+	asJSON := false
 	var parts []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--json":
+			// Rejected outright until now. The comment below records an earlier bug where
+			// `--json` was swallowed into the search text, so the flag has been on this
+			// command's mind since without ever being answered (#1932).
+			asJSON = true
 		case "--limit":
 			if i+1 >= len(args) {
 				return fmt.Errorf("fix: --limit wants a number")
@@ -72,6 +80,9 @@ func runFix(dir string, args []string, stdout io.Writer) error {
 	pairs := index.FixesFor(dir, text, limit, func(project string) bool {
 		return pol.Allows(policy.ActivationSearch, project)
 	})
+	if asJSON {
+		return writeFixJSON(stdout, pairs)
+	}
 	if len(pairs) == 0 {
 		// One honest line. The old code tried to tell "not an error" apart from
 		// "never seen it", but the test it used rejects `Error: …`, `npm ERR!`
@@ -148,4 +159,45 @@ func nearestRecordedError(dir, text string, allow func(string) bool) string {
 		}
 	}
 	return search.SafeLine(best)
+}
+
+// fixJSON is the `deja fix --json` envelope. See docs/json-output.md.
+//
+// Object-shaped and versioned, because a consumer parses it on a schedule. The
+// empty case is the same shape with an empty array rather than a different one:
+// the prose path answers "nothing recorded" three different ways depending on
+// what the store holds, and a script cannot branch on prose.
+type fixJSON struct {
+	SchemaVersion int          `json:"schema_version"`
+	Fixes         []fixRowJSON `json:"fixes"`
+}
+
+type fixRowJSON struct {
+	Error   string `json:"error"`
+	Command string `json:"command"`
+	// Candidate is the half-evidence flag the prose renders as "ran next,
+	// unconfirmed": one session ran this after the error and nothing has
+	// confirmed it worked. A caller acting on a fix needs to know which it has.
+	Candidate bool `json:"candidate"`
+	// When is omitted rather than zero-valued: an absent timestamp is a real
+	// state here, and "0001-01-01" is not a date anybody should read.
+	When string `json:"when,omitempty"`
+}
+
+func writeFixJSON(stdout io.Writer, pairs []index.FixPair) error {
+	rows := make([]fixRowJSON, 0, len(pairs))
+	for _, p := range pairs {
+		row := fixRowJSON{
+			Error:     search.SafeLine(p.Error),
+			Command:   search.SafeCommand(p.Command),
+			Candidate: p.Candidate,
+		}
+		if !p.When.IsZero() {
+			row.When = p.When.UTC().Format(time.RFC3339)
+		}
+		rows = append(rows, row)
+	}
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(fixJSON{SchemaVersion: jsonout.Version, Fixes: rows})
 }
