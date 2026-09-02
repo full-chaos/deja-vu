@@ -134,8 +134,8 @@ $ deja "jwt refresh token"
 
 ### MCP 工具
 
-服务端提供 `recall`、`recall_context`、`blame`、`fix`、`how` 和 `remember`。
-`deja install` 会自动接好，只有手工配置智能体时才需要关心它们。
+服务端只暴露一个工具 `deja`，用 `mode` 参数选择能力：`recall`、`context`、`blame`、`fix`、`how`、`remember`。
+`deja install` 会自动接好，只有手工配置智能体时才需要关心它。原来的六个工具名对已经接好的客户端仍然有效。
 
 ## 支持的工具
 
@@ -258,7 +258,7 @@ rm -rf ~/.cache/deja
 - [为什么智能体在会话之间会忘事](https://vshulcz.github.io/deja-vu/guide/forgetting.html) · [每个智能体把历史存在哪里](https://vshulcz.github.io/deja-vu/guide/where-sessions-are-stored.html)
 - [压缩会丢掉什么](https://vshulcz.github.io/deja-vu/guide/after-compaction.html) · [换一个智能体](https://vshulcz.github.io/deja-vu/guide/switching-agents.html) · [审计智能体做过什么](https://vshulcz.github.io/deja-vu/guide/auditing-agents.html) · [导出一次对话](https://vshulcz.github.io/deja-vu/guide/export-conversations.html) · [跨机器](https://vshulcz.github.io/deja-vu/guide/sync-across-machines.html) · [记忆要花多少 token](https://vshulcz.github.io/deja-vu/guide/token-cost.html)
 
-按工具：[opencode](https://vshulcz.github.io/deja-vu/guide/memory-for-opencode.html) · [DeepSeek Harness](https://vshulcz.github.io/deja-vu/guide/memory-for-dsh.html) · [Kimi Code](https://vshulcz.github.io/deja-vu/guide/memory-for-kimi.html) · [Zed](https://vshulcz.github.io/deja-vu/guide/memory-for-zed.html) · [Grok Build](https://vshulcz.github.io/deja-vu/guide/memory-for-grok.html) · [Gemini CLI](https://vshulcz.github.io/deja-vu/guide/memory-for-gemini.html) · [Qwen Code](https://vshulcz.github.io/deja-vu/guide/memory-for-qwen.html) · [OpenClaw](https://vshulcz.github.io/deja-vu/guide/memory-for-openclaw.html) · [Goose](https://vshulcz.github.io/deja-vu/guide/memory-for-goose.html) · [Cline](https://vshulcz.github.io/deja-vu/guide/memory-for-cline.html) · [pi and omp](https://vshulcz.github.io/deja-vu/guide/memory-for-pi.html)
+按工具：[opencode](https://vshulcz.github.io/deja-vu/guide/memory-for-opencode.html) · [DeepSeek Harness](https://vshulcz.github.io/deja-vu/guide/memory-for-dsh.html) · [Kimi Code](https://vshulcz.github.io/deja-vu/guide/memory-for-kimi.html) · [Zed](https://vshulcz.github.io/deja-vu/guide/memory-for-zed.html) · [Grok Build](https://vshulcz.github.io/deja-vu/guide/memory-for-grok.html) · [Gemini CLI](https://vshulcz.github.io/deja-vu/guide/memory-for-gemini.html) · [Qwen Code](https://vshulcz.github.io/deja-vu/guide/memory-for-qwen.html) · [OpenClaw](https://vshulcz.github.io/deja-vu/guide/memory-for-openclaw.html) · [Goose](https://vshulcz.github.io/deja-vu/guide/memory-for-goose.html) · [Cline](https://vshulcz.github.io/deja-vu/guide/memory-for-cline.html) · [pi and omp](https://vshulcz.github.io/deja-vu/guide/memory-for-pi.html) · [Hermes](https://vshulcz.github.io/deja-vu/guide/memory-for-hermes.html)
 
 ## 在你自己的历史上试一次
 
