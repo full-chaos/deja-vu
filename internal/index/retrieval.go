@@ -495,6 +495,9 @@ func relevanceSearch(dir string, m Manifest, o query.Options) (SearchResult, err
 	}
 	keep = append(keep, weak...)
 	ss, err := sessionsServable(dir, keep, o)
+	if err == nil && len(m.Sessions) >= bestMessageStore {
+		ss = rerankByBestMessage(ss, terms, rank.idf)
+	}
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -4288,4 +4291,95 @@ func consonantY(word string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(word, "y"), true
+}
+
+// bestMessageStore is the store size from which the relevance pool is fused
+// with a per-message reading. On a haystack of a few hundred sessions the
+// session-level overlap already ranks well and the fusion costs it points
+// (LoCoMo 70.3 -> 69.7 hit@1 when applied everywhere); on a pile of nineteen
+// thousand the answer is one turn in one session among fifty that spread the
+// same words thin, and the fusion is worth hit@1 15 -> 18, hit@5 32 -> 35
+// (day0bench, -corpus 1000; #3016).
+const bestMessageStore = 2000
+
+// bestMessageTurns bounds how many turns of one session are read for the
+// fusion: the pool is fifty sessions, a marathon can hold thousands of turns,
+// and the fact this is looking for sits in one of them, not in the tail.
+const bestMessageTurns = 4000
+
+// rerankByBestMessage fuses the relevance pool's own order with the single
+// message in each session that covers the most query weight, on the reading
+// that a fact lives in one turn — usually the user's — while a lookalike
+// session spreads the same words over many. Reciprocal rank fusion keeps both
+// votes; stable on ties, so the pool's order survives where messages cannot
+// separate sessions.
+func rerankByBestMessage(ss []model.Session, terms []string, idf map[string]float64) []model.Session {
+	forms := make([][]string, len(terms))
+	for i, t := range terms {
+		t = strings.ToLower(t)
+		forms[i] = append([]string{t}, stemMatchForms(t)...)
+	}
+	best := make([]float64, len(ss))
+	for i, s := range ss {
+		msgs := s.Messages
+		if len(msgs) > bestMessageTurns {
+			msgs = msgs[:bestMessageTurns]
+		}
+		for _, msg := range msgs {
+			toks := map[string]bool{}
+			for _, tk := range tokens(strings.ToLower(msg.Text)) {
+				toks[tk] = true
+			}
+			score := 0.0
+			for ti, t := range terms {
+				hit := false
+				for _, f := range forms[ti] {
+					if toks[f] {
+						hit = true
+						break
+					}
+				}
+				if hit {
+					w := idf[strings.ToLower(t)]
+					if w <= 0 {
+						w = 1
+					}
+					score += w
+					if msg.Role == "user" {
+						score += 0.5 * w
+					}
+				}
+			}
+			if score > best[i] {
+				best[i] = score
+			}
+		}
+	}
+	// Fuse rather than replace: the pool's own order is session-level IDF
+	// overlap, which wins on a small haystack; the best-message score wins on
+	// a large pile. Reciprocal rank fusion keeps both votes.
+	byMsg := make([]int, len(ss))
+	for i := range byMsg {
+		byMsg[i] = i
+	}
+	sort.SliceStable(byMsg, func(a, b int) bool { return best[byMsg[a]] > best[byMsg[b]] })
+	msgRank := make([]int, len(ss))
+	for r, i := range byMsg {
+		msgRank[i] = r
+	}
+	const k = 5.0
+	fused := make([]float64, len(ss))
+	for i := range ss {
+		fused[i] = 1/(k+float64(i)) + 1/(k+float64(msgRank[i]))
+	}
+	idx := make([]int, len(ss))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return fused[idx[a]] > fused[idx[b]] })
+	out := make([]model.Session, len(ss))
+	for i, j := range idx {
+		out[i] = ss[j]
+	}
+	return out
 }
