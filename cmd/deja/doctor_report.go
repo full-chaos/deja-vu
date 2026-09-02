@@ -437,7 +437,7 @@ func doctorStoreChecks() []doctorStoreCheck {
 		{"omp", []string{sources.OmpRoot()}, sources.OmpSessionFiles(), sources.ParseOmpFile},
 		{"prime", []string{sources.PrimeRoot()}, sources.PrimeSessionFiles(), sources.ParsePrimeFile},
 		{"amp", []string{sources.AmpRoot()}, sources.AmpThreadFiles(), sources.ParseAmpFile},
-		{"openclaw", []string{sources.OpenClawRoot()}, sources.OpenClawSessionFiles(), sources.ParseOpenClawFile},
+		{"openclaw", []string{sources.OpenClawRoot()}, sources.OpenClawStoreFiles(), parseDoctorOpenClaw},
 		{"copilot", []string{sources.CopilotRoot()}, sources.CopilotSessionFiles(), sources.ParseCopilotFile},
 		// Both were listed by the text rows and by nothing else: absent here,
 		// `doctor --json` never named them and "no agent history was found on
@@ -511,6 +511,15 @@ func parseDoctorCodex(path string) ([]model.Session, error) {
 		return sources.ParseCodexHistory(path)
 	}
 	return sources.ParseCodexRollout(path)
+}
+
+// parseDoctorOpenClaw reads whichever OpenClaw store the newest path is: the
+// per-agent SQLite database of 2026.8 or a JSONL transcript from before it.
+func parseDoctorOpenClaw(path string) ([]model.Session, error) {
+	if filepath.Base(path) == "openclaw-agent.sqlite" {
+		return sources.ParseOpenClawDB(path)
+	}
+	return sources.ParseOpenClawFile(path)
 }
 
 func parseDoctorCursor(path string) ([]model.Session, error) {
