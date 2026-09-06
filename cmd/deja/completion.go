@@ -54,7 +54,7 @@ _deja_completion() {
     command="${COMP_WORDS[1]-}"
     action="${COMP_WORDS[2]-}"
 
-    local commands="blame bench brief check completion ctx doctor embed files fix forget friction handoff help how index install last log mcp promote remember restore resume search share show sources stats statusline sync uninstall update version view warmup"
+    local commands="blame bench brief check completion ctx doctor embed files fix forget friction handoff help how index install instructions last log mcp promote remember restore resume search share show sources stats statusline sync uninstall update version view warmup"
     local harnesses="%HARNESSES%"
     local install_targets="%INSTALL_TARGETS% --all --auto"
 
@@ -103,6 +103,15 @@ _deja_completion() {
             ;;
         index)
             COMPREPLY=( $(compgen -W "--rebuild -rebuild" -- "$cur") )
+            ;;
+        instructions)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=( $(compgen -W "example apply export resolve hook install" -- "$cur") )
+            elif [[ "$prev" == "--store" ]]; then
+                COMPREPLY=( $(compgen -f -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--store --help" -- "$cur") )
+            fi
             ;;
         install|uninstall)
             COMPREPLY=( $(compgen -W "$install_targets --no-guidance" -- "$cur") )
@@ -185,6 +194,7 @@ _deja() {
     'help:print the command reference'
     'index:build or refresh the index'
     'install:wire deja into an agent'
+    'instructions:resolve approved operating instructions (experimental)'
     'last:list recent sessions'
     'brief:the screen bare deja prints on a terminal'
     'log:show what deja served to agents'
@@ -244,6 +254,13 @@ _deja() {
     index)
       _arguments '--rebuild[force a full rebuild]' '-rebuild[force a full rebuild]'
       ;;
+    instructions)
+      if (( CURRENT == 3 )); then
+        _values 'instruction action' example apply export resolve hook install
+      else
+        _arguments '--store=[approved registry]:path:_files' '--help[show instruction help]'
+      fi
+      ;;
     install|uninstall)
       _arguments '--no-guidance[skip guidance files]' "1:target:($install_targets)"
       ;;
@@ -288,7 +305,7 @@ const fishCompletion = `function __deja_needs_command
     test (count (commandline -opc)) -eq 1
 end
 
-complete -c deja -n '__deja_needs_command' -a 'blame bench brief check completion ctx doctor embed files fix forget friction handoff help how index install last log mcp promote remember restore resume search share show sources stats statusline sync uninstall update version view warmup'
+complete -c deja -n '__deja_needs_command' -a 'blame bench brief check completion ctx doctor embed files fix forget friction handoff help how index install instructions last log mcp promote remember restore resume search share show sources stats statusline sync uninstall update version view warmup'
 complete -c deja -n '__deja_needs_command' -l json -d 'Print JSON'
 complete -c deja -n '__deja_needs_command' -l re -d 'Interpret query as a regular expression'
 complete -c deja -n '__deja_needs_command' -l all -d 'Include all results'
@@ -301,6 +318,10 @@ complete -c deja -n '__deja_needs_command' -l session -r
 complete -c deja -n '__deja_needs_command' -l rebuild
 complete -c deja -n '__deja_needs_command' -l limit -r -d 'Max sessions to return (1-100)'
 complete -c deja -n '__fish_seen_subcommand_from search' -l limit -r -d 'Max sessions to return (1-100)'
+
+complete -c deja -n '__fish_seen_subcommand_from instructions; and test (count (commandline -opc)) -eq 2' -a 'example apply export resolve hook install'
+complete -c deja -n '__fish_seen_subcommand_from instructions' -l store -r -F
+complete -c deja -n '__fish_seen_subcommand_from instructions' -l help
 
 complete -c deja -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish powershell pwsh'
 complete -c deja -n '__fish_seen_subcommand_from blame' -l all
@@ -327,8 +348,8 @@ complete -c deja -n '__fish_seen_subcommand_from handoff' -l to -r -a '%HANDOFF_
 complete -c deja -n '__fish_seen_subcommand_from handoff' -l exec
 complete -c deja -n '__fish_seen_subcommand_from hook-context' -l plain
 complete -c deja -n '__fish_seen_subcommand_from index' -l rebuild
-complete -c deja -n '__fish_seen_subcommand_from install uninstall' -a '%INSTALL_TARGETS% --all --auto'
-complete -c deja -n '__fish_seen_subcommand_from install uninstall' -l no-guidance
+complete -c deja -n '__fish_seen_subcommand_from install uninstall; and not __fish_seen_subcommand_from instructions' -a '%INSTALL_TARGETS% --all --auto'
+complete -c deja -n '__fish_seen_subcommand_from install uninstall; and not __fish_seen_subcommand_from instructions' -l no-guidance
 complete -c deja -n '__fish_seen_subcommand_from show' -l json
 complete -c deja -n '__fish_seen_subcommand_from show' -l harness -r -a '%HARNESSES%'
 complete -c deja -n '__fish_seen_subcommand_from show' -l offset -r
@@ -352,8 +373,8 @@ complete -c deja -n '__fish_seen_subcommand_from stats' -l project -r
 complete -c deja -n '__fish_seen_subcommand_from stats' -l since -r
 complete -c deja -n '__fish_seen_subcommand_from stats' -l role -r -a '%ROLES%'
 complete -c deja -n '__fish_seen_subcommand_from sync; and not __fish_seen_subcommand_from export import ssh' -a 'export import ssh'
-complete -c deja -n '__fish_seen_subcommand_from export' -l full
-complete -c deja -n '__fish_seen_subcommand_from export' -F
+complete -c deja -n '__fish_seen_subcommand_from export; and not __fish_seen_subcommand_from instructions' -l full
+complete -c deja -n '__fish_seen_subcommand_from export; and not __fish_seen_subcommand_from instructions' -F
 complete -c deja -n '__fish_seen_subcommand_from import' -F
 complete -c deja -n '__fish_seen_subcommand_from ssh' -l pull
 complete -c deja -n '__fish_seen_subcommand_from ssh' -l full
@@ -366,7 +387,7 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
     $commands = @(
         'blame', 'bench', 'brief', 'check', 'completion', 'ctx', 'doctor', 'embed',
         'files', 'fix', 'forget', 'friction', 'handoff', 'help', 'how',
-        'index', 'install', 'last', 'log', 'mcp', 'promote', 'remember',
+        'index', 'install', 'instructions', 'last', 'log', 'mcp', 'promote', 'remember',
         'restore', 'resume', 'search', 'share', 'show', 'sources', 'stats',
         'statusline', 'sync', 'uninstall', 'update', 'version', 'view', 'warmup'
     )
@@ -414,6 +435,10 @@ Register-ArgumentCompleter -Native -CommandName deja -ScriptBlock {
                 else { @('--to', '--exec') }
             }
             'hook-context' { @('--plain') }
+            'instructions' {
+                if ($argumentPosition -eq 1) { @('example', 'apply', 'export', 'resolve', 'hook', 'install') }
+                else { @('--store', '--help') }
+            }
             'index' { @('--rebuild', '-rebuild') }
             { $_ -in @('install', 'uninstall') } { $installTargets + @('--no-guidance') }
             'last' {
