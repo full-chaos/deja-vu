@@ -169,9 +169,12 @@ func runHookToolMode(dir string, stdin io.Reader, stdout io.Writer, shape hookTo
 	if alreadyInjected(dir, input.SessionID)[token] {
 		return nil
 	}
-	rememberInjectedIDs(dir, input.SessionID, token)
 	line = truncateToolLine(line, toolHookMaxBytes)
 	out := frameRecall(line)
+	if !allowHookContext(stdout, out) {
+		return nil
+	}
+	rememberInjectedIDs(dir, input.SessionID, token)
 	// Record the injection so deja's most frequent surface is not invisible to
 	// stats and the receipt. Deduped above, so this counts a distinct fact
 	// served, not every action.

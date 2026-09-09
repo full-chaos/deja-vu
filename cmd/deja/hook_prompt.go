@@ -177,7 +177,7 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 	// with the host's reminder appended is still the question, and the
 	// reminder's own words are not what to search for (#3156).
 	asked := digest.StripHarnessBlocks(string(input.Prompt))
-	nudge := failureNudge(dir, asked)
+	nudge := failureNudgeForOutput(dir, asked, stdout)
 	// Nobody asked. A harness delivers its own plumbing as the next user turn —
 	// a finished background task, a system reminder, a slash command's envelope
 	// — and the hook fires on it like a question. The terms are then the
@@ -501,6 +501,9 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 		return emitNudgeOnly(stdout, plain, nudge)
 	}
 	out := frameRecall(body)
+	if !allowHookContext(stdout, out) {
+		return nil
+	}
 	rememberInjectedIDs(dir, input.SessionID, blockFingerprint(body))
 	// Stamped, because the question is answered again once the window passes,
 	// where a block fingerprint holds for the life of the session.

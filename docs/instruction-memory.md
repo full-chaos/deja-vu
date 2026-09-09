@@ -1,7 +1,7 @@
 # Instruction memory: experimental first pass
 
 This adds `deja instructions`, a separate, opt-in subsystem inside the existing
-binary. History recall remains unchanged. The new command is intentionally
+binary. History ranking remains unchanged. The new command is intentionally
 absent from the general help until full repository and live-harness validation
 is complete; `deja instructions help` describes the experimental interface.
 
@@ -15,15 +15,27 @@ claim to detect contradictions in arbitrary prose.
 
 The same registry can deliver context to Claude Code and Codex at SessionStart,
 UserPromptSubmit, PreToolUse, and SubagentStart. SessionStart also handles
-resume/compact events the harness emits. The installer preserves existing Deja
-history hooks and unrelated configuration. Installation is separate from
-`deja install`, and never bypasses native hook review/trust.
+resume/compact events the harness emits. The opt-in installer attaches approved
+context to `hook-context`, `hook-prompt`, and `hook-tool`, so each event uses one
+Deja process and one combined response. It migrates the previous separate
+instruction hooks and preserves unrelated configuration. `SubagentStart` keeps
+an instruction-only hook because it has no existing history hook. Installation
+is separate from `deja install`, and never bypasses native hook review/trust.
+Reinstalling the normal hooks preserves the explicit instruction opt-in. The
+combined pre-tool hook receives every tool event so tool/path scopes also apply
+to reads; normal history recall still uses its existing relevance gates.
 
-**This is instruction delivery, not enforcement.** Hooks emit no permission
-allow/deny decisions. A delivered runbook is not evidence that it was executed;
+**This is instruction delivery, not enforcement.** Instruction delivery adds no
+permission allow/deny decisions; existing history-hook tool updates are preserved. A delivered runbook is not evidence that it was executed;
 pre-tool injection does not prove the agent reconsidered its pending call.
 Failures produce an INCOMPLETE warning, plus model-visible context for supported
 events, rather than silently pretending that no instructions applied.
+
+Compared with Deja's existing promoted notes, the registry adds path, tool,
+worktree, task, and environment scopes; `must` rules that accumulate rather
+than rank; and effective windows, expiry, and checked supersession. The cost is
+a separate store, CLI, and explicit provenance/approval model. It remains
+advisory delivery, not enforcement.
 
 ## Try it in a scratch configuration first
 
@@ -140,10 +152,13 @@ refuses unresolved conflicts. Nothing extracts/promotes history automatically.
 
 Duplicate JSON keys, unknown record fields, malformed JSON, unsupported schemas,
 relative paths and unbounded inputs are refused. A concurrent approval requires
-a matching registry revision. Process-wide locks refuse competing writers;
-a crashed writer can leave a lock that requires inspection before removal.
-No stale lock is automatically broken. Hook config backups retain exact prior
-bytes, including large numeric values and unrelated hook definitions.
+a matching registry revision. `apply` replaces the entire approved snapshot; it
+does not merge concurrent drafts. If another approval wins the compare-and-swap,
+the loser must reload the current snapshot, reconcile its draft, and reapply it
+deliberately. Process-wide locks refuse competing writers; a crashed writer can
+leave a lock that requires inspection before removal. No stale lock is
+automatically broken. Hook config backups retain exact prior bytes, including
+large numeric values and unrelated hook definitions.
 
 ## Budget, storage and trust boundaries
 
@@ -155,7 +170,11 @@ that cost before scaling this backend. No per-tool history writes occur.
 
 The context budget is 8,000 UTF-8 bytes, not tokens or complete JSON wire bytes.
 All applicable/conditional mandatory text must fit in full or rendering fails.
-Only optional defaults may be omitted, with a count. Repeated injection can add
+Only optional defaults may be omitted, with a count. With shared hooks, approved
+instructions receive that budget first; recalled history is included only when
+the complete block also fits. If it does not fit, a UI note explains its omission.
+Instruction delivery remains enabled when `DEJA_RECALL=off`; that switch controls
+history recall, not the separately approved instruction opt-in. Repeated injection can add
 material context cost; delivery receipts/deduplication with compaction-aware
 invalidation are not implemented yet.
 

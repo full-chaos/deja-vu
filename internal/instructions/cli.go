@@ -20,7 +20,7 @@ const Help = `deja instructions (experimental; opt-in advisory delivery)
   resolve [--repo ROOT] [--worktree ROOT] [--task ID] [--session ID]
           [--environment NAME] [--tool NAME] [--path RELATIVE] [--json]
   hook --agent claude|codex        read a lifecycle event on stdin
-  install --agent claude|codex     preserve existing hooks and add instruction hooks
+  install --agent claude|codex     attach approved instruction context to deja hooks
 
 All commands accept --store ABSOLUTE_FILE. Default: DEJA_INSTRUCTIONS_FILE,
 then XDG_CONFIG_HOME/deja/instructions.json, then ~/.config/deja/instructions.json.

@@ -15,8 +15,90 @@ const hookMarker = "Loading approved Deja instructions"
 
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 
-// Install is explicitly invoked, never part of general deja install. It neither
-// alters history hooks nor bypasses the agent's review/trust requirements.
+// InstructionSuffix is the exact opt-in tail that an ordinary deja lifecycle
+// hook carries. It is deliberately a shell fragment rather than an argv slice:
+// Claude and Codex persist hook commands as strings. Callers must not evaluate
+// it while inspecting a configuration; StripInstructionSuffix parses only this
+// narrow, canonical form.
+func InstructionSuffix(store, agent string) (string, error) {
+	if !absolutePath(store) {
+		return "", fmt.Errorf("store must be a clean absolute path")
+	}
+	if !oneOf(agent, "claude", "codex") {
+		return "", fmt.Errorf("agent must be claude or codex")
+	}
+	return " --instructions-store " + shellQuote(store) + " --instructions-agent " + agent, nil
+}
+
+// WithInstructionSuffix attaches the canonical instruction-store options to a
+// plain deja hook command.
+func WithInstructionSuffix(command, store, agent string) (string, error) {
+	suffix, err := InstructionSuffix(store, agent)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(command) == "" {
+		return "", fmt.Errorf("hook command must not be empty")
+	}
+	return command + suffix, nil
+}
+
+// StripInstructionSuffix recognizes exactly the suffix emitted by
+// WithInstructionSuffix. It does not invoke a shell or accept general shell
+// syntax: the store word is a canonical single-quoted word, including the
+// standard quote-escape sequence for apostrophes.
+func StripInstructionSuffix(command string) (base, store, agent string, ok bool) {
+	const storeFlag = " --instructions-store "
+	// A legal absolute path can itself contain the flag text. Try each textual
+	// occurrence and accept only one whose remaining bytes are our exact
+	// canonical suffix; no shell syntax is evaluated here.
+	for start := 0; start < len(command); {
+		i := strings.Index(command[start:], storeFlag)
+		if i < 0 {
+			break
+		}
+		i += start
+		candidateBase := command[:i]
+		rest := command[i+len(storeFlag):]
+		candidateStore, candidateRest, parsed := parseQuotedStore(rest)
+		if parsed && strings.HasPrefix(candidateRest, " --instructions-agent ") {
+			candidateAgent := strings.TrimPrefix(candidateRest, " --instructions-agent ")
+			suffix, err := InstructionSuffix(candidateStore, candidateAgent)
+			if err == nil && command == candidateBase+suffix {
+				return candidateBase, candidateStore, candidateAgent, true
+			}
+		}
+		start = i + len(storeFlag)
+	}
+	return "", "", "", false
+}
+
+// parseQuotedStore accepts the output of shellQuote only. Shell's concatenated
+// single/double/single quote escape for an apostrophe is the one exception to a
+// simple single-quoted word. The unconsumed suffix begins with a space.
+func parseQuotedStore(s string) (value, rest string, ok bool) {
+	if !strings.HasPrefix(s, "'") {
+		return "", "", false
+	}
+	s = s[1:]
+	for {
+		i := strings.IndexByte(s, '\'')
+		if i < 0 {
+			return "", "", false
+		}
+		value += s[:i]
+		s = s[i+1:]
+		if strings.HasPrefix(s, "\"'\"'") {
+			value += "'"
+			s = s[4:]
+			continue
+		}
+		return value, s, true
+	}
+}
+
+// Install is explicitly invoked, never part of general deja install. It augments
+// the existing lifecycle hooks and does not bypass review/trust requirements.
 func Install(agent, config, binary, store string) (result string, err error) {
 	if !oneOf(agent, "claude", "codex") {
 		return "", fmt.Errorf("agent must be claude or codex")
@@ -91,8 +173,7 @@ func Install(agent, config, binary, store string) (result string, err error) {
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return "", readErr
 	}
-	command := shellQuote(binary) + " instructions hook --agent " + shellQuote(agent) + " --store " + shellQuote(store)
-	if err = mergeHooks(data, command, agent); err != nil {
+	if err = mergeHooks(data, binary, store, agent); err != nil {
 		return "", err
 	}
 	updated, err := json.MarshalIndent(data, "", "  ")
@@ -122,7 +203,7 @@ func Install(agent, config, binary, store string) (result string, err error) {
 	}
 	return config, nil
 }
-func mergeHooks(config map[string]any, command, agent string) error {
+func mergeHooks(config map[string]any, binary, store, agent string) error {
 	hooks := map[string]any{}
 	if existing, ok := config["hooks"]; ok {
 		var valid bool
@@ -130,6 +211,11 @@ func mergeHooks(config map[string]any, command, agent string) error {
 		if !valid || hooks == nil {
 			return fmt.Errorf("hooks must be a JSON object")
 		}
+	}
+	shared := map[string]string{
+		"SessionStart":     "hook-context",
+		"UserPromptSubmit": "hook-prompt",
+		"PreToolUse":       "hook-tool",
 	}
 	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "SubagentStart"} {
 		groups := []any{}
@@ -141,6 +227,15 @@ func mergeHooks(config map[string]any, command, agent string) error {
 			}
 		}
 		clean := []any{}
+		var adopted bool
+		var appendIntegrated bool
+		var standalone bool
+		if sub, sharedEvent := shared[event]; sharedEvent {
+			standalone = false
+			_ = sub
+		} else {
+			standalone = true
+		}
 		for _, value := range groups {
 			group, ok := value.(map[string]any)
 			if !ok {
@@ -158,9 +253,45 @@ func mergeHooks(config map[string]any, command, agent string) error {
 					return fmt.Errorf("invalid %s handler", event)
 				}
 				cmd, _ := handler["command"].(string)
-				if handler["statusMessage"] == hookMarker && strings.Contains(cmd, " instructions hook --agent ") {
+				if handler["statusMessage"] == hookMarker && markedStandaloneInstructionHook(cmd, binary) {
 					removed = true
 					continue
+				}
+				if sub, sharedEvent := shared[event]; sharedEvent && handler["type"] == "command" {
+					kind, _ := sharedHookKindOf(cmd, binary, sub)
+					if kind == sharedHookWrapper {
+						return fmt.Errorf("cannot safely integrate instructions into wrapped %s hook", event)
+					}
+					if kind == sharedHookOwned {
+						if adopted {
+							removed = true
+							continue
+						}
+						adopted = true
+						if event == "PreToolUse" && groupHasForeignHandlers(handlers) {
+							// A matcher governs the whole group. Leave the reader's
+							// group intact and put the combined command in an unfiltered
+							// group below.
+							removed = true
+							appendIntegrated = true
+							continue
+						}
+						// The explicit binary is part of this installer contract. An
+						// older deja/deja-hook command may not understand the opt-in
+						// flags, so adopt its ownership but point at the validated
+						// executable supplied for this install.
+						command, e := WithInstructionSuffix(sharedBase(binary, sub), store, agent)
+						if e != nil {
+							return e
+						}
+						handler["command"] = command
+						if agent == "codex" {
+							handler["additionalContextLimit"] = 0
+						}
+						if event == "PreToolUse" {
+							delete(group, "matcher")
+						}
+					}
 				}
 				kept = append(kept, h)
 			}
@@ -170,15 +301,142 @@ func mergeHooks(config map[string]any, command, agent string) error {
 			group["hooks"] = kept
 			clean = append(clean, group)
 		}
-		handler := map[string]any{"type": "command", "command": command, "timeout": 5, "statusMessage": hookMarker}
-		// Codex otherwise summarizes large additionalContext. We already enforce an
-		// explicit byte budget; approved mandatory text must not be summarized away.
-		if agent == "codex" {
-			handler["additionalContextLimit"] = 0
+		if standalone {
+			command := shellQuote(binary) + " instructions hook --agent " + shellQuote(agent) + " --store " + shellQuote(store)
+			handler := instructionHandler(command, agent)
+			clean = append(clean, map[string]any{"hooks": []any{handler}})
+		} else if !adopted || appendIntegrated {
+			sub := shared[event]
+			command, e := WithInstructionSuffix(sharedBase(binary, sub), store, agent)
+			if e != nil {
+				return e
+			}
+			clean = append(clean, map[string]any{"hooks": []any{instructionHandler(command, agent)}})
 		}
-		clean = append(clean, map[string]any{"hooks": []any{handler}})
 		hooks[event] = clean
 	}
 	config["hooks"] = hooks
 	return nil
+}
+
+func instructionHandler(command, agent string) map[string]any {
+	handler := map[string]any{"type": "command", "command": command, "timeout": 5, "statusMessage": hookMarker}
+	// Codex otherwise summarizes large additionalContext. We already enforce an
+	// explicit byte budget; approved mandatory text must not be summarized away.
+	if agent == "codex" {
+		handler["additionalContextLimit"] = 0
+	}
+	return handler
+}
+
+type sharedCommandKind uint8
+
+const (
+	sharedHookOther sharedCommandKind = iota
+	sharedHookOwned
+	sharedHookWrapper
+)
+
+// sharedHookKind recognizes only a bare deja/deja-hook command, or the exact
+// executable supplied to Install. Anything that merely contains one is a
+// wrapper the reader owns; adding another command beside it would fire twice,
+// so the caller rejects that ambiguity instead.
+func sharedHookKindOf(command, binary, sub string) (sharedCommandKind, bool) {
+	base, _, _, integrated := StripInstructionSuffix(command)
+	if integrated {
+		command = base
+	}
+	if token, ok := bareHookToken(command, sub); ok && knownDejaToken(token, binary) {
+		return sharedHookOwned, integrated
+	}
+	if strings.Contains(command, " "+sub) && strings.Contains(command, "deja") {
+		return sharedHookWrapper, false
+	}
+	return sharedHookOther, false
+}
+
+func sharedBase(binary, sub string) string { return shellQuote(binary) + " " + sub }
+
+// markedStandaloneInstructionHook identifies the old installer line only when
+// it is a bare command deja could itself have written. A status message is
+// reader-visible text, not an ownership marker for an arbitrary shell chain.
+func markedStandaloneInstructionHook(command, binary string) bool {
+	exe, rest, ok := parseBareShellToken(command)
+	if !ok || !knownDejaToken(exe, binary) {
+		return false
+	}
+	const agentFlag = " instructions hook --agent "
+	if !strings.HasPrefix(rest, agentFlag) {
+		return false
+	}
+	agent, rest, ok := parseQuotedStore(strings.TrimPrefix(rest, agentFlag))
+	if !ok || !oneOf(agent, "claude", "codex") {
+		return false
+	}
+	const storeFlag = " --store "
+	if !strings.HasPrefix(rest, storeFlag) {
+		return false
+	}
+	store, rest, ok := parseQuotedStore(strings.TrimPrefix(rest, storeFlag))
+	return ok && rest == "" && absolutePath(store)
+}
+
+// bareHookToken extracts the executable from a two-word command without
+// interpreting shell syntax. The quoted case accepts only shellQuote's form;
+// everything with a wrapper, redirect, assignment, or extra argument is left
+// to its owner.
+func bareHookToken(command, sub string) (string, bool) {
+	want := " " + sub
+	if !strings.HasSuffix(command, want) {
+		return "", false
+	}
+	token, rest, ok := parseBareShellToken(strings.TrimSuffix(command, want))
+	return token, ok && rest == ""
+}
+
+// parseBareShellToken accepts exactly one shell word: an unquoted path with no
+// shell metacharacters, or shellQuote's single-quoted form. It returns the
+// unconsumed command text (which starts with a space when present) without ever
+// evaluating it.
+func parseBareShellToken(command string) (token, rest string, ok bool) {
+	if command == "" {
+		return "", "", false
+	}
+	if strings.HasPrefix(command, "'") {
+		return parseQuotedStore(command)
+	}
+	i := strings.IndexAny(command, " \t")
+	if i < 0 {
+		token = command
+	} else {
+		token, rest = command[:i], command[i:]
+	}
+	if token == "" || strings.ContainsAny(token, "'\";|&<>`$\r\n\\*?[]{}()!~#=") {
+		return "", "", false
+	}
+	return token, rest, true
+}
+
+// IsBareHookCommand reports whether command is exactly one executable token
+// followed by sub. It accepts the canonical single-quoted token that
+// shellQuote emits, but does not parse or evaluate arbitrary shell syntax.
+func IsBareHookCommand(command, sub string) bool {
+	_, ok := bareHookToken(command, sub)
+	return ok
+}
+
+func knownDejaToken(token, binary string) bool {
+	if token == binary {
+		return true
+	}
+	base := token
+	if i := strings.LastIndexAny(base, `/\`); i >= 0 {
+		base = base[i+1:]
+	}
+	base = strings.ToLower(base)
+	return base == "deja" || base == "deja-hook"
+}
+
+func groupHasForeignHandlers(handlers []any) bool {
+	return len(handlers) != 1
 }

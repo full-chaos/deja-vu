@@ -17,6 +17,7 @@ import (
 
 	"github.com/vshulcz/deja-vu/internal/digest"
 	"github.com/vshulcz/deja-vu/internal/index"
+	"github.com/vshulcz/deja-vu/internal/instructions"
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/policy"
 	"github.com/vshulcz/deja-vu/internal/sources"
@@ -1658,10 +1659,20 @@ func hookCommandKindOf(existing any, cmd string) hookCommandKind {
 	if !ok || s == "" {
 		return hookNotDejas
 	}
+	sub := cmd[strings.LastIndex(cmd, " ")+1:]
+	// An opt-in instruction-store tail belongs to the ordinary deja hook. It
+	// must be stripped before ownership is checked, then preserved if this
+	// install repoints the executable. Malformed shell-looking tails are not
+	// accepted: a reader's command is safer left alone than guessed at.
+	if base, _, _, hasInstructions := instructions.StripInstructionSuffix(s); hasInstructions {
+		s = base
+		if instructions.IsBareHookCommand(s, sub) {
+			return hookDejas
+		}
+	}
 	if s == cmd {
 		return hookDejas
 	}
-	sub := cmd[strings.LastIndex(cmd, " ")+1:]
 	for i := 0; i < len(s); {
 		j := strings.Index(s[i:], " "+sub)
 		if j < 0 {
@@ -1678,6 +1689,21 @@ func hookCommandKindOf(existing any, cmd string) hookCommandKind {
 		i = end
 	}
 	return hookNotDejas
+}
+
+// preserveInstructionSuffix carries a validated opt-in instruction registry
+// through a normal deja reinstall. It intentionally returns the ordinary
+// command when the old command has no canonical suffix.
+func preserveInstructionSuffix(existing, command string) string {
+	_, store, agent, ok := instructions.StripInstructionSuffix(existing)
+	if !ok {
+		return command
+	}
+	combined, err := instructions.WithInstructionSuffix(command, store, agent)
+	if err != nil {
+		return command
+	}
+	return combined
 }
 
 // isDejaHookCommand reports whether deja's hook runs in this command at all,
@@ -1837,7 +1863,15 @@ func updateClaudeHook(root map[string]any, event, cmd, matcher string, uninstall
 				// rather than adding a second one: installing from a new path
 				// used to leave the old entry behind, and both would fire.
 				found = true
-				h["command"] = cmd
+				existing, _ := h["command"].(string)
+				integrated := false
+				if _, _, _, integrated = instructions.StripInstructionSuffix(existing); integrated && event == "PreToolUse" {
+					// The instruction installer has already split any foreign
+					// matcher group. Its combined handler must see every tool so
+					// path-scoped constraints can decide for themselves.
+					matcher = ""
+				}
+				h["command"] = preserveInstructionSuffix(existing, cmd)
 				if msg := hookStatusMessage(event); msg != "" {
 					h["statusMessage"] = msg
 				}

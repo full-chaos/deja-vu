@@ -34,7 +34,10 @@ func encoded(t *testing.T, v any) []byte {
 }
 func isolated(t *testing.T) string {
 	t.Helper()
-	d := t.TempDir()
+	d, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, k := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"} {
 		t.Setenv(k, d)
 	}

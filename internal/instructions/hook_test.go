@@ -147,7 +147,10 @@ func TestNewFileSymlinkTarget(t *testing.T) {
 		t.Skip("requires symlink privilege")
 	}
 	d := isolated(t)
-	outside := t.TempDir()
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if e := os.Symlink(outside, filepath.Join(d, "link")); e != nil {
 		t.Fatal(e)
 	}

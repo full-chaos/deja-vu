@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vshulcz/deja-vu/internal/instructions"
 	"github.com/vshulcz/deja-vu/internal/sources"
 )
 
@@ -103,16 +104,26 @@ func updateCodexHook(root map[string]any, event, cmd, matcher string, uninstall 
 				continue
 			}
 			found = true
+			integrated := event == "PreToolUse" && entryHasIntegratedHook(entry, cmd)
 			adoptCodexHookEntry(entry, cmd, event)
 			// The matcher is part of the wiring, not a user setting, so an
 			// upgrade has to rewrite it: the SessionStart entry written when
 			// this meant "startup|resume" went on missing every compaction
 			// through any number of installs, because adopting it left the
 			// pattern alone.
-			if matcher == "" {
-				delete(entry, "matcher")
-			} else {
-				entry["matcher"] = matcher
+			entryMatcher := matcher
+			if integrated {
+				entryMatcher = ""
+			}
+			// A matcher belongs to the group, so never change one that also
+			// governs a reader's handler. The instruction installer splits
+			// those groups before it asks normal install to adopt them.
+			if entryHasOnlyOwnedHook(entry, cmd) {
+				if entryMatcher == "" {
+					delete(entry, "matcher")
+				} else {
+					entry["matcher"] = entryMatcher
+				}
 			}
 		}
 		kept = append(kept, entryAny)
@@ -163,11 +174,35 @@ func adoptCodexHookEntry(entry map[string]any, cmd, event string) {
 		if h == nil || h["type"] != "command" || hookCommandKindOf(h["command"], cmd) != hookDejas {
 			continue
 		}
-		h["command"] = cmd
+		existing, _ := h["command"].(string)
+		h["command"] = preserveInstructionSuffix(existing, cmd)
 		if msg := hookStatusMessage(event); msg != "" {
 			h["statusMessage"] = msg
 		}
 	}
+}
+
+func entryHasIntegratedHook(entry map[string]any, cmd string) bool {
+	for _, hAny := range entry["hooks"].([]any) {
+		h, _ := hAny.(map[string]any)
+		command, _ := h["command"].(string)
+		if hookCommandKindOf(command, cmd) != hookDejas {
+			continue
+		}
+		if _, _, _, ok := instructions.StripInstructionSuffix(command); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func entryHasOnlyOwnedHook(entry map[string]any, cmd string) bool {
+	hs, _ := entry["hooks"].([]any)
+	if len(hs) != 1 {
+		return false
+	}
+	h, _ := hs[0].(map[string]any)
+	return h != nil && hookCommandKindOf(h["command"], cmd) == hookDejas
 }
 
 // entryHasCommand matches on the trailing subcommand rather than the whole

@@ -329,6 +329,10 @@ func runHookContext(dir string, plain bool) error {
 // harness that has no session-start channel and has to carry the digest on its
 // per-prompt hook.
 func runHookContextMode(dir string, plain, once bool) error {
+	return runHookContextIO(dir, plain, once, os.Stdin, os.Stdout)
+}
+
+func runHookContextIO(dir string, plain, once bool, stdin io.Reader, stdout io.Writer) error {
 	// A session start is the one moment deja is guaranteed to run on every
 	// harness, which makes it the only reliable place to repair wiring left
 	// behind by an older binary. It costs one small file read when nothing
@@ -366,7 +370,7 @@ func runHookContextMode(dir string, plain, once bool) error {
 	// cannot decode carries the session this injection went to, and losing it
 	// without a word left the audit log unable to tell that case from a host
 	// that sent nothing at all (#2161).
-	payload := readHookStdin()
+	payload := readHookPayload(stdin, hookStdinWait)
 	unreadable := len(bytes.TrimSpace(payload)) > 0 && json.Unmarshal(payload, &input) != nil
 	input.SessionID = adoptGrok(adoptGrok(input.SessionID, input.grokEnvelope.SessionID), input.ConversationID)
 	if once {
@@ -376,7 +380,15 @@ func runHookContextMode(dir string, plain, once bool) error {
 		if sessionHadDigest(dir, input.SessionID) {
 			return nil
 		}
-		rememberSessionDigest(dir, input.SessionID)
+		if shared, ok := stdout.(*sharedRecallOutput); ok {
+			defer func() {
+				if !shared.omitted {
+					rememberSessionDigest(dir, input.SessionID)
+				}
+			}()
+		} else {
+			rememberSessionDigest(dir, input.SessionID)
+		}
 	}
 	input.WorkspaceRoots = adoptGrokRoots(input.WorkspaceRoots, input.WorkspaceRoot)
 	// The harness tells us which project this is; deja read only the
@@ -393,6 +405,9 @@ func runHookContextMode(dir string, plain, once bool) error {
 		// stood here is what taught it to.
 		if env, from := environmentBlockFrom(dir, policy.ActivationAuto); env != "" {
 			out := frameRecall(env)
+			if !allowHookContext(stdout, out) {
+				return nil
+			}
 			// The block is about the machine and names no project, so without
 			// the projects behind its walls a forget of one of them could not
 			// reach the stored text (#2349).
@@ -402,7 +417,7 @@ func runHookContextMode(dir string, plain, once bool) error {
 				usage.RecordDigestPolicyFrom(dir, usage.KindHook, out, input.SessionID, 0, 0, from, policy.Load().Describe(policy.ActivationAuto))
 			}
 			if plain {
-				fmt.Fprintln(os.Stdout, out)
+				fmt.Fprintln(stdout, out)
 				return nil
 			}
 			var resp sessionStartHookResponse
@@ -417,7 +432,7 @@ func runHookContextMode(dir string, plain, once bool) error {
 			// like (#3065).
 			resp.SystemMessage = joinNotes(resp.SystemMessage, joinNotes(builtNote(dir), weekNote(dir)))
 			if b, err := json.Marshal(resp); err == nil {
-				fmt.Fprintln(os.Stdout, string(b))
+				fmt.Fprintln(stdout, string(b))
 			}
 			return nil
 		}
@@ -451,7 +466,7 @@ func runHookContextMode(dir string, plain, once bool) error {
 				resp.HookSpecificOutput.HookEventName = "SessionStart"
 				resp.SystemMessage = line
 				if b, err := json.Marshal(resp); err == nil {
-					fmt.Fprintln(os.Stdout, string(b))
+					fmt.Fprintln(stdout, string(b))
 				}
 			}
 		}
@@ -475,6 +490,9 @@ func runHookContextMode(dir string, plain, once bool) error {
 		digest += "\n" + tip
 	}
 	digest = frameRecall(digest)
+	if !allowHookContext(stdout, digest) {
+		return nil
+	}
 	polName := policy.Load().Describe(policy.ActivationAuto)
 	if unreadable {
 		usage.RecordDigestPolicySessionsUnread(dir, usage.KindHook, digest, input.SessionID, sessions, raw, polName, servedIDs, servedProjects)
@@ -490,7 +508,7 @@ func runHookContextMode(dir string, plain, once bool) error {
 	// prompt about what the start just mentioned got nothing back.
 	rememberInjectedIDsFor(dir, sessionStartKeyPrefix+input.SessionID, hookProjectKey(hookProjectPath(input.CWD, input.WorkspaceRoots)), servedIDs)
 	if plain {
-		fmt.Fprintln(os.Stdout, digest)
+		fmt.Fprintln(stdout, digest)
 		return nil
 	}
 	var resp sessionStartHookResponse
@@ -589,7 +607,7 @@ func runHookContextMode(dir string, plain, once bool) error {
 	if err != nil {
 		return nil
 	}
-	fmt.Fprintln(os.Stdout, string(b))
+	fmt.Fprintln(stdout, string(b))
 	return nil
 }
 

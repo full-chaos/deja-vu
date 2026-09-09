@@ -221,6 +221,9 @@ var commands = map[string]command{
 		if sayIfTypedByHand("hook-prompt") {
 			return nil
 		}
+		if handled, err := runSharedInstructionHook(dir, "UserPromptSubmit", rest, os.Stdin, os.Stdout); handled {
+			return err
+		}
 		plain := len(rest) > 0 && (rest[0] == "--plain" || rest[0] == "-plain")
 		return runHookPromptMode(dir, os.Stdin, os.Stdout, plain)
 	},
@@ -236,6 +239,9 @@ var commands = map[string]command{
 	"hook-tool": func(dir string, rest []string) error {
 		if sayIfTypedByHand("hook-tool") {
 			return nil
+		}
+		if handled, err := runSharedInstructionHook(dir, "PreToolUse", rest, os.Stdin, os.Stdout); handled {
+			return err
 		}
 		return runHookToolMode(dir, os.Stdin, os.Stdout, hookToolShapeOf(rest))
 	},
@@ -549,6 +555,9 @@ func cmdIndex(dir string, rest []string) error {
 }
 
 func cmdHookContext(dir string, rest []string) error {
+	if handled, err := runSharedInstructionHook(dir, "SessionStart", rest, os.Stdin, os.Stdout); handled {
+		return err
+	}
 	plain := false
 	once := false
 	for _, a := range rest {
@@ -3677,6 +3686,8 @@ Usage:
   deja hook-plan     (PreToolUse ExitPlanMode hook: factual plan/history co-occurrences)
   deja hook-tool [--plain] [--crush]  (PreToolUse Bash/Edit hook: one line on what this command or file already has)
   deja hook-tool-after  (PostToolUse Bash hook: the command that followed this error before)
+  Experimental instruction delivery for hook-context/hook-prompt/hook-tool:
+    --instructions-store <absolute-path> --instructions-agent claude|codex
   deja check -       (read a plan from stdin and print factual co-occurrences)
   deja view [--no-open]  (browse your memory: sessions, recalls, notes — one local HTML)
   deja ctx <query|id-prefix>

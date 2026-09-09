@@ -30,6 +30,8 @@ import (
 
 const nudgeGap = 20 * time.Minute
 
+const failureNudgeText = "The user just said an approach did not hold. Dead ends are the one thing this store never records — if that is what happened, save it now with `deja remember \"<what was tried, why it failed>\"`, in one line, before moving on."
+
 // failureNudge returns the line to add when the user has just reported backing
 // something out, or "" for the silence that is the default.
 func failureNudge(dir, prompt string) string {
@@ -39,7 +41,7 @@ func failureNudge(dir, prompt string) string {
 	if !nudgeDue(dir) {
 		return ""
 	}
-	return "The user just said an approach did not hold. Dead ends are the one thing this store never records — if that is what happened, save it now with `deja remember \"<what was tried, why it failed>\"`, in one line, before moving on."
+	return failureNudgeText
 }
 
 // reportsFailure reads the user's own words, line by line, using the same rule
@@ -57,14 +59,25 @@ func reportsFailure(prompt string) bool {
 // prompt hook is paid on every message, and advice repeated on every message
 // is noise within a minute.
 func nudgeDue(dir string) bool {
+	if !nudgeAvailable(dir) {
+		return false
+	}
+	markNudge(dir)
+	return true
+}
+
+func nudgeAvailable(dir string) bool {
 	p := dir + ".nudge"
 	if b, err := os.ReadFile(p); err == nil {
 		if ts, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && time.Since(time.Unix(ts, 0)) < nudgeGap {
 			return false
 		}
 	}
-	_ = os.WriteFile(p, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
 	return true
+}
+
+func markNudge(dir string) {
+	_ = os.WriteFile(dir+".nudge", []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
 }
 
 // emitNudgeOnly writes the nudge when there is no recall to carry it. It
@@ -74,6 +87,9 @@ func emitNudgeOnly(stdout io.Writer, plain bool, nudge string) error {
 		return nil
 	}
 	out := frameRecall(nudge)
+	if !allowHookContext(stdout, out) {
+		return nil
+	}
 	if plain {
 		fmt.Fprintln(stdout, out)
 		return nil

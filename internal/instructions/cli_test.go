@@ -81,7 +81,7 @@ func TestInstall(t *testing.T) {
 		if e != nil {
 			t.Fatal(e)
 		}
-		for _, needle := range []string{"deja hook-tool", "keep", "9007199254740993"} {
+		for _, needle := range []string{"hook-tool", "keep", "9007199254740993"} {
 			if !bytes.Contains(first, []byte(needle)) {
 				t.Fatalf("clobbered %s", needle)
 			}
