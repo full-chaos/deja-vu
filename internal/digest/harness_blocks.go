@@ -137,7 +137,7 @@ func stripHookStatusLines(text string) string {
 	lines := strings.Split(text, "\n")
 	kept := lines[:0]
 	for _, l := range lines {
-		if isHookEcho(strings.TrimSpace(l)) {
+		if hookStatusLineRE.MatchString(strings.TrimSpace(l)) {
 			continue
 		}
 		kept = append(kept, l)

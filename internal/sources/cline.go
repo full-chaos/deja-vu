@@ -497,7 +497,7 @@ var environmentDetailsRe = regexp.MustCompile(`(?ms)^[ \t]*<environment_details>
 // user-input equivalent) so the tags themselves are not indexed, and the
 // host's <environment_details> block, which is not the person's words.
 func unwrapClineTask(text string) string {
-	t := strings.TrimSpace(environmentDetailsRe.ReplaceAllString(text, ""))
+	t := stripClineHostBlocks(text)
 	for _, tag := range []string{"task", "user_message", "user_input"} {
 		open := "<" + tag
 		if !strings.HasPrefix(t, open) {
@@ -552,4 +552,36 @@ func ClinePluginsDir() string {
 		return filepath.Join(p, "plugins")
 	}
 	return filepath.Join(Home(), ".cline", "plugins")
+}
+
+var clineHostBlocks = []string{"environment_details", "workspace_diagnostics", "slash_command"}
+
+func stripClineHostBlocks(text string) string {
+	t := text
+	for _, tag := range clineHostBlocks {
+		// Line-anchored: the host writes the block on its own line, and a
+		// person naming the tag inside a sentence — "why is
+		// <environment_details> in my history" — is asking about it, not
+		// pasting one (#3255).
+		open := regexp.MustCompile(`(?m)^[ \t]*<` + tag + `>[ \t]*\r?$`)
+		closeTag := "</" + tag + ">"
+		for {
+			loc := open.FindStringIndex(t)
+			if loc == nil {
+				break
+			}
+			rest := t[loc[1]:]
+			k := strings.Index(rest, closeTag)
+			if k < 0 {
+				// An unterminated block runs to the end of the message: the
+				// listing was cut mid-write, and what follows is not the
+				// person's either.
+				t = t[:loc[0]]
+				break
+			}
+			end := loc[1] + k + len(closeTag)
+			t = t[:loc[0]] + strings.TrimPrefix(t[end:], "\n")
+		}
+	}
+	return strings.TrimSpace(t)
 }

@@ -27,20 +27,15 @@ type installResult struct {
 	// about, could not act on, and left as it found it. Empty in every ordinary
 	// case, so a printer can append it blind (#2218).
 	Note string
-	// Also is every other config this target wrote, for the callers that need
-	// the paths rather than the sentence about them. An -auto target writes two
-	// files and folds them into one result, so the screen that names what was
-	// left behind saw one of them and reported "kept 1 snapshot" beside two
-	// .bak files (#3171).
-	Also []string
+	// also holds the other files an -auto target changed in the same run;
+	// the printer folds them into Note, the kept-snapshot line needs the paths.
+	also []string
 }
 
-// paths is every config this result covers, the named one first.
-func (r installResult) paths() []string {
-	if r.Path == "" {
-		return r.Also
-	}
-	return append([]string{r.Path}, r.Also...)
+// touched is every file this result changed: the one it is named for and the
+// ones that rode along in the note (#3171).
+func (r installResult) touched() []string {
+	return append([]string{r.Path}, r.also...)
 }
 
 func runInstall(dir string, args []string, uninstall bool) error {
@@ -218,7 +213,7 @@ func runInstall(dir string, args []string, uninstall bool) error {
 				pruneGuidanceDirs(cr.Path)
 			}
 		}
-		touchedPaths = append(touchedPaths, r.paths()...)
+		touchedPaths = append(touchedPaths, r.touched()...)
 		if banner {
 			done = append(done, lineItem{t, r.Action, shortHome(r.Path), r.Note})
 		} else {
@@ -610,66 +605,6 @@ func refusalRemedy(errs []error) string {
 	return "fix what each one reports and run it again"
 }
 
-// existingTargetChecks is what says a harness is on this machine: one path the
-// harness itself creates, per install target. Named rather than inline so the
-// test that holds it to the target list can ask for a path instead of
-// repeating the platform switches (#3192).
-func existingTargetChecks() map[string]string {
-	return map[string]string{
-		"claude-code": sources.ClaudeConfigDir(),
-		"codex":       sources.CodexHome(),
-		"opencode":    filepath.Join(opencodeConfigHome(), "opencode"),
-		"cursor":      sources.CursorCLIHome(),
-		"gemini":      filepath.Join(sources.GeminiHome(), "settings.json"),
-		"antigravity": antigravityConfigHome(),
-		"copilot":     filepath.Join(homeDir(), ".copilot"),
-		"grok":        sources.GrokRoot(),
-		"qwen":        sources.QwenConfigDir(),
-		"kimi":        sources.KimiConfigDir(),
-		"cline":       sources.ClineConfigDir(),
-		"hermes":      sources.HermesHome(),
-		"pi":          sources.PiConfigDir(),
-		"omp":         sources.OmpConfigDir(),
-		"deepseek":    sources.DSHHome(),
-		"openclaw":    sources.OpenClawStateDir(),
-		// aider keeps no config directory: its history file is what says it
-		// has been used here. The binary alone would match every machine that
-		// merely has it on PATH.
-		"aider": filepath.Join(homeDir(), ".aider.chat.history.md"),
-		// The session store, not the config directory: deja creates the
-		// latter itself, which would make every machine look like a Goose
-		// machine after one install.
-		"goose": sources.GooseRoot(),
-		"roo":   rooFirstRoot(),
-		// These six have install targets and were in the matrix with nothing
-		// looking for them, so `--auto` wired the other nineteen and said
-		// nothing about Amp, prime-agent, Crush, Continue, Zed or VS Code on a
-		// machine that had them (#3192). Each is keyed on something the harness
-		// writes for itself, for the reason goose's entry gives.
-		//
-		// Amp's thread store rather than its settings file: deja writes into
-		// the settings file.
-		"amp": sources.AmpRoot(),
-		// prime-agent's sessions directory, and it honours the harness's own
-		// relocation variables, so a moved store is still found.
-		"prime": sources.PrimeRoot(),
-		// Crush's project registry, in its data home. Its config directory is
-		// where deja writes crush.json, so keying on that would make every
-		// machine a Crush machine after one install.
-		"crush": filepath.Join(sources.CrushDataHome(), "projects.json"),
-		// Continue's session directory. The folder above it holds the config
-		// deja writes, and Continue creates the sessions directory on its
-		// first conversation — so a Continue that has been installed and never
-		// used is not detected, which is the same bar the aider entry sets.
-		"continue": filepath.Join(sources.ContinueRoot(), "sessions"),
-		// Zed's data directory, not the config file deja edits.
-		"zed": sources.ZedRoot(),
-		// VS Code's own User folder, which the editor creates on first run;
-		// deja only ever writes inside it.
-		"vscode": vsCodeFirstRoot(),
-	}
-}
-
 func existingTargets() []string {
 	checks := existingTargetChecks()
 	var out []string
@@ -712,17 +647,24 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	case "gemini":
 		return installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall)
 	case "gemini-auto":
-		// MCP first, then the hooks extension. `--auto` maps gemini to this
-		// target alone, so installing only the extension left the harness
-		// without the tools: its own `gemini mcp list` said "No MCP servers
+		// The hooks extension, then MCP. `--auto` maps gemini to this target
+		// alone, so installing only the extension left the harness without
+		// the tools: its own `gemini mcp list` said "No MCP servers
 		// configured" on a machine that had just run `deja install --auto`.
-		// grok-auto pairs them the same way.
-		// Same file, same reason as qwen-auto: whichever half may refuse goes
-		// first (#2745).
-		if _, err := installGeminiAuto(exe, uninstall); err != nil {
+		// grok-auto pairs them the same way. The extension goes first for the
+		// reason qwen-auto has: whichever half may refuse goes first (#2745).
+		ext, err := installGeminiAuto(exe, uninstall)
+		if err != nil {
 			return installResult{}, err
 		}
-		return installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall)
+		mcp, err := installMCPJSON(filepath.Join(sources.GeminiHome(), "settings.json"), exe, uninstall)
+		if err != nil {
+			return installResult{}, err
+		}
+		// Both writes in one result, like every other -auto target: the
+		// extension's path and its note about hooksConfig reached nobody
+		// while the first result was dropped (#3185).
+		return wroteAll(ext, mcp), nil
 	case "antigravity":
 		return installMCPJSON(filepath.Join(antigravityConfigHome(), "mcp_config.json"), exe, uninstall)
 	case "antigravity-auto":
@@ -739,10 +681,7 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 		if err := readableStrictJSON(probe...); err != nil {
 			return installResult{}, err
 		}
-		// Both halves. Discarding the first meant `install grok-auto` named
-		// GROK.md and the hook file while it had also written config.toml and
-		// user-settings.json — the shape #3185 fixed for gemini-auto (#3220).
-		mcp, err := installGrok(exe, uninstall)
+		base, err := installGrok(exe, uninstall)
 		if err != nil {
 			return installResult{}, err
 		}
@@ -750,7 +689,10 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 		if err != nil {
 			return installResult{}, err
 		}
-		return wroteAll(mcp, hooks), nil
+		// Both halves in one result, in the order they run: the config and
+		// settings writes reached nobody while the first result was dropped
+		// (#3220, the #3185 shape).
+		return wroteAll(base, hooks), nil
 	case "qwen":
 		return installMCPJSON(filepath.Join(sources.QwenConfigDir(), "settings.json"), exe, uninstall)
 	case "qwen-auto":
@@ -871,21 +813,27 @@ func wroteAll(rs ...installResult) installResult {
 		}
 	}
 	var also []string
-	// Every other config this target touched, whether or not it changed: the
-	// snapshot beside an unchanged file is still one deja left behind, and the
-	// screen that names what stays behind needs the path, not the sentence.
-	var paths []string
 	for _, r := range rs {
 		if r.Path == "" || r.Path == out.Path {
 			continue
 		}
-		paths = append(paths, r.Path)
+		// Every file this target handled rides along, changed or not, and so
+		// does anything the other result was already carrying: the
+		// kept-snapshot line reads these paths, and a second run that changes
+		// nothing still has a snapshot beside each of them (review of #3389).
+		out.also = append(out.also, r.Path)
+		out.also = append(out.also, r.also...)
 		if r.Action == "unchanged" {
 			continue
 		}
-		also = append(also, fmt.Sprintf("also %s %s", r.Action, shortHome(r.Path)))
+		line := fmt.Sprintf("also %s %s", r.Action, shortHome(r.Path))
+		// The other write's own note rides with its line: gemini's extension
+		// says what switch it left on, and that was lost with the result.
+		if r.Note != "" {
+			line += " — " + r.Note
+		}
+		also = append(also, line)
 	}
-	out.Also = append(out.Also, paths...)
 	for _, line := range also {
 		if out.Note != "" {
 			out.Note += "; "
@@ -1057,7 +1005,29 @@ func backupOnce(path string) (bool, error) {
 	}
 	// Configs can carry MCP credentials; the snapshot is owner-only even
 	// when the live file is looser.
-	return true, os.WriteFile(bak, b, 0o600)
+	if err := os.WriteFile(bak, b, 0o600); err != nil {
+		return true, err
+	}
+	// Whose snapshot this is cannot be read back out of its bytes, so it is
+	// recorded here: the uninstall deletes one only if deja took it (#3340).
+	rememberSnapshot(bak)
+	return true, nil
+}
+
+// backupOnceUnlessCreated is backupOnce for a file that was already there
+// before this run; one this run created is deja's and needs no snapshot. The
+// record holds the path as given, the write may have followed a symlink, so
+// both forms are compared.
+func backupOnceUnlessCreated(path string) (bool, error) {
+	for _, p := range createdByThisRun {
+		if p == path {
+			return false, nil
+		}
+		if r, err := filepath.EvalSymlinks(p); err == nil && r == path {
+			return false, nil
+		}
+	}
+	return backupOnce(path)
 }
 
 // removingWiring is set for the length of an uninstall run. Thirty-seven call
@@ -1109,6 +1079,24 @@ func mcpBlock(root map[string]any, key, path string) (map[string]any, bool, erro
 		return nil, false, fmt.Errorf("%s: %q is not an object deja can edit — left as it was", path, key)
 	}
 	return m, true, nil
+}
+
+// dropOwnBackup removes the snapshot beside path when the snapshot is deja's
+// own wiring and nothing else. A snapshot of the reader's config stays even
+// when the live file has come back to exactly it: that copy is theirs, and
+// TestUninstallLeavesNoFileOrDirItCreated has said so since #840 — "the user's
+// own config and its snapshot are not ours to delete" (#2604). It runs on the
+// paths that delete the file too, which is where a config deja wrote whole and
+// then edited again left a .bak the uninstall called the reader's (#3340).
+func dropOwnBackup(path string) {
+	bak := path + ".bak"
+	b, err := os.ReadFile(bak)
+	if err != nil {
+		return
+	}
+	if mentionsDeja(b) {
+		_ = os.Remove(bak)
+	}
 }
 
 // mentionsDeja reports whether a config snapshot carries deja's own wiring.
@@ -1264,6 +1252,14 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return "", err
 			}
+			// Only a snapshot deja took itself. mentionsDeja is a content guess
+			// and a loose one — a reader's own config that says the word, or
+			// their own snapshot of an older deja block, matches it — which is
+			// fine for deciding whether a file may be overwritten and not for
+			// deciding whether one may be deleted (review of #3340).
+			if snapshotTaken(path) {
+				dropOwnBackup(path)
+			}
 			return "removed", nil
 		}
 		// The same rule for the structured writers, which never reach zero
@@ -1278,6 +1274,9 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 			// condition wanted (same rule as pruneGuidanceDirs).
 			if dir := filepath.Dir(path); isRealDir(dir) {
 				_ = os.Remove(dir)
+			}
+			if snapshotTaken(path) {
+				dropOwnBackup(path)
 			}
 			return "removed", nil
 		}
@@ -1294,13 +1293,24 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 	// deja's wiring or stops on a conflict. Follow the link and write where it
 	// points, so the link stays a link and the change lands in the repo.
 	// A dangling link has nothing to follow and keeps the old behaviour.
+	given := path
 	if resolved, rerr := filepath.EvalSymlinks(path); rerr == nil && resolved != path {
 		path = resolved
+		// The snapshot is taken under the resolved name a line below, and a
+		// later run may ask under either spelling — a link that has since been
+		// replaced by the real directory, a record written by an older deja.
+		// Recording both is the only way back, since no resolution runs
+		// backwards (review of #3340).
+		rememberSnapshot(given + ".bak")
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			return "", err
 		}
 	}
-	if _, err := backupOnce(path); err != nil {
+	// No snapshot of a file this run created: a second write to it in the
+	// same run — roo allows deja's tool right after writing the entry — was
+	// backing up deja's own file from a moment before, and the uninstall then
+	// called it a config the reader already had (#3245).
+	if _, err := backupOnceUnlessCreated(path); err != nil {
 		return "", err
 	}
 	// On the way out, a snapshot that itself contains deja's wiring is deja's
@@ -1311,21 +1321,7 @@ func writeIfChanged(path string, old, next []byte) (string, error) {
 	// write, so the uninstall that meets it did not create it and would
 	// otherwise leave it (goose). A backup with no deja in it is the user's.
 	if removingWiring {
-		defer func() {
-			bak := path + ".bak"
-			b, err := os.ReadFile(bak)
-			if err != nil {
-				return
-			}
-			// Only deja's own. A snapshot of the reader's config stays even
-			// when the live file has come back to exactly it: that copy is
-			// theirs, and TestUninstallLeavesNoFileOrDirItCreated has said so
-			// since #840 — "the user's own config and its snapshot are not
-			// ours to delete" (#2604).
-			if mentionsDeja(b) {
-				_ = os.Remove(bak)
-			}
-		}()
+		defer func() { dropOwnBackup(path) }()
 	}
 	tmp, terr := os.CreateTemp(filepath.Dir(path), ".deja-tmp-")
 	if terr != nil {
@@ -1875,21 +1871,13 @@ func installGrok(exe string, uninstall bool) (installResult, error) {
 		return res, err
 	}
 	// The other CLI sharing this directory reads a different file entirely.
+	// Both go through wroteAll, so the pair is accounted for the way every
+	// other target's pair is — including on a run that changes neither.
 	user, uerr := installGrokUserSettings(exe, uninstall)
 	if uerr != nil {
 		return res, uerr
 	}
-	if res.Action == "unchanged" {
-		if res.Note != "" {
-			if user.Note != "" {
-				user.Note = res.Note + "; " + user.Note
-			} else {
-				user.Note = res.Note
-			}
-		}
-		return user, nil
-	}
-	return res, nil
+	return wroteAll(res, user), nil
 }
 
 type tomlMCPBlock struct {
@@ -3821,3 +3809,66 @@ func removeTOMLMCPBlock(s, key string) string {
 func tomlBlockOwnedBy(found, key string) bool {
 	return found == key || strings.HasPrefix(found, key+".")
 }
+
+// existingTargetChecks is what says a harness is on this machine: one path the
+// harness itself creates, per install target. Named rather than inline so the
+// test that holds it to the target list can ask for a path instead of
+// repeating the platform switches (#3192).
+func existingTargetChecks() map[string]string {
+	return map[string]string{
+		"claude-code": sources.ClaudeConfigDir(),
+		"codex":       sources.CodexHome(),
+		"opencode":    filepath.Join(opencodeConfigHome(), "opencode"),
+		"cursor":      sources.CursorCLIHome(),
+		"gemini":      filepath.Join(sources.GeminiHome(), "settings.json"),
+		"antigravity": antigravityConfigHome(),
+		"copilot":     filepath.Join(homeDir(), ".copilot"),
+		"grok":        sources.GrokRoot(),
+		"qwen":        sources.QwenConfigDir(),
+		"kimi":        sources.KimiConfigDir(),
+		"cline":       sources.ClineConfigDir(),
+		"hermes":      sources.HermesHome(),
+		"pi":          sources.PiConfigDir(),
+		"omp":         sources.OmpConfigDir(),
+		"deepseek":    sources.DSHHome(),
+		"openclaw":    sources.OpenClawStateDir(),
+		// aider keeps no config directory: its history file is what says it
+		// has been used here. The binary alone would match every machine that
+		// merely has it on PATH.
+		"aider": filepath.Join(homeDir(), ".aider.chat.history.md"),
+		// The session store, not the config directory: deja creates the
+		// latter itself, which would make every machine look like a Goose
+		// machine after one install.
+		"goose": sources.GooseRoot(),
+		"roo":   rooFirstRoot(),
+		// These six have install targets and were in the matrix with nothing
+		// looking for them, so `--auto` wired the other nineteen and said
+		// nothing about Amp, prime-agent, Crush, Continue, Zed or VS Code on a
+		// machine that had them (#3192). Each is keyed on something the harness
+		// writes for itself, for the reason goose's entry gives.
+		//
+		// Amp's thread store rather than its settings file: deja writes into
+		// the settings file.
+		"amp": sources.AmpRoot(),
+		// prime-agent's sessions directory, and it honours the harness's own
+		// relocation variables, so a moved store is still found.
+		"prime": sources.PrimeRoot(),
+		// Crush's project registry, in its data home. Its config directory is
+		// where deja writes crush.json, so keying on that would make every
+		// machine a Crush machine after one install.
+		"crush": filepath.Join(sources.CrushDataHome(), "projects.json"),
+		// Continue's session directory. The folder above it holds the config
+		// deja writes, and Continue creates the sessions directory on its
+		// first conversation — so a Continue that has been installed and never
+		// used is not detected, which is the same bar the aider entry sets.
+		"continue": filepath.Join(sources.ContinueRoot(), "sessions"),
+		// Zed's data directory, not the config file deja edits.
+		"zed": sources.ZedRoot(),
+		// VS Code's own User folder, which the editor creates on first run;
+		// deja only ever writes inside it.
+		"vscode": vsCodeFirstRoot(),
+	}
+}
+
+// paths is touched() under the name the callers merged from main use.
+func (r installResult) paths() []string { return r.touched() }

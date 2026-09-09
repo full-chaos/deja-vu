@@ -99,20 +99,36 @@ def _provider_active():
         from hermes_cli.config import cfg_get, load_config
         if cfg_get(load_config(), "memory", "provider") != "deja-memory":
             return False
-        # Config can outlive the provider (an uninstall, a deleted directory);
-        # then the hook is the memory again, or there would be none at all.
+        # Config can outlive the provider (an uninstall, a deleted directory),
+        # and a provider that is there can still fail to load on a Hermes build
+        # it was not written for — the hook then stood down for a provider that
+        # was answering nothing (#3390). Ask the loader, and fall back to the
+        # file when this build has no loader to ask.
         here = os.path.dirname(os.path.abspath(__file__))
-        init = os.path.join(os.path.dirname(here), "deja-memory", "__init__.py")
-        if not os.path.isfile(init):
+        present = os.path.isfile(os.path.join(os.path.dirname(here), "deja-memory", "__init__.py"))
+        if not present:
             return False
-        # The file can be there and still not load — it imports names from
-        # Hermes, and an older Hermes does not have all of them. Standing down
-        # for a provider that never loaded leaves the turn with no memory at
-        # all, which is worse than repeating it (#3202).
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("deja_memory_probe", init)
-        spec.loader.exec_module(importlib.util.module_from_spec(spec))
-        return True
+        try:
+            from plugins.memory import load_memory_provider
+        except Exception:
+            # No loader to ask on this build: load the provider the way Hermes
+            # would. A directory that raises on import is not a provider, and
+            # the hook has to keep answering (#3340).
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "_deja_memory_probe",
+                    os.path.join(os.path.dirname(here), "deja-memory", "__init__.py"),
+                )
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+            except Exception:
+                return False
+            return True
+        try:
+            return load_memory_provider("deja-memory") is not None
+        except Exception:
+            return False
     except Exception:
         return False
 

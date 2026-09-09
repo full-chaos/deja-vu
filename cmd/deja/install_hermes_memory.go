@@ -87,10 +87,8 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
-try:
-    # The status line is newer than the provider interface: Hermes 0.17 has no
-    # RecallStatus, and importing it there fails the whole module, so the
-    # provider loads as unavailable while the hook has already stood down.
+try:  # Hermes 0.17 has no RecallStatus; the provider loads without it and
+    # loses only the status line (#3390).
     from agent.memory_provider import RecallStatus
 except ImportError:
     RecallStatus = None
@@ -236,7 +234,7 @@ class DejaMemoryProvider(MemoryProvider):
         return text
 
     def recall_status(self):
-        if not self._last_text or RecallStatus is None:
+        if RecallStatus is None or not self._last_text:
             return None
         return RecallStatus(provider_label="deja", count=self._last_count)
 

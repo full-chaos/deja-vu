@@ -144,9 +144,14 @@ func yamlFlowItems(v string) ([]string, bool) {
 		return nil, true
 	}
 	items = append(items, strings.TrimSpace(cur.String()))
-	for _, it := range items {
+	for i, it := range items {
 		if it == "" {
 			return nil, true
+		}
+		// A name quoted in the flow list is the same file unquoted, and the
+		// block list deja writes takes it plain.
+		if len(it) > 1 && (it[0] == '"' || it[0] == '\'') && it[len(it)-1] == it[0] {
+			items[i] = it[1 : len(it)-1]
 		}
 	}
 	return items, true

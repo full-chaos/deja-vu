@@ -26,7 +26,7 @@ func TestKeptSnapshotsCountsEveryConfigAnAutoTargetWrote(t *testing.T) {
 		installResult{Path: one, Action: "updated"},
 		installResult{Path: two, Action: "updated"},
 	)
-	got := keptSnapshotsLine(r.paths())
+	got := keptSnapshotsLine(r.touched())
 	if !strings.Contains(got, "kept 2 snapshots") {
 		t.Fatalf("the second config's snapshot went unmentioned:\n%s", got)
 	}
@@ -37,7 +37,7 @@ func TestKeptSnapshotsCountsEveryConfigAnAutoTargetWrote(t *testing.T) {
 		installResult{Path: one, Action: "updated"},
 		installResult{Path: two, Action: "unchanged"},
 	)
-	if got := keptSnapshotsLine(r.paths()); !strings.Contains(got, "kept 2 snapshots") {
+	if got := keptSnapshotsLine(r.touched()); !strings.Contains(got, "kept 2 snapshots") {
 		t.Fatalf("an unchanged config's snapshot went unmentioned:\n%s", got)
 	}
 	// …without claiming it was written: the note is about what changed.
@@ -47,7 +47,7 @@ func TestKeptSnapshotsCountsEveryConfigAnAutoTargetWrote(t *testing.T) {
 
 	// One target, one config: still one snapshot, not a duplicate.
 	r = wroteAll(installResult{Path: one, Action: "updated"})
-	if got := keptSnapshotsLine(r.paths()); !strings.Contains(got, "kept 1 snapshot ") {
+	if got := keptSnapshotsLine(r.touched()); !strings.Contains(got, "kept 1 snapshot ") {
 		t.Fatalf("a single-config target miscounted:\n%s", got)
 	}
 }
