@@ -3869,6 +3869,3 @@ func existingTargetChecks() map[string]string {
 		"vscode": vsCodeFirstRoot(),
 	}
 }
-
-// paths is touched() under the name the callers merged from main use.
-func (r installResult) paths() []string { return r.touched() }

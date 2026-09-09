@@ -487,12 +487,6 @@ func clineContentText(raw json.RawMessage) string {
 	return strings.Join(parts, "\n")
 }
 
-// environmentDetailsRe is the block Roo Code and Cline append to every user
-// turn — visible files, open tabs, the clock, the cost, the mode, a workspace
-// listing. It opens and closes on lines of its own; a person's mention of the
-// tag mid-sentence is not one (#3255).
-var environmentDetailsRe = regexp.MustCompile(`(?ms)^[ \t]*<environment_details>[ \t]*\r?\n.*?^[ \t]*</environment_details>[ \t]*\r?(?:\n|$)`)
-
 // unwrapClineTask strips the legacy <task>...</task> envelope (and its modern
 // user-input equivalent) so the tags themselves are not indexed, and the
 // host's <environment_details> block, which is not the person's words.
