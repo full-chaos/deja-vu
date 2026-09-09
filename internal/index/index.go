@@ -122,18 +122,24 @@ import (
 // 35 carries no format change at all — the parsers changed what they hand over,
 // and an index built before them keeps rows the readers would no longer write
 // (#3289). Kimi filed injections and its own hook's output under the person
-// (#3199); Roo and Cline kept the <environment_details> listing inside every
-// user turn and aider kept /undo and /clear as questions (#3255, #3248); Hermes
-// stamped every session with the profile instead of the directory it was worked
-// in, and titled by whichever row came first (#3257, #3251, #3241); Zed threw
-// away every tool result it stored (#3291); Claude Code's own records — skill
-// bodies, re-fired prompts, the /fork notice — were indexed as the person's
-// words (#3267); Roo and legacy Cline yielded no command or file records
-// (#3295); Crush is a new reader whose stores
-// nothing had walked. None of that reaches an existing
-// store without a re-read, and the repo's precedent for a content-changing
-// parser fix is exactly this: #2875 for goose, #1383 for the greeting rule,
-// #2905 for the Thai bigrams.
+// (#3199, #3235); Roo and Cline kept the <environment_details> listing inside
+// every user turn (#3255, #3256) and yielded no tool results (#3269), no
+// command or file records (#3295); aider kept /undo and /clear as questions
+// (#3248) and its banner and continuation lines as speech (#3311); Hermes
+// stamped every session with the profile instead of the directory it was
+// worked in, and titled by whichever row came first (#3257, #3251, #3241);
+// Zed threw away every tool result it stored (#3291), inlined its summary of a
+// mentioned thread as the person's words (#3336) and gave every message one
+// stamp (#3333); Claude Code's own records — skill bodies, re-fired prompts,
+// the /fork notice — were indexed as the person's words (#3267); Qwen's tool
+// results (#3281), Grok's tool input (#3285), Antigravity's edits (#3279) and
+// plan approvals (#3326), Gemini's toolCalls (#3293), opencode's synthetic
+// parts (#3299), subagent parents (#3301) and its own session titles (#3315),
+// Copilot's injected skills (#3305) and exit codes (#3369), Cursor's per-turn
+// stamps (#3349); Crush is a new reader whose stores nothing had walked. None
+// of that reaches an existing store without a re-read, and the repo's
+// precedent for a content-changing parser fix is exactly this: #2875 for
+// goose, #1383 for the greeting rule, #2905 for the Thai bigrams.
 const version = 35
 const maxIndexedText = 64 * 1024
 

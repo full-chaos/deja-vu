@@ -11,25 +11,19 @@ import (
 	"github.com/vshulcz/deja-vu/internal/index"
 )
 
-// Nobody asked. A harness delivers its own plumbing as the next user turn — a
-// finished background task, a system reminder — and this hook fired on it like
-// a question. The terms were the envelope's field names plus a task id that
-// exists nowhere else, and what they matched was another notification in
-// another session: noise injected as recalled history, under a line telling the
-// user that deja fires on noise (#3156).
-func TestHookPromptStandsDownOnHarnessArtifacts(t *testing.T) {
+// A turn that is only the host's envelope — a task notification delivered as
+// a user prompt — gets nothing: no block, no "you have been here" line. Seen
+// live on 2026-09-08 with the envelope's field names as the identifying terms
+// (#3156). The same session, asked a real question, still gets its block.
+func TestHookPromptStandsDownOnTheHostsOwnTurn(t *testing.T) {
 	withStatsStores(t)
 	claudeRoot := os.Getenv("DEJA_CLAUDE_ROOT")
-	ts := time.Now().Add(-72 * time.Hour).UTC().Format(time.RFC3339)
-
-	// A past session holding a notification of its own — what the noisy prompt
-	// matched — and a real answer beside it, so silence here is a decision and
-	// not an empty store.
-	writeClaudeFixture(t, filepath.Join(claudeRoot, "beta", "past.jsonl"), "past", []string{
-		`{"type":"user","sessionId":"past","timestamp":"` + ts +
-			`","message":{"role":"user","content":"<task-notification>\n<task-id>zx91qq4kb</task-id>\n<status>failed</status>\n</task-notification>"}}`,
-		`{"type":"assistant","sessionId":"past","timestamp":"` + ts +
-			`","message":{"role":"assistant","content":"the zibblex retry cap is four, we settled that"}}`,
+	old := time.Now().Add(-72 * time.Hour).UTC().Format(time.RFC3339)
+	writeClaudeFixture(t, filepath.Join(claudeRoot, "beta", "notice.jsonl"), "notice", []string{
+		`{"type":"user","sessionId":"notice","timestamp":"` + old + `","message":{"role":"user","content":"<task-notification>\n<task-id>br50mykp6</task-id>\n<status>failed</status>\n</task-notification>"}}`,
+		`{"type":"assistant","sessionId":"notice","timestamp":"` + old + `","message":{"role":"assistant","content":"That is the earlier background task-id run; it failed on the task-notification path."}}`,
+		`{"type":"user","sessionId":"notice","timestamp":"` + old + `","message":{"role":"user","content":"the exporter_batch job drops rows at utc_midnight"}}`,
+		`{"type":"assistant","sessionId":"notice","timestamp":"` + old + `","message":{"role":"assistant","content":"utc_midnight rollover: the exporter_batch cursor was compared in local time."}}`,
 	})
 	if err := index.Ensure(index.DefaultDir(), "", true, nil); err != nil {
 		t.Fatal(err)
@@ -39,30 +33,24 @@ func TestHookPromptStandsDownOnHarnessArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Chdir(cwd)
-
-	for _, artifact := range []string{
-		`<task-notification>\n<task-id>br50mykp6</task-id>\n<status>failed</status>\n</task-notification>`,
-		`<system-reminder>The task list is empty.</system-reminder>`,
-		`Summary: 1. Primary Request and Intent:\n   keep polishing the tool\n2. Key Technical Concepts:\n   - hooks`,
-	} {
+	ask := func(prompt string) string {
 		var out bytes.Buffer
-		in := strings.NewReader(`{"prompt":"` + artifact + `","session_id":"asking"}`)
-		if err := runHookPromptMode(index.DefaultDir(), in, &out, true); err != nil {
+		in := `{"prompt":` + jsonString(prompt) + `,"session_id":"agent-9"}`
+		if err := runHookPrompt(index.DefaultDir(), strings.NewReader(in), &out); err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(out.String(), "deja-recall") || strings.Contains(out.String(), "you have been here") {
-			t.Errorf("the hook recalled on a harness artifact:\nprompt: %s\ngot: %q", artifact, out.String())
-		}
+		return out.String()
 	}
-
-	// The control: a real question in the same session, against the same
-	// store, still gets its block.
-	var out bytes.Buffer
-	in := strings.NewReader(`{"prompt":"what did we decide about the zibblex retry cap","session_id":"asking"}`)
-	if err := runHookPromptMode(index.DefaultDir(), in, &out, true); err != nil {
-		t.Fatal(err)
+	if got := ask("<task-notification>\n<task-id>br50mykp6</task-id>\n<status>failed</status>\n<summary>Background command failed</summary>\n</task-notification>"); strings.TrimSpace(got) != "" {
+		t.Fatalf("the host's own turn got a block:\n%s", got)
 	}
-	if !strings.Contains(out.String(), "retry cap is four") {
-		t.Fatalf("a real question went unanswered, so the silence above proves nothing:\n%q", out.String())
+	// A person's words with the host's reminder appended still count as the
+	// person's words — and the reminder's words are not the query.
+	got := ask("exporter_batch dropping rows at utc_midnight again\n<system-reminder>\nCAVEMAN MODE ACTIVE\n</system-reminder>")
+	if !strings.Contains(got, "utc_midnight") {
+		t.Fatalf("a real question with a reminder appended got nothing:\n%s", got)
+	}
+	if strings.Contains(got, "CAVEMAN") {
+		t.Fatalf("the reminder's words reached the block:\n%s", got)
 	}
 }

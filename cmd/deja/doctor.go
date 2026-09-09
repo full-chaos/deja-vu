@@ -420,6 +420,12 @@ func inDotDir(root, p string) bool {
 // large reads as the tool failing to understand the user's own history, which
 // is the one thing doctor exists to rule out.
 func unplacedFiles(root string, seen []string, skipped func(string) bool) (unread, byRule int) {
+	return unplacedFilesIn(root, seen, skipped, false)
+}
+
+// unplacedFilesIn is unplacedFiles with the one decision a caller can make:
+// whether a dot directory under this root is the store itself.
+func unplacedFilesIn(root string, seen []string, skipped func(string) bool, dotDirsAreTheStore bool) (unread, byRule int) {
 	have := make(map[string]bool, len(seen))
 	for _, p := range seen {
 		have[filepath.Clean(p)] = true
@@ -439,7 +445,15 @@ func unplacedFiles(root string, seen []string, skipped func(string) bool) (unrea
 		// A store's own scratch is not a transcript deja failed to read: 452
 		// of the 482 this machine reported for codex sat in `.tmp`, and a
 		// count that size reads as a parser that cannot cope with the store.
-		if inDotDir(root, p) {
+		//
+		//
+		// Unless the store keeps its transcripts there: Antigravity files
+		// everything under `.system_generated`, so the rule silenced its row
+		// completely rather than trimming its noise. Codex is the opposite —
+		// it writes in-progress rollouts under `.tmp` — which is why this is
+		// the caller's decision and not something inferred from the files
+		// (#3377).
+		if !dotDirsAreTheStore && inDotDir(root, p) {
 			return nil
 		}
 		if skipped != nil && skipped(p) {
@@ -726,34 +740,73 @@ func doctorHarnesses(w io.Writer, dir string) {
 	printFiles := func(name, path string, present bool, seen []string) {
 		printFilesSkipping(name, path, present, seen, nil)
 	}
+	// printFilesBeside is printFiles for a harness whose store keeps files
+	// beside the transcripts that are not transcripts — Continue's
+	// sessions.json (the list, which deja reads), Copilot's vscode.metadata.json
+	// (the IDE's bookkeeping, #3303), Kimi's per-session state.json (the title
+	// and working directory, #3309). Counted with the files, it made `doctor`
+	// disagree with `deja sources` by one; counted as unread, it made every
+	// store report a file deja could not read (#3297). So it is neither: the
+	// count is the transcripts, and the note leaves the list alone.
+	// printFilesBesideIn is printFilesBeside for a row whose printed location is
+	// not one directory: cline names its modern store and its legacy roots on
+	// the same line, and that string cannot be walked (#3360).
+	printFilesBesideIn := func(name, loc string, walks []string, dotDirsAreTheStore, present bool, seen []string, beside ...string) {
+		detail := doctorCount(len(seen), "file")
+		placed := append(append([]string{}, seen...), beside...)
+		unread := 0
+		for _, walk := range walks {
+			u, _ := unplacedFilesIn(walk, placed, nil, dotDirsAreTheStore)
+			unread += u
+		}
+		if unread > 0 {
+			detail += fmt.Sprintf(", %d not recognised here", unread)
+		}
+		printRow(name, loc, present, detail)
+	}
+	printFilesBeside := func(name, path string, present bool, seen []string, beside ...string) {
+		printFilesBesideIn(name, path, []string{path}, false, present, seen, beside...)
+	}
 
 	claudeRoot := sources.ClaudeRoot()
 	printFilesSkipping("claude", claudeRoot, doctorExists(claudeRoot), sources.ClaudeFiles(),
 		func(p string) bool { return !sources.ClaudeFileWanted(p) })
 
 	codexRoot := sources.CodexRoot()
-	printFiles("codex", codexRoot, doctorExists(codexRoot), sources.CodexFiles())
+	printFilesBeside("codex", codexRoot, doctorExists(codexRoot), sources.CodexFiles(), sources.CodexSidecarFiles()...)
 
 	ocDB := sources.OpencodeDB()
 	printRow("opencode", ocDB, doctorFilePresent(ocDB), doctorSQLiteDetail(ocDB, sqlite))
 
 	printRow("aider", doctorAiderLocation(), len(sources.AiderFiles()) > 0, doctorCount(len(sources.AiderFiles()), "file"))
 
+	// The row names the store and counts what is under `tmp`, where the chats
+	// are: Antigravity keeps its own store in a sibling directory of the same
+	// root and has its own row, so walking the whole of ~/.gemini reported its
+	// files — 55 of 77 on a real machine — as chats gemini failed to read
+	// (#3397). The settings and the extensions beside them are not chats
+	// either.
 	geminiRoot := sources.GeminiRoot()
-	printFiles("gemini", geminiRoot, doctorExists(geminiRoot), sources.GeminiChatFiles())
+	printFilesBesideIn("gemini", geminiRoot, []string{filepath.Join(geminiRoot, "tmp")}, false,
+		doctorExists(geminiRoot), sources.GeminiChatFiles(), sources.GeminiSidecarFiles()...)
 
 	printRow("cursor", doctorCursorLocation(), doctorCursorPresent(), doctorCursorDetail(sqlite))
 
-	printRow("antigravity", doctorAntigravityLocation(), len(sources.AntigravityRoots()) > 0, doctorCount(len(sources.AntigravityTranscripts()), "file"))
+	agyRoots := sources.AntigravityRoots()
+	printFilesBesideIn("antigravity", doctorAntigravityLocation(), agyRoots, true, len(agyRoots) > 0,
+		sources.AntigravityTranscripts(), sources.AntigravitySidecarFiles()...)
 
-	grokRoot := sources.GrokRoot()
-	printFiles("grok", grokRoot, doctorExists(grokRoot), sources.GrokSessionFiles())
+	// The store root also holds Grok's settings, credentials and caches, which
+	// are not transcripts and never will be; the sessions directory is what the
+	// count is about (#3319).
+	grokRoot := filepath.Join(sources.GrokRoot(), "sessions")
+	printFilesBeside("grok", grokRoot, doctorExists(grokRoot), sources.GrokSessionFiles(), sources.GrokSidecarFiles()...)
 
 	qwenRoot := filepath.Join(sources.QwenRoot(), "projects")
 	printFiles("qwen", qwenRoot, doctorExists(qwenRoot), sources.QwenSessionFiles())
 
 	kimiRoot := filepath.Join(sources.KimiRoot(), "sessions")
-	printFiles("kimi", kimiRoot, doctorExists(kimiRoot), sources.KimiSessionFiles())
+	printFilesBeside("kimi", kimiRoot, doctorExists(kimiRoot), sources.KimiSessionFiles(), sources.KimiSidecarFiles()...)
 
 	gooseRoot := filepath.Join(sources.GooseRoot(), "sessions")
 	printRow("goose", gooseRoot, doctorExists(gooseRoot) || doctorFilePresent(sources.GooseDB()), doctorGooseDetail(sqlite))
@@ -767,7 +820,12 @@ func doctorHarnesses(w io.Writer, dir string) {
 	if legacy := sources.ClineLegacyRoots(); len(legacy) > 0 {
 		clineLoc += ", " + strings.Join(legacy, string(os.PathListSeparator))
 	}
-	printRow("cline", clineLoc, clineFiles > 0 || doctorExists(clineModern), doctorCount(clineFiles, "file"))
+	// Every root the line names is walked, or the count would promise coverage
+	// the row does not have: a stray file under a legacy tasks tree was
+	// invisible while the line advertised that root (review of #3360).
+	clineWalks := sources.ClineStoreRoots()
+	printFilesBesideIn("cline", clineLoc, clineWalks, false, clineFiles > 0 || doctorExists(clineModern),
+		sources.ClineSessionFiles(), sources.ClineSidecarFiles()...)
 
 	rooFiles := len(sources.RooTaskFiles())
 	rooLoc := "VS Code globalStorage rooveterinaryinc.roo-cline"
@@ -777,17 +835,18 @@ func doctorHarnesses(w io.Writer, dir string) {
 	printRow("roo", rooLoc, rooFiles > 0, doctorCount(rooFiles, "file"))
 
 	continueDir := filepath.Join(sources.ContinueRoot(), "sessions")
-	printFiles("continue", continueDir, doctorExists(continueDir), sources.ContinueSessionFiles())
+	printFilesBeside("continue", continueDir, doctorExists(continueDir), sources.ContinueSessionFiles(),
+		filepath.Join(continueDir, "sessions.json"))
 
 	piRoot := sources.PiRoot()
 	printFiles("pi", piRoot, doctorExists(piRoot), sources.PiSessionFiles())
 	openclawRoot := sources.OpenClawRoot()
-	printRow("openclaw", openclawRoot, doctorExists(openclawRoot), doctorCount(len(sources.OpenClawSessionFiles()), "file"))
+	printFilesBeside("openclaw", openclawRoot, doctorExists(openclawRoot), sources.OpenClawSessionFiles(), sources.OpenClawSidecarFiles()...)
 	for _, db := range sources.OpenClawAgentDBs() {
 		printRow("openclaw", db, doctorFilePresent(db), doctorSQLiteDetail(db, sqlite))
 	}
 	copilotRoot := sources.CopilotRoot()
-	printFiles("copilot", copilotRoot, doctorExists(copilotRoot), sources.CopilotSessionFiles())
+	printFilesBeside("copilot", copilotRoot, doctorExists(copilotRoot), sources.CopilotSessionFiles(), sources.CopilotSidecarFiles()...)
 	chatFiles := len(sources.CopilotChatSessionFiles())
 	chatLoc := "VS Code Copilot Chat"
 	if roots := sources.CopilotChatRoots(); len(roots) > 0 {
@@ -1365,7 +1424,9 @@ func doctorJSONDejaKeys(key string) func(string) []string {
 			return nil
 		}
 		var root map[string]any
-		if json.Unmarshal(b, &root) != nil {
+		// The file may be JSONC — the install keeps a reader's comments and
+		// trailing commas (#3243) — so it is read the way install reads it.
+		if json.Unmarshal([]byte(jsoncToJSON(string(b))), &root) != nil {
 			return nil
 		}
 		m, _ := root[key].(map[string]any)

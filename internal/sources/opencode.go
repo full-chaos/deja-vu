@@ -3,6 +3,7 @@ package sources
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,7 +39,11 @@ func OpencodeDB() string {
 }
 
 func LoadOpencode() []model.Session {
-	ss, _ := ParseOpencodeDBWhere(OpencodeDB(), "", 0)
+	// A store that would not open — locked past the timeout by the agent
+	// using it, or unreadable — is reported like a transcript that would not
+	// parse, so the pass says so and does not record the store as read.
+	ss, err := ParseOpencodeDBWhere(OpencodeDB(), "", 0)
+	diagFileError(OpencodeDB(), err)
 	return ss
 }
 
@@ -94,6 +99,11 @@ func ParseOpencodeDBWhere(db, where string, limit int) ([]model.Session, error) 
 	q := `select s.id,s.directory,s.time_created,s.time_updated,` +
 		`json_extract(m.data,'$.role') as role,` +
 		`json_extract(p.data,'$.text') as text,` +
+		// The text opencode wrote itself under the user role — "Continue if
+		// you have next steps…", "The following tool was executed by the
+		// user" — carries this flag; 338 of them indexed as the person's words
+		// on one store (#3299).
+		`json_extract(p.data,'$.synthetic') as synthetic,` +
 		`json_extract(p.data,'$.state.input.filePath') as path,` +
 		`json_extract(p.data,'$.state.input.command') as cmd,` +
 		`json_extract(p.data,'$.state.input.patchText') as patch,` +
@@ -191,6 +201,9 @@ func ParseOpencodeDBWhere(db, where string, limit int) ([]model.Session, error) 
 		}
 		role := str(r["role"])
 		txt := str(r["text"])
+		if opencodeSynthetic(r["synthetic"]) {
+			continue
+		}
 		// A read call carries no text, only the file it opened. Recorded under
 		// the files role so it can answer "which files" without competing in
 		// ordinary search.
@@ -265,7 +278,57 @@ func ParseOpencodeDBWhere(db, where string, limit int) ([]model.Session, error) 
 	for _, s := range by {
 		out = append(out, *s)
 	}
+	// A subagent run is its own session with parent_id naming the spawner —
+	// 922 of 1472 on one store; read without it, every child listed as a
+	// person's own session (#3301). Read beside the rows, best effort: a store
+	// from before the column keeps its sessions standalone.
+	if parents := opencodeParents(db); len(parents) > 0 {
+		for i := range out {
+			if p := parents[out[i].ID]; p != "" {
+				out[i].Kind = "subagent"
+				out[i].Parent = p
+			}
+		}
+	}
+	// opencode names every session, and for the 922 subagent runs of one real
+	// store that name is the only short thing about them — the first user line
+	// there is the whole brief (#3315). Read beside the rows, not in the main
+	// projection: a store from before the column would fail the whole query
+	// and take the harness with it.
+	if titles := opencodeTitles(db); len(titles) > 0 {
+		for i := range out {
+			if t := titles[out[i].ID]; t != "" {
+				out[i].Title = t
+			}
+		}
+	}
 	return out, nil
+}
+
+// opencodeParents maps a session id to its parent's, for the sessions that
+// have one. The column arrived with subagents; a query that fails is a store
+// without it, and nothing is stamped.
+func opencodeParents(db string) map[string]string {
+	cmd := exec.Command("sqlite3", "-readonly", "-json", sqliteTarget(db), ".timeout 5000",
+		`select id, parent_id from session where parent_id is not null and parent_id <> ''`)
+	b, err := cmd.Output()
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	var rows []struct {
+		ID     string `json:"id"`
+		Parent string `json:"parent_id"`
+	}
+	if json.Unmarshal(b, &rows) != nil {
+		return nil
+	}
+	m := make(map[string]string, len(rows))
+	for _, r := range rows {
+		if r.ID != "" && r.Parent != "" && r.ID != r.Parent {
+			m[r.ID] = r.Parent
+		}
+	}
+	return m
 }
 
 func OpencodeCounts() (sessions, messages int, err error) {
@@ -335,6 +398,61 @@ func ParseOpencodeNewest(db string) ([]model.Session, error) {
 		return nil, nil
 	}
 	return ParseOpencodeDBWhere(db, " and s.id='"+sqlEscape(id)+"'", 0)
+}
+
+// opencodeSynthetic reads the part's synthetic flag off the sqlite3 -json row:
+// true comes back as 1, json.Number or bool depending on the shape.
+func opencodeSynthetic(v any) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case float64:
+		return x != 0
+	case json.Number:
+		return x.String() != "0" && x.String() != ""
+	case string:
+		return x == "1" || x == "true"
+	}
+	return false
+}
+
+// opencodeTitles maps a session id to the name opencode gave it, for the names
+// worth having. A store without the column stamps nothing.
+func opencodeTitles(db string) map[string]string {
+	cmd := exec.Command("sqlite3", "-readonly", "-json", sqliteTarget(db), ".timeout 5000",
+		`select id, title from session where title is not null and title <> ''`)
+	b, err := cmd.Output()
+	if err != nil || len(b) == 0 {
+		return nil
+	}
+	var rows []struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	}
+	if json.Unmarshal(b, &rows) != nil {
+		return nil
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		t := strings.TrimSpace(r.Title)
+		if r.ID == "" || opencodeThinTitle(t) {
+			continue
+		}
+		out[r.ID] = t
+	}
+	return out
+}
+
+// opencodeThinTitle reports whether opencode's own name for a session says
+// less than its first line would: its "New session - <timestamp>" placeholder
+// (31 of 1472 on a real store), or a name of two words or fewer and short —
+// "done" ×12, "ok", "Greeting" ×11 there, where the first line is the better
+// name. Same shape as Continue's placeholders (#3274).
+func opencodeThinTitle(t string) bool {
+	if strings.HasPrefix(t, "New session - ") || t == "New session" {
+		return true
+	}
+	return len(strings.Fields(t)) <= 2 && len([]rune(t)) <= 12
 }
 
 // partTime prefers the part's own timestamp and falls back to the message's.
@@ -426,4 +544,16 @@ func withStderr(err error, buf *bytes.Buffer) error {
 		msg = strings.TrimSpace(msg[:sqliteStderrMax]) + "…"
 	}
 	return fmt.Errorf("%s (%w)", msg, err)
+}
+
+// ExitStderrLine is the first line sqlite3 wrote to stderr before it exited,
+// or "" when the error carries none: "database is locked" says more than
+// "exit status 5".
+func ExitStderrLine(err error) string {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return ""
+	}
+	line := strings.TrimSpace(strings.SplitN(string(ee.Stderr), "\n", 2)[0])
+	return line
 }

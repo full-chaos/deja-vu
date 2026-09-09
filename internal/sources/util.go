@@ -432,43 +432,6 @@ func safeParse(path string, parse func(string) ([]model.Session, error)) (ss []m
 	return parse(path)
 }
 
-// OnFileParsed is called with each transcript path as it finishes parsing, so
-// a caller drawing progress can move per file rather than per store. The index
-// sets it for a cold rebuild: every file-based store parses through the pool
-// below, and one store holding most of the corpus used to leave the bar at 0%
-// until it finished — measured, ten seconds of a thirty-second rebuild (#3372).
-//
-// Set before the parse and cleared after; nil means nobody is watching. It is
-// called from the pool's workers, so an implementation has to be safe to call
-// from several goroutines at once.
-var OnFileParsed func(path string)
-
-// SetFileProgress installs the callback and returns a function that restores
-// what was there. The mutex covers the swap, not the call: parsing runs long
-// after this returns.
-func SetFileProgress(fn func(path string)) func() {
-	fileProgressMu.Lock()
-	prev := OnFileParsed
-	OnFileParsed = fn
-	fileProgressMu.Unlock()
-	return func() {
-		fileProgressMu.Lock()
-		OnFileParsed = prev
-		fileProgressMu.Unlock()
-	}
-}
-
-var fileProgressMu sync.Mutex
-
-func fileParsed(path string) {
-	fileProgressMu.Lock()
-	fn := OnFileParsed
-	fileProgressMu.Unlock()
-	if fn != nil {
-		fn(path)
-	}
-}
-
 func parseFiles(files []string, parse func(string) ([]model.Session, error)) []model.Session {
 	files = append([]string(nil), files...)
 	sort.Strings(files)
@@ -782,4 +745,41 @@ func truncateRunes(s string, n int) string {
 // twice rather than the side that skips it for good (#2155).
 func millisecondBackoff(t time.Time) string {
 	return t.UTC().Add(-time.Millisecond).Format("2006-01-02T15:04:05.000")
+}
+
+// OnFileParsed is called with each transcript path as it finishes parsing, so
+// a caller drawing progress can move per file rather than per store. The index
+// sets it for a cold rebuild: every file-based store parses through the pool
+// above, and one store holding most of the corpus used to leave the bar at 0%
+// until it finished — measured, ten seconds of a thirty-second rebuild (#3372).
+//
+// Set before the parse and cleared after; nil means nobody is watching. It is
+// called from the pool's workers, so an implementation has to be safe to call
+// from several goroutines at once.
+var OnFileParsed func(path string)
+
+// SetFileProgress installs the callback and returns a function that restores
+// what was there. The mutex covers the swap, not the call: parsing runs long
+// after this returns.
+func SetFileProgress(fn func(path string)) func() {
+	fileProgressMu.Lock()
+	prev := OnFileParsed
+	OnFileParsed = fn
+	fileProgressMu.Unlock()
+	return func() {
+		fileProgressMu.Lock()
+		OnFileParsed = prev
+		fileProgressMu.Unlock()
+	}
+}
+
+var fileProgressMu sync.Mutex
+
+func fileParsed(path string) {
+	fileProgressMu.Lock()
+	fn := OnFileParsed
+	fileProgressMu.Unlock()
+	if fn != nil {
+		fn(path)
+	}
 }

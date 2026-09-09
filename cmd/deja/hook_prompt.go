@@ -47,6 +47,10 @@ const dejaVuMaxMessages = 300
 type promptHookInput struct {
 	Prompt    hookPromptText `json:"prompt"`
 	SessionID string         `json:"session_id"`
+	// Cursor names the conversation conversation_id and sends no session_id;
+	// read as no session at all, the cooldown was never recorded and the same
+	// block went out on every prompt of the conversation (#3287).
+	ConversationID string `json:"conversation_id"`
 	// CWD is what the harness says the project is. Reading only the
 	// environment meant a host that sends the payload without exporting
 	// CLAUDE_PROJECT_DIR recalled nothing (#759).
@@ -60,7 +64,7 @@ type promptHookInput struct {
 // adopt fills in what grok spells differently, so this prompt's recall is filed
 // under the session that asked for it.
 func (i *promptHookInput) adopt() {
-	i.SessionID = adoptGrok(i.SessionID, i.grokEnvelope.SessionID)
+	i.SessionID = adoptGrok(adoptGrok(i.SessionID, i.grokEnvelope.SessionID), i.ConversationID)
 	i.WorkspaceRoots = adoptGrokRoots(i.WorkspaceRoots, i.WorkspaceRoot)
 }
 
@@ -169,7 +173,11 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 	// The failure the user just reported is worth capturing whether or not
 	// this prompt also earns a recall, so it is decided before the gates that
 	// silence the recall path.
-	nudge := failureNudge(dir, string(input.Prompt))
+	// The envelope comes off before anything is decided: a person's question
+	// with the host's reminder appended is still the question, and the
+	// reminder's own words are not what to search for (#3156).
+	asked := digest.StripHarnessBlocks(string(input.Prompt))
+	nudge := failureNudge(dir, asked)
 	// Nobody asked. A harness delivers its own plumbing as the next user turn —
 	// a finished background task, a system reminder, a slash command's envelope
 	// — and the hook fires on it like a question. The terms are then the
@@ -177,10 +185,10 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 	// they match is another notification in another session: a block of noise
 	// injected as recalled history, under a line telling the user deja fires on
 	// noise (#3156). Same test the digest uses on transcript messages.
-	if digest.IsAgentArtifact(string(input.Prompt)) {
+	if asked == "" || digest.IsAgentArtifact(asked) {
 		return emitNudgeOnly(stdout, plain, nudge)
 	}
-	terms := prompt.Terms(string(input.Prompt))
+	terms := prompt.Terms(asked)
 	if !promptTermsWorthAsking(terms) {
 		return emitNudgeOnly(stdout, plain, nudge)
 	}
@@ -445,7 +453,7 @@ func runHookPromptMode(dir string, stdin io.Reader, stdout io.Writer, plain bool
 		// way of its own to tell "mm_status" from "decide", and the session
 		// that answers often says both — measured live, ten of the answers
 		// this hook newly returns open on the ordinary word.
-		digest, shown := search.AutoRecallDigestShowing(ss, digestBudget(confident), byIdentifying(terms, idfOf), string(input.Prompt))
+		digest, shown := search.AutoRecallDigestShowing(ss, digestBudget(confident), byIdentifying(terms, idfOf), asked)
 		if strings.TrimSpace(digest) == "" {
 			return emitNudgeOnly(stdout, plain, nudge)
 		}
@@ -999,10 +1007,15 @@ func forgetInjected(dir, sid string) {
 	// next start refusing to send back exactly what the compaction lost. On a
 	// harness whose only rows are those two, nothing was forgotten at all
 	// (#3307).
-	keys := map[string]bool{
-		hookseenKey(sid):                         true,
-		hookseenKey(sessionStartKeyPrefix + sid): true,
-		hookseenKey(onceDigestKey(sid)):          true,
+	key := hookseenKey(sid)
+	keys := map[string]bool{key: true}
+	// Only for an id that is not itself one of those keys. No harness writes a
+	// session id beginning with a prefix deja owns, and if one ever did, the
+	// prefixed forms would be another session's rows rather than this one's —
+	// so the narrow, exact behaviour is what that case gets.
+	if !hookseenPrefixed(key) {
+		keys[hookseenKey(sessionStartKeyPrefix+sid)] = true
+		keys[hookseenKey(onceDigestKey(sid))] = true
 	}
 	var kept []string
 	for _, line := range strings.Split(string(b), "\n") {
@@ -1524,4 +1537,16 @@ func weakRecallPointer(ss []model.Session, terms []string) string {
 	}
 	return fmt.Sprintf("deja: this project has history on %q from %s%s — call recall with a specific token if it matters here.\n",
 		search.SafeLine(topic), when, more)
+}
+
+// hookseenPrefixed reports whether a key already carries one of the prefixes
+// deja writes its own rows under, so a session id shaped like one of them does
+// not reach across into another session's rows.
+func hookseenPrefixed(key string) bool {
+	for _, p := range []string{sessionStartKeyPrefix, "once:", "agy:"} {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }

@@ -396,25 +396,6 @@ func IsToolCallRecord(line string) bool {
 	return toolCallRecordRE.MatchString(line)
 }
 
-// hookEchoRE matches a host repeating what a hook returned. Claude Code writes
-// `UserPromptSubmit says: …`, `SessionStart:compact says: …` and
-// `⎿ SessionStart:startup says: …` into the transcript under the user role, so
-// deja's own status line comes back as something the person said and can be
-// quoted as the session's title (#3168).
-//
-// The event has to be one a harness actually fires, not merely a capitalised
-// word: "Vlad says: rebase first" opens a message the same way and is the
-// person's. Optional `:variant` for the spellings Claude Code uses —
-// SessionStart:startup, PreCompact:manual.
-var hookEchoRE = regexp.MustCompile(`^(?:⎿\s*)?(?:` + strings.Join([]string{
-	"SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-	"PostToolUseFailure", "PreToolUseResult", "PreCompact", "SubagentStop", "Stop",
-	"Notification", "PreInvocation", "BeforeShellExecution", "AfterShellExecution",
-	"BeforeReadFile", "AfterFileEdit",
-}, "|") + `)(?::[A-Za-z]+)? says: `)
-
-func isHookEcho(t string) bool { return hookEchoRE.MatchString(t) }
-
 func noisyMessage(s string) bool {
 	t := strings.TrimSpace(s)
 	if t == "" {
@@ -425,23 +406,13 @@ func noisyMessage(s string) bool {
 	// <teammate-message ...>" — slipped past the prefix check and reached the
 	// session-start block, where truncated inter-agent JSON was among the first
 	// things an agent read. Nobody writes these tags in prose.
-	for _, p := range []string{"<local-command", "<command-", "<task-notification", "<teammate-message", "<bash-", "<system-reminder"} {
+	for _, p := range []string{"<local-command", "<command-", "<task-notification", "<teammate-message", "<bash-", "<system-reminder", "<deja-recall"} {
 		if strings.Contains(t, p) {
 			return true
 		}
 	}
 	// Prose, so only where it opens the message.
-	if strings.HasPrefix(t, "Caveat:") {
-		return true
-	}
-	if isHookEcho(t) {
-		return true
-	}
-	// deja's own block, echoed back into the transcript under a user role by a
-	// host that records what a hook returned. It is in the artifact list and
-	// was not here, so a line out of deja's recall could still be picked as the
-	// session's title — recall quoting itself (#3168).
-	if strings.Contains(t, "<deja-recall>") {
+	if strings.HasPrefix(t, "Caveat:") || IsCompactionSummary(t) || IsHookStatusLine(t) {
 		return true
 	}
 	if strings.Contains(t, "tool_use") || strings.Contains(t, "tool_result") {
@@ -596,47 +567,24 @@ var agentArtifactMarkers = []string{
 	`{"type":`,
 }
 
-// isCompactionSummary recognises the block a harness writes as the first user
-// turn after a context compaction. It is the agent's own summary of the session
-// so far, not something the user said, and as a session title it reads
-// "Summary: 1. Primary Request and Intent: - MOST R…" — which says nothing
-// about the session while pushing the real question out of the line (#3157).
-//
-// Two shapes, both anchored: the resumption preamble, and "Summary:" followed
-// by the numbered heading that always opens one. An ordinary message that
-// happens to begin "Summary:" carries neither and stays a title.
-func isCompactionSummary(trimmed string) bool {
-	if strings.HasPrefix(trimmed, "This session is being continued from a previous conversation") {
-		return true
-	}
-	if !strings.HasPrefix(trimmed, "Summary:") {
-		return false
-	}
-	head := trimmed
-	if len(head) > 400 {
-		head = head[:400]
-	}
-	return strings.Contains(head, "1. Primary Request and Intent")
-}
-
 func IsAgentArtifact(text string) bool {
 	for _, m := range agentArtifactMarkers {
 		if strings.Contains(text, m) {
 			return true
 		}
 	}
+	// deja's own block echoed back by the harness is plumbing wherever it
+	// sits in the message (#3178).
+	if strings.Contains(text, "<deja-recall>") {
+		return true
+	}
 	trimmed := strings.TrimSpace(text)
+	if IsCompactionSummary(trimmed) || IsHookStatusLine(trimmed) {
+		return true
+	}
 	// Harness preambles injected as user turns: <environment_context>,
 	// <user_instructions> and similar XML-wrapped plumbing.
 	if strings.HasPrefix(trimmed, "<") && strings.Contains(trimmed, "</") {
-		return true
-	}
-	if isCompactionSummary(trimmed) {
-		return true
-	}
-	// The host repeating a hook's own status line back into the transcript,
-	// and deja's block echoed with it (#3168).
-	if isHookEcho(trimmed) || strings.Contains(trimmed, "<deja-recall>") {
 		return true
 	}
 	// ls dumps recorded under a user role.
@@ -669,6 +617,47 @@ func IsAgentArtifact(text string) bool {
 	return false
 }
 
+// compactionOutlineRE is the numbered outline the summary opens with; a person
+// asking "Summary: what is the Primary Request and Intent here?" has no "1.".
+var compactionOutlineRE = regexp.MustCompile(`^Summary:\s*1\.\s*Primary Request and Intent`)
+
+// IsCompactionSummary reports whether a message is the block a harness writes
+// as the first user turn after a compaction — Claude Code's "Summary: 1.
+// Primary Request and Intent: …" and the "This session is being continued
+// from a previous conversation" preamble in front of it. The model wrote it
+// and the host filed it under the user's role, so as a title it named a
+// session "Summary: 1. Primary Request and Intent: - MOST R…" and told the
+// reader nothing (#3157). Judged on the opening, since a person can write
+// "Summary:" and go on to say something.
+func IsCompactionSummary(t string) bool {
+	t = strings.TrimSpace(t)
+	if strings.HasPrefix(t, "This session is being continued from a previous conversation") {
+		return true
+	}
+	head := t
+	if len(head) > 300 {
+		head = head[:300]
+	}
+	return strings.HasPrefix(t, "Summary:") && compactionOutlineRE.MatchString(head)
+}
+
+// hookStatusLineRE is the shape Claude Code uses to record what a hook said
+// in its systemMessage: `UserPromptSubmit says: …`, `SessionStart:compact
+// says: …`, sometimes behind the tree glyph. Only the host's event names
+// count — "Vlad says: no" is a person. The line is deja's own status
+// bar coming back through the transcript under the user role, and it was
+// quoted as a session title: "you have been here: 'UserPromptSubmit says:
+// deja-vu — you have been h…'" (#3168).
+var hookStatusLineRE = regexp.MustCompile(`^(?:⎿\s*)?(?:SessionStart|SessionEnd|UserPromptSubmit|PreToolUse|PostToolUse|PostToolUseFailure|PreCompact|Stop|SubagentStart|SubagentStop|Notification|PermissionRequest|Setup)(?::[a-z]+)? says: `)
+
+// IsHookStatusLine reports whether a message is nothing but a hook's status
+// line — the bar pasted on its own, no question under it. With a question
+// under it the message is the person's; StripHarnessBlocks takes the bar off.
+func IsHookStatusLine(t string) bool {
+	t = strings.TrimSpace(t)
+	return hookStatusLineRE.MatchString(t) && strings.TrimSpace(stripHookStatusLines(t)) == ""
+}
+
 // compactedHalf returns what the harness said the session was about before the
 // compaction, when its summary is the first thing in the session — the shape a
 // resumed session has, and the only place the earlier half survives. Empty for
@@ -683,7 +672,7 @@ func compactedHalf(s model.Session) string {
 			continue
 		}
 		trimmed := strings.TrimSpace(m.Text)
-		if !isCompactionSummary(trimmed) {
+		if !IsCompactionSummary(trimmed) {
 			return ""
 		}
 		return compactionIntent(trimmed)
@@ -790,13 +779,8 @@ func Handoff(s model.Session, budget int) string {
 	if i := strings.Index(body, "\n"); i > 0 && strings.HasPrefix(body, "# deja share:") {
 		body = strings.TrimSpace(body[i:])
 	}
-	// A session resumed after a compaction opens on the harness's summary of
-	// the half it dropped, and that summary is the only record of what the
-	// work was: without it the handoff's problem statement is whatever the
-	// person typed after the resume — "продолжай" (#3266). It is the
-	// harness's text rather than theirs, so it is named as such and kept
-	// short, and it is taken only when it opens the session: a summary with
-	// the person's own turns above it adds nothing they did not already say.
+	// What the compaction threw away, when the harness's own summary is all
+	// that is left of it (#3366).
 	if earlier != "" {
 		body = "## Earlier, from the harness's summary of the compacted half\n\n" +
 			earlier + "\n\n" + body

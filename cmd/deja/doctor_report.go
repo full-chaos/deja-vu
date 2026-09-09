@@ -428,7 +428,7 @@ func doctorStoreChecks() []doctorStoreCheck {
 		{"gemini", []string{sources.GeminiRoot()}, sources.GeminiChatFiles(), sources.ParseGeminiFile},
 		{"cursor", []string{sources.CursorUserRoot(), sources.CursorCLIRoot()}, cursorFiles, parseDoctorCursor},
 		{"antigravity", sources.AntigravityRoots(), sources.AntigravityTranscripts(), sources.ParseAntigravityFile},
-		{"grok", []string{sources.GrokRoot()}, sources.GrokSessionFiles(), sources.ParseGrokFile},
+		{"grok", []string{filepath.Join(sources.GrokRoot(), "sessions")}, sources.GrokSessionFiles(), sources.ParseGrokFile},
 		{"hermes", []string{sources.HermesHome(), sources.HermesProfilesRoot()}, sources.HermesSessionFiles(), parseDoctorHermes},
 		{"qwen", []string{filepath.Join(sources.QwenRoot(), "projects")}, sources.QwenSessionFiles(), sources.ParseQwenFile},
 		{"kimi", []string{filepath.Join(sources.KimiRoot(), "sessions")}, sources.KimiSessionFiles(), sources.ParseKimiFile},
@@ -446,7 +446,7 @@ func doctorStoreChecks() []doctorStoreCheck {
 		// `doctor --json` never named them and "no agent history was found on
 		// this machine" was printed on a machine whose history is theirs
 		// (#999).
-		{"cline", []string{sources.ClineSessionsDir()}, sources.ClineSessionFiles(), sources.ParseClineFile},
+		{"cline", sources.ClineStoreRoots(), sources.ClineSessionFiles(), sources.ParseClineFile},
 		{"roo", sources.RooRoots(), sources.RooTaskFiles(), sources.ParseRooTask},
 		{"deepseek", []string{sources.DeepSeekRoot()}, sources.DeepSeekSessionFiles(), sources.ParseDeepSeekFile},
 		// Zed keeps one SQLite store rather than session files, so the file
@@ -551,6 +551,15 @@ func parseDoctorHermes(path string) ([]model.Session, error) {
 
 func inspectDoctorStore(check doctorStoreCheck) (doctorStore, time.Time) {
 	store := doctorStore{Name: check.name, State: "missing", Paths: check.paths, Files: len(check.files)}
+	// A store with more than one root can be half-readable, and this loop
+	// returns on the first refusal — the walk below has said so since #816
+	// while this said the whole harness was denied (#3407).
+	denyRoot := func(path string) (doctorStore, time.Time) {
+		store.State = "denied"
+		store.Denied = path
+		store.Partial = len(check.files) > 0
+		return store, time.Time{}
+	}
 	for _, path := range check.paths {
 		if path == "" {
 			continue
@@ -558,9 +567,7 @@ func inspectDoctorStore(check doctorStoreCheck) (doctorStore, time.Time) {
 		fi, err := os.Stat(path)
 		if err != nil {
 			if os.IsPermission(err) {
-				store.State = "denied"
-				store.Denied = path
-				return store, time.Time{}
+				return denyRoot(path)
 			}
 			continue
 		}
@@ -568,18 +575,14 @@ func inspectDoctorStore(check doctorStoreCheck) (doctorStore, time.Time) {
 			f, err := os.Open(path)
 			if err != nil {
 				if os.IsPermission(err) {
-					store.State = "denied"
-					store.Denied = path
-					return store, time.Time{}
+					return denyRoot(path)
 				}
 				continue
 			}
 			_, err = f.Readdirnames(1)
 			_ = f.Close()
 			if err != nil && err != io.EOF && os.IsPermission(err) {
-				store.State = "denied"
-				store.Denied = path
-				return store, time.Time{}
+				return denyRoot(path)
 			}
 		}
 	}

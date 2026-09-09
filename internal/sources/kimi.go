@@ -35,6 +35,15 @@ func KimiSessionFiles() []string {
 	})
 }
 
+// KimiSidecarFiles lists the per-session state.json the reader opens itself
+// for the title and the working directory. doctor counted one per session as a
+// transcript it could not read (#3309).
+func KimiSidecarFiles() []string {
+	return walkFiles(filepath.Join(KimiRoot(), "sessions"), func(p string) bool {
+		return filepath.Base(p) == "state.json"
+	})
+}
+
 func LoadKimi() []model.Session { return parseFiles(KimiSessionFiles(), ParseKimiFile) }
 
 func ParseKimiFile(path string) ([]model.Session, error) {
@@ -64,6 +73,20 @@ type kimiState struct {
 	WorkDir   string `json:"workDir"`
 	CreatedAt string `json:"createdAt"`
 	UpdatedAt string `json:"updatedAt"`
+}
+
+// kimiPersonsOrigin reports whether a message's origin says a person wrote it:
+// kind "user", a skill or plugin command the person typed (Kimi marks those
+// with trigger "user-slash"), or no origin at all — the same disposition
+// Kimi's own context builder applies.
+func kimiPersonsOrigin(origin any) bool {
+	o, ok := origin.(map[string]any)
+	if !ok {
+		return true
+	}
+	kind, _ := o["kind"].(string)
+	trigger, _ := o["trigger"].(string)
+	return kind == "" || kind == "user" || strings.HasPrefix(kind, "user") || trigger == "user-slash"
 }
 
 func parseKimiFileFromOffset(path string, offset int64) ([]model.Session, error) {
@@ -107,13 +130,15 @@ func parseKimiFileFromOffset(path string, offset int64) ([]model.Session, error)
 			if role != "user" && role != "assistant" {
 				return
 			}
-			// Kimi writes everything it appends to the context under the user
-			// role and says who wrote it in message.origin.kind: the person, a
-			// <system-reminder> injection, a hook's stdout, a background task,
-			// a compaction summary. Keyed on the role alone, all of them were
-			// the person's — so deja recalled its own hook's output back as
-			// something the user said (#3199).
-			if role == "user" && !kimiUserOrigin(msg["origin"]) {
+			// Kimi appends the host's own lines under role user too — an
+			// injected reminder, a hook's wrapped stdout, a background task's
+			// notice — and names the author in origin.kind. Only the person's
+			// are user turns; a message with no origin is an older protocol's
+			// and was always the person's (#3199).
+			if role == "user" && !kimiPersonsOrigin(msg["origin"]) {
+				// The host's line still moves the clock: a session whose
+				// last record is a hook's output ended when that arrived.
+				s.Touch(parseTimeAny(m["time"]))
 				return
 			}
 			if role == "assistant" {
@@ -214,27 +239,6 @@ func parseKimiFileFromOffset(path string, offset int64) ([]model.Session, error)
 		return nil, err
 	}
 	return []model.Session{s}, err
-}
-
-// kimiUserOrigin reports that a user-role record is the person's. Kimi's own
-// Disposition keeps `user` and the user's slash commands and treats the rest —
-// `injection`, `hook_result`, `background_task`, `system_trigger`,
-// `compaction_summary` — as the host's.
-//
-// A record with no origin at all is the person's: older protocols wrote none,
-// and reading their absence as "not the user" would empty every session
-// written before the field existed.
-func kimiUserOrigin(v any) bool {
-	o, ok := v.(map[string]any)
-	if !ok {
-		return true
-	}
-	kind, _ := o["kind"].(string)
-	switch kind {
-	case "", "user", "slash_command":
-		return true
-	}
-	return false
 }
 
 // kimiText joins the text parts of an append_message content array.

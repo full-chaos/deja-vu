@@ -46,9 +46,9 @@ func TestParseHermesPGReadsRowsLikeSQLite(t *testing.T) {
 	if ss[0].Project != "hermes" || ss[0].Harness != "hermes" {
 		t.Fatalf("project/harness = %q/%q", ss[0].Project, ss[0].Harness)
 	}
-	// Same as the SQLite path: the title is the index's to derive.
+	// The title is the index's to derive (#3251).
 	if ss[0].Title != "" {
-		t.Fatalf("the parser titled the session %q", ss[0].Title)
+		t.Fatalf("title = %q, want none", ss[0].Title)
 	}
 }
 

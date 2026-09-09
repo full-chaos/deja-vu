@@ -1,7 +1,6 @@
 package sources
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,22 +14,10 @@ import (
 )
 
 // HermesHome is the Hermes root: profiles, plugins and config.yaml live here.
-//
-// HERMES_HOME is Hermes's own variable, and deja reads it for the reason
-// PrimeRoot gives: a machine that moved its store has moved it for deja too,
-// and asking for a second variable saying what the first already said is the
-// kind of silence doctor cannot explain. Before this, a relocated Hermes was
-// installed into ~/.hermes — a directory Hermes does not read — and indexed as
-// nothing (#3203). DEJA_HERMES_HOME still wins, for tests and for a store that
-// is neither.
+// HERMES_HOME is Hermes's own switch and moves install, parse and doctor
+// together; DEJA_HERMES_HOME overrides it for deja alone (#3203).
 func HermesHome() string {
-	if p := os.Getenv("DEJA_HERMES_HOME"); p != "" {
-		return p
-	}
-	if p := os.Getenv("HERMES_HOME"); p != "" {
-		return p
-	}
-	return filepath.Join(Home(), ".hermes")
+	return EnvPath("DEJA_HERMES_HOME", EnvPath("HERMES_HOME", filepath.Join(Home(), ".hermes")))
 }
 
 // Hermes keeps one SQLite store per profile under ~/.hermes/profiles/<name>,
@@ -171,57 +158,13 @@ func parseHermesDBWhere(db, where string) ([]model.Session, error) {
 	if err := cmd.Wait(); err != nil {
 		return nil, err
 	}
-	applyHermesCWD(out, hermesSessionCWD(db))
+	cwds := hermesSessionCwds(db)
+	for i := range out {
+		if cwd := cwds[out[i].ID]; cwd != "" {
+			out[i].Project = claudeProjectName(pathToProjectKey(cwd))
+		}
+	}
 	return out, nil
-}
-
-// applyHermesCWD moves each session into the project it was worked in, where
-// the store says. Sessions the table does not name keep the profile.
-func applyHermesCWD(ss []model.Session, cwd map[string]string) {
-	for i := range ss {
-		dir := strings.TrimSpace(cwd[ss[i].ID])
-		if dir == "" {
-			continue
-		}
-		if name := claudeProjectName(pathToProjectKey(dir)); name != "" {
-			ss[i].Project = name
-		}
-	}
-}
-
-// hermesSessionCWD reads where each session was worked, from the `sessions`
-// table Hermes keeps beside `messages`.
-//
-// Every session used to be stamped with the profile directory — "hermes" —
-// because the schema was read as having no working directory. It has one, and
-// the cost of missing it is that the per-prompt hook, which ranks the payload's
-// project, never served a Hermes session to the project it was about: measured
-// on a real store, the same prompt returned 2,006 bytes from ~/hermes and
-// nothing at all from the project the sessions actually name (#3257).
-//
-// Best-effort by design: an older store has no such table, and a Hermes that
-// renames the column should cost the grouping rather than the harness. A failed
-// query gives an empty map and every session keeps the profile.
-func hermesSessionCWD(db string) map[string]string {
-	out, err := exec.Command("sqlite3", "-readonly", "-json", sqliteTarget(db), ".timeout 5000",
-		"select id, coalesce(cwd,'') as cwd from sessions where cwd is not null and cwd <> ''").Output()
-	if err != nil || len(bytes.TrimSpace(out)) == 0 {
-		return nil
-	}
-	var rows []struct {
-		ID  string `json:"id"`
-		CWD string `json:"cwd"`
-	}
-	if json.Unmarshal(out, &rows) != nil {
-		return nil
-	}
-	m := make(map[string]string, len(rows))
-	for _, r := range rows {
-		if r.ID != "" && r.CWD != "" {
-			m[r.ID] = r.CWD
-		}
-	}
-	return m
 }
 
 // decodeHermesArray reads a json array of {session_id,role,content,timestamp}
@@ -264,12 +207,10 @@ func decodeHermesArray(dec *json.Decoder, project, path string) ([]model.Session
 		if len(s.Messages) == 0 {
 			continue
 		}
-		// No title from here. Setting one in the parser skipped the index's own
-		// rule: a one- or two-word opener gives way to the next user turn that
-		// can name the session (#790), and the first row is not always the
-		// user's — a store opening with the assistant's greeting was titled by
-		// the greeting (#3241, #3251). Every other parser leaves this empty
-		// unless the harness recorded a title of its own.
+		// No title here: the index derives one (the person's first line,
+		// a greeting giving way to the next turn, the agent's line when
+		// nobody typed). Titling in the parser skipped the greeting rule, so
+		// a session opened with "hi" listed as "hi" (#3241, #3251).
 		out = append(out, *s)
 	}
 	return out, nil
@@ -305,8 +246,36 @@ func nonEmptyFile(p string) bool {
 	return err == nil && fi.Size() > 0
 }
 
-// hermesProfile names the session's project after the profile directory, the
-// only grouping Hermes stores — there is no working directory in the schema.
+// hermesSessionCwds reads the directory each session was recorded in, from the
+// sessions table Hermes keeps beside messages. Stamped with the profile alone,
+// every session fell into one project, and the prompt hook — which ranks the
+// payload's project only — never served a Hermes session in the directory it
+// was about (#3257). Best effort: a store from before the table, or a row with
+// no cwd, keeps the profile.
+func hermesSessionCwds(db string) map[string]string {
+	q := `select id,cwd from sessions where cwd is not null and cwd <> ''`
+	out, err := exec.Command("sqlite3", "-readonly", "-json", sqliteTarget(db), ".timeout 5000", q).Output()
+	if err != nil {
+		return nil
+	}
+	var rows []struct {
+		ID  string `json:"id"`
+		Cwd string `json:"cwd"`
+	}
+	if json.Unmarshal(out, &rows) != nil {
+		return nil
+	}
+	cwds := make(map[string]string, len(rows))
+	for _, r := range rows {
+		if r.ID != "" && strings.TrimSpace(r.Cwd) != "" {
+			cwds[r.ID] = strings.TrimSpace(r.Cwd)
+		}
+	}
+	return cwds
+}
+
+// hermesProfile names the session's project after the profile directory when
+// the store says nothing about where the session was recorded.
 func hermesProfile(db string) string {
 	name := filepath.Base(filepath.Dir(db))
 	// The root store has no profile directory to be named after.

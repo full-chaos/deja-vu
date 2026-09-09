@@ -41,11 +41,10 @@ type claudeLine struct {
 	IsSidechain      bool   `json:"isSidechain"`
 	AgentID          string `json:"agentId"`
 	AttributionAgent string `json:"attributionAgent"`
-	// isMeta marks a user record Claude Code wrote itself: the body of a skill
-	// it loaded, a prompt a cron job re-fired, the /fork notice, an [Image: …]
-	// placeholder, the local-command caveat. 779 of them on this machine, none
-	// on an assistant record and none carrying a tool call, so a meta record is
-	// the harness talking and nothing else (#3267).
+	// IsMeta marks a user-role record Claude Code wrote itself — a loaded
+	// skill's body, a prompt a cron job re-fired, the /fork notice, an image
+	// placeholder. Indexed as the person's words, a skill body became 52
+	// questions nobody asked on one machine (#3267).
 	IsMeta bool `json:"isMeta"`
 }
 
@@ -68,6 +67,9 @@ func parseClaudeTypedFromOffset(path string, offset int64) ([]model.Session, err
 			return
 		}
 		if v.Type != "user" && v.Type != "assistant" {
+			return
+		}
+		if v.Type == "user" && v.IsMeta {
 			return
 		}
 		if v.IsSidechain && v.AgentID != "" {
@@ -95,14 +97,6 @@ func parseClaudeTypedFromOffset(path string, offset int64) ([]model.Session, err
 			if toolOut {
 				role = RoleToolOutput
 			}
-		}
-		// A meta record's text is the harness's, not the person's, so it is not
-		// a turn — dropped here rather than by a text rule, because no text rule
-		// names a skill body or a re-fired prompt. Only the text goes: the work
-		// records below still run, so a meta record that ever carries a tool
-		// call keeps it.
-		if v.IsMeta && role == "user" {
-			txt = ""
 		}
 		if txt != "" {
 			s.Messages = append(s.Messages, model.Message{Role: role, Text: txt, Time: t})

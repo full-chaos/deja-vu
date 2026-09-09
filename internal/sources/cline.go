@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -109,6 +110,18 @@ func ClineLegacyRoots() []string {
 	return out
 }
 
+// ClineStoreRoots names every directory the transcript walk covers: the
+// CLI/SDK sessions directory and each legacy extension root's tasks tree. Both
+// doctor forms read it, so the row and the machine report cannot disagree on
+// where a cline transcript is looked for (#3399).
+func ClineStoreRoots() []string {
+	roots := []string{ClineSessionsDir()}
+	for _, root := range ClineLegacyRoots() {
+		roots = append(roots, filepath.Join(root, "tasks"))
+	}
+	return roots
+}
+
 // ClineSessionFiles lists both generations' transcript files.
 func ClineSessionFiles() []string {
 	files := walkFiles(ClineSessionsDir(), func(p string) bool {
@@ -120,6 +133,18 @@ func ClineSessionFiles() []string {
 		})...)
 	}
 	return files
+}
+
+// ClineSidecarFiles lists the per-session manifest the reader opens itself for
+// the title, the working directory and the timestamps. doctor counted one per
+// session as a transcript it could not read, the same shape as #3297 (#3360).
+func ClineSidecarFiles() []string {
+	return walkFiles(ClineSessionsDir(), func(p string) bool {
+		// The manifest is named after the directory it sits in, which is what
+		// the reader opens; anything else under a session is a file deja has
+		// no account of and the row should say so.
+		return filepath.Base(p) == filepath.Base(filepath.Dir(p))+".json"
+	})
 }
 
 func LoadCline() []model.Session {
@@ -287,25 +312,25 @@ func parseClineLegacyTask(path string) ([]model.Session, error) {
 		if m.Role != "user" && m.Role != "assistant" {
 			continue
 		}
+		ts := base.Add(time.Duration(ti) * time.Second)
+		if m.Role == "user" {
+			if tool := clineTurnToolOutput(m.Content, ts); len(tool) > 0 {
+				s.Touch(ts)
+				s.Messages = append(s.Messages, tool...)
+			}
+		} else if work := rooWorkRecords(m.Content, ts); len(work) > 0 {
+			s.Touch(ts)
+			s.Messages = append(s.Messages, work...)
+		}
 		text := clineContentText(m.Content)
 		if m.Role == "user" {
 			text = unwrapClineTask(text)
 		}
-		ts := base.Add(time.Duration(ti) * time.Second)
-		// The legacy VS Code store speaks Roo's vocabulary, not the modern
-		// CLI's — the extension the two share is where both came from — so the
-		// same records come out through the same dialect. Taken before the
-		// empty-text check: a turn that only made a call carries no text, and
-		// skipping it on that alone is what left the work unindexed (#3295).
-		records := rooWorkRecords(m.Content, ts)
-		if text == "" && len(records) == 0 {
+		if text == "" {
 			continue
 		}
 		s.Touch(ts)
-		if text != "" {
-			s.Messages = append(s.Messages, model.Message{Role: m.Role, Text: text, Time: ts})
-		}
-		s.Messages = append(s.Messages, records...)
+		s.Messages = append(s.Messages, model.Message{Role: m.Role, Text: text, Time: ts})
 	}
 	if len(s.Messages) == 0 {
 		return nil, nil
@@ -326,6 +351,41 @@ var clineDialect = toolDialect{
 	commandKey:  "commands",
 	editTools:   map[string]bool{"editor": true},
 	oldKey:      "old_text",
+}
+
+// rooDialect is what the Roo Code and the legacy Cline extension call their
+// tools: execute_command with `command`, and `path` on the file tools —
+// read_file, write_to_file, apply_diff, insert_content, search_and_replace,
+// replace_in_file. Neither reader emitted a call as a work record before
+// #3295. The edit span is not read: apply_diff carries a SEARCH/REPLACE
+// block, not an old_string.
+var rooDialect = toolDialect{
+	pathKey: "path",
+	pathTools: map[string]bool{"read_file": true, "write_to_file": true, "apply_diff": true,
+		"insert_content": true, "search_and_replace": true, "replace_in_file": true},
+	shellTool: "execute_command",
+	editTools: map[string]bool{},
+}
+
+// rooWorkRecords is clineWorkRecords for the task files: the command a call
+// ran and the files it named, under the same switches.
+func rooWorkRecords(raw json.RawMessage, ts time.Time) []model.Message {
+	var blocks []any
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	var out []model.Message
+	if IndexToolPaths() {
+		if p := toolPathsIn(blocks, rooDialect); p != "" {
+			out = append(out, model.Message{Role: RoleFiles, Text: p, Time: ts})
+		}
+	}
+	if IndexCommands() {
+		for _, cmd := range commandsIn(blocks, rooDialect) {
+			out = append(out, model.Message{Role: RoleCommand, Text: cmd, Time: ts})
+		}
+	}
+	return out
 }
 
 // clineWorkRecords turns the tool blocks of one message into work records.
@@ -354,6 +414,26 @@ func clineWorkRecords(raw json.RawMessage, ts time.Time) []model.Message {
 		for _, body := range clineToolResults(blocks) {
 			out = append(out, model.Message{Role: RoleToolOutput, Text: body, Time: ts})
 		}
+	}
+	return out
+}
+
+// clineTurnToolOutput is what a turn's tool_result blocks printed, for the
+// legacy Cline and the Roo task files, which put a command's output there and
+// the person's words (if any) in text blocks beside it. Read as text blocks
+// only, a failing command's error reached neither search nor the fix pairs
+// (#3269). The same switch and the same role the modern reader uses.
+func clineTurnToolOutput(raw json.RawMessage, ts time.Time) []model.Message {
+	if !IndexToolOutput() {
+		return nil
+	}
+	var blocks []any
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	var out []model.Message
+	for _, body := range clineToolResults(blocks) {
+		out = append(out, model.Message{Role: RoleToolOutput, Text: capParsedMessage(body), Time: ts})
 	}
 	return out
 }
@@ -408,9 +488,10 @@ func clineContentText(raw json.RawMessage) string {
 }
 
 // unwrapClineTask strips the legacy <task>...</task> envelope (and its modern
-// user-input equivalent) so the tags themselves are not indexed.
+// user-input equivalent) so the tags themselves are not indexed, and the
+// host's <environment_details> block, which is not the person's words.
 func unwrapClineTask(text string) string {
-	t := stripClineHostBlocks(strings.TrimSpace(text))
+	t := stripClineHostBlocks(text)
 	for _, tag := range []string{"task", "user_message", "user_input"} {
 		open := "<" + tag
 		if !strings.HasPrefix(t, open) {
@@ -431,44 +512,6 @@ func unwrapClineTask(text string) string {
 	return t
 }
 
-// clineHostBlocks are the envelopes Roo Code and Cline append to a user turn:
-// the workspace listing, the open tabs, the clock, the running cost, the mode.
-// They are the host's words inside the person's message, so before this a query
-// on "files", "current", "time" or any open tab's path hit every Roo and Cline
-// session, and `ctx` printed the listing where the reader's own question goes
-// (#3255).
-//
-// Stripped at the parser rather than at display: the block lands in the store,
-// so every surface that reads a message sees it — search, titles, the digest,
-// the excerpt. `internal/digest/harness_blocks.go` does the same job for text
-// that only ever passes through a prompt.
-var clineHostBlocks = []string{"environment_details", "workspace_diagnostics", "slash_command"}
-
-// stripClineHostBlocks removes those blocks wherever they sit in the message.
-// Roo appends them after the task text in the same turn, so a prefix check
-// would miss every one of them.
-func stripClineHostBlocks(t string) string {
-	for _, tag := range clineHostBlocks {
-		open, close := "<"+tag+">", "</"+tag+">"
-		for {
-			i := strings.Index(t, open)
-			if i < 0 {
-				break
-			}
-			j := strings.Index(t[i:], close)
-			if j < 0 {
-				// An unterminated block runs to the end of the message: the
-				// listing was cut mid-write, and what follows it is not the
-				// person's either.
-				t = t[:i]
-				break
-			}
-			t = t[:i] + t[i+j+len(close):]
-		}
-	}
-	return strings.TrimSpace(t)
-}
-
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a
@@ -480,7 +523,9 @@ func firstNonEmpty(a, b string) string {
 // key claudeProjectName expects, so cline/roo sessions land in the same
 // project namespace as every other harness.
 func pathToProjectKey(p string) string {
-	return strings.ReplaceAll(p, "/", "-")
+	// A Windows path folds the same way: backslashes are separators too, and
+	// the drive letter's colon is not a character a key carries (#3217).
+	return strings.NewReplacer("/", "-", "\\", "-", ":", "-").Replace(p)
 }
 
 func firstLineTrim(s string) string {
@@ -501,4 +546,36 @@ func ClinePluginsDir() string {
 		return filepath.Join(p, "plugins")
 	}
 	return filepath.Join(Home(), ".cline", "plugins")
+}
+
+var clineHostBlocks = []string{"environment_details", "workspace_diagnostics", "slash_command"}
+
+func stripClineHostBlocks(text string) string {
+	t := text
+	for _, tag := range clineHostBlocks {
+		// Line-anchored: the host writes the block on its own line, and a
+		// person naming the tag inside a sentence — "why is
+		// <environment_details> in my history" — is asking about it, not
+		// pasting one (#3255).
+		open := regexp.MustCompile(`(?m)^[ \t]*<` + tag + `>[ \t]*\r?$`)
+		closeTag := "</" + tag + ">"
+		for {
+			loc := open.FindStringIndex(t)
+			if loc == nil {
+				break
+			}
+			rest := t[loc[1]:]
+			k := strings.Index(rest, closeTag)
+			if k < 0 {
+				// An unterminated block runs to the end of the message: the
+				// listing was cut mid-write, and what follows is not the
+				// person's either.
+				t = t[:loc[0]]
+				break
+			}
+			end := loc[1] + k + len(closeTag)
+			t = t[:loc[0]] + strings.TrimPrefix(t[end:], "\n")
+		}
+	}
+	return strings.TrimSpace(t)
 }

@@ -302,15 +302,27 @@ func zedSession(db string, r zedRow) (model.Session, bool) {
 		Started: started,
 		Updated: updated,
 	}
-	// Zed stores no per-message timestamp in either thread format, so every
-	// message inherits the thread's start the way aider's do. Order is carried
-	// by the array itself, which is what recall actually reads.
+	// Zed stores no per-message timestamp in either thread format, so the place
+	// in the array is the only clock there is, and it becomes one: the thread's
+	// start plus a millisecond per record. Sharing one stamp made two turns
+	// that say the same thing — the same file read twice, the same command run
+	// twice — indistinguishable to the ingest's duplicate check, which dropped
+	// 1385 of this machine's 6767 Zed messages (#3333).
+	at := started
+	tick := func() time.Time {
+		t := at
+		at = at.Add(time.Millisecond)
+		return t
+	}
 	for _, raw := range th.Messages {
 		role, text := zedMessage(raw)
 		if text != "" && !HarnessAuthored(role) {
-			s.Messages = append(s.Messages, model.Message{Role: role, Text: text, Time: started})
+			s.Messages = append(s.Messages, model.Message{Role: role, Text: text, Time: tick()})
 		}
-		s.Messages = append(s.Messages, zedWork(raw, started)...)
+		for _, w := range zedWork(raw, started) {
+			w.Time = tick()
+			s.Messages = append(s.Messages, w)
+		}
 	}
 	if len(s.Messages) == 0 {
 		return model.Session{}, false
@@ -417,13 +429,11 @@ func zedMessage(raw json.RawMessage) (role, text string) {
 // measured there: 797 ToolUse blocks against 69 Agent.Text ones, so the parser
 // was indexing the talk and none of the work.
 //
-// What came back is here too, and this said otherwise. An Agent message carries
-// `tool_results`, a map keyed by tool_use_id holding `tool_name`, `is_error`,
-// `content: {Text: …}` and `output`. Measured on a real store of 30 threads:
-// 3,059 results, 141 of them errors, 98 carrying "failed with exit code" — none
-// of it indexed, so `deja fix` had nothing to pair an error with and a search
-// for a failure that happened in Zed answered "this index holds no tool
-// records at all" (#3291).
+// Tool results ride on the same agent message, `tool_results` keyed by the
+// call id — tool_name, is_error, content.Text and output. This comment used
+// to say Zed stores the call and not what came back; a real store held 3059
+// results, 97 of them failed terminal runs, and none reached search or the
+// fix pairs (#3291). They are indexed as tool output like every other reader's.
 //
 // Modern threads only. An agent-1 message carries `segments` rather than a
 // tagged content array, and whether tool calls appear there is not something
@@ -451,12 +461,8 @@ func zedWork(raw json.RawMessage, t time.Time) []model.Message {
 				Input json.RawMessage `json:"input"`
 			} `json:"ToolUse"`
 		} `json:"content"`
-		// Keyed by tool_use_id, so the order is the map's; the results are
-		// sorted below to keep a rebuild's records stable.
 		ToolResults map[string]struct {
-			ToolName string `json:"tool_name"`
-			IsError  bool   `json:"is_error"`
-			Content  struct {
+			Content struct {
 				Text string `json:"Text"`
 			} `json:"content"`
 			Output json.RawMessage `json:"output"`
@@ -467,6 +473,28 @@ func zedWork(raw json.RawMessage, t time.Time) []model.Message {
 	}
 	var out []model.Message
 	var paths []string
+	if IndexToolOutput() && len(msg.ToolResults) > 0 {
+		// A map, so the order is fixed by the call id rather than by the
+		// decoder: the same thread indexes the same way twice.
+		ids := make([]string, 0, len(msg.ToolResults))
+		for id := range msg.ToolResults {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		for _, id := range ids {
+			r := msg.ToolResults[id]
+			text := strings.TrimSpace(r.Content.Text)
+			if text == "" {
+				var s string
+				if json.Unmarshal(r.Output, &s) == nil {
+					text = strings.TrimSpace(s)
+				}
+			}
+			if text != "" {
+				out = append(out, model.Message{Role: RoleToolOutput, Text: capParsedMessage(text), Time: t})
+			}
+		}
+	}
 	for _, block := range msg.Content {
 		if block.ToolUse == nil {
 			continue
@@ -482,39 +510,7 @@ func zedWork(raw json.RawMessage, t time.Time) []model.Message {
 	if len(paths) > 0 && IndexToolPaths() {
 		out = append(out, model.Message{Role: RoleFiles, Text: strings.Join(dedupeStrings(paths), "\n"), Time: t})
 	}
-	if IndexToolOutput() && len(msg.ToolResults) > 0 {
-		ids := make([]string, 0, len(msg.ToolResults))
-		for id := range msg.ToolResults {
-			ids = append(ids, id)
-		}
-		sort.Strings(ids)
-		for _, id := range ids {
-			r := msg.ToolResults[id]
-			text := strings.TrimSpace(r.Content.Text)
-			if text == "" {
-				text = strings.TrimSpace(zedResultOutput(r.Output))
-			}
-			if text == "" {
-				continue
-			}
-			out = append(out, model.Message{Role: RoleToolOutput, Text: capParsedMessage(text), Time: t})
-		}
-	}
 	return out
-}
-
-// zedResultOutput reads the `output` field, which Zed writes as a string on the
-// results seen and leaves free to be a structure. Only a string is text; a
-// structure has already been rendered into content.Text where it matters.
-func zedResultOutput(raw json.RawMessage) string {
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
-	}
-	return ""
 }
 
 // zedCommand is the shell line a terminal call ran, or "" when the call is not
@@ -625,9 +621,20 @@ func zedContentText(body json.RawMessage, keep ...string) string {
 			if err := json.Unmarshal(raw, &part); err != nil {
 				// Mention is a struct, not a string.
 				var m struct {
-					Content string `json:"content"`
+					URI     json.RawMessage `json:"uri"`
+					Content string          `json:"content"`
 				}
 				if err := json.Unmarshal(raw, &m); err != nil {
+					continue
+				}
+				var kind map[string]json.RawMessage
+				_ = json.Unmarshal(m.URI, &kind)
+				// A thread mention carries Zed's own summary of a conversation
+				// deja has already indexed under its own id, and it stood above
+				// the sentence the person typed: 48798 characters of it across
+				// the twelve mentions on a real store (#3336). Every other kind
+				// — a selection, a file — is what they attached on purpose.
+				if _, ok := kind["Thread"]; ok {
 					continue
 				}
 				part = m.Content

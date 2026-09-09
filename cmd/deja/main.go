@@ -891,7 +891,7 @@ func cmdCtx(dir string, rest []string) error {
 	} else {
 		for _, a := range rest {
 			if strings.HasPrefix(a, "--") {
-				return fmt.Errorf("ctx takes no flags, only a query or id-prefix — got %q", a)
+				return fmt.Errorf("ctx takes no flags, only a query or id-prefix — got %q; a question that starts with a dash goes after `--`", a)
 			}
 		}
 	}
@@ -951,10 +951,13 @@ func cmdCtx(dir string, rest []string) error {
 	var hits []search.Hit
 	if result.Tier == search.TierError {
 		fmt.Fprintln(os.Stderr, "deja: matched by error signature; showing the sessions that hit it")
-		hits = search.ErrorHits(ss)
+		// Both tiers below build their own hits and never went through the cap
+		// in RunDetailed, so `--limit 3` printed the whole window — fifty
+		// sessions — and so did a query with no flag (#3345).
+		hits, _ = capTierHits(search.ErrorHits(ss), o)
 	} else if result.Tier == search.TierRelevance {
 		fmt.Fprintln(os.Stderr, "deja: no exact match; showing sessions ranked by relevance to the whole query")
-		hits = search.RelevanceHitsWeighted(ss, index.RelevanceMatchTerms(o.Query), result.TermIDF)
+		hits, _ = capTierHits(search.RelevanceHitsWeighted(ss, index.RelevanceMatchTerms(o.Query), result.TermIDF), o)
 	} else if hits, err = search.Run(ss, o); err != nil {
 		return err
 	}
@@ -1310,6 +1313,9 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		if o.Total < len(hits) {
 			o.Total = len(hits)
 		}
+		var capped bool
+		hits, capped = capTierHits(hits, o)
+		o.Capped = o.Capped || capped
 	case search.TierRelevance:
 		fmt.Fprintln(os.Stderr, "deja: no exact match; showing sessions ranked by relevance to the whole query")
 		hits = search.RelevanceHitsWeighted(ss, index.RelevanceMatchTerms(o.Query), result.TermIDF)
@@ -1325,6 +1331,9 @@ func searchWithOptions(dir string, args []string, sourceInstance string, bare bo
 		if o.Total < len(hits) {
 			o.Total = len(hits)
 		}
+		var relCapped bool
+		hits, relCapped = capTierHits(hits, o)
+		o.Capped = o.Capped || relCapped
 	default:
 		// RunDetailed rather than Run: the JSON envelope reports how many
 		// sessions matched before the cap, and that is not recoverable from a
@@ -2333,6 +2342,12 @@ func parseLast(args []string) (int, search.Options, string, error) {
 			}
 		default:
 			if strings.HasPrefix(a, "-") {
+				if flagName(a) == "--limit" {
+					// The two commands beside this one take --limit, so the
+					// reader is carrying it over rather than guessing; the
+					// count last takes is a bare argument (#3405).
+					return n, o, sinceRaw, fmt.Errorf("last: unknown flag %q — the count is a bare argument, `deja last 3`", a)
+				}
 				return n, o, sinceRaw, fmt.Errorf("last: unknown flag %q", a)
 			}
 			// The only bare argument last takes is the count. Dropping anything
@@ -2602,7 +2617,11 @@ func parseBlame(args []string) (string, search.BlameOptions, bool, error) {
 			}
 		default:
 			if strings.HasPrefix(a, "-") {
-				return "", o, false, fmt.Errorf("blame: unknown flag %q", a)
+				if flagName(a) == "--limit" {
+					// blame widens with --all rather than a count (#3405).
+					return "", o, false, fmt.Errorf("blame: unknown flag %q — it takes --all to show every session", a)
+				}
+				return "", o, false, fmt.Errorf("blame: unknown flag %q; a path or question that starts with a dash goes after `--`", a)
 			}
 			if path != "" {
 				return "", o, false, fmt.Errorf("blame accepts one path")
@@ -3076,7 +3095,7 @@ func printSources(dir string) {
 	if fi, err := os.Stat(sources.OpencodeDB()); err == nil {
 		size = fi.Size()
 	}
-	s, m, _ := sources.OpencodeCounts()
+	s, m, countErr := sources.OpencodeCounts()
 	// The counts come out of sqlite, which knows nothing about the exclude
 	// list, so with a pattern in force this row kept reporting sessions that
 	// are not indexed, not searchable and not exported while every other row
@@ -3108,6 +3127,21 @@ func printSources(dir string) {
 	}
 	if opencodeExcluded > 0 {
 		note += fmt.Sprintf("\texcluded-sessions=%d", opencodeExcluded)
+	}
+	// A store sqlite could not open — locked past the timeout, or a file the
+	// reader may not open — looked like one nobody had used, the shape #1000
+	// fixed for the file stores (#3190).
+	if countErr != nil && sources.SQLite3Available() {
+		reason := "sqlite3: " + countErr.Error()
+		if line := sources.ExitStderrLine(countErr); line != "" {
+			reason = "sqlite3: " + line
+		}
+		if f, err := os.Open(sources.OpencodeDB()); err != nil {
+			reason = err.Error()
+		} else {
+			f.Close()
+		}
+		note = "\t(cannot be read — " + reason + ")" + note
 	}
 	fmt.Printf("opencode\t%s\tsessions=%d messages=%d size=%s redacted=%d%s\n", sources.OpencodeDB(), s, m, humanBytes(size), redactions[sources.OpencodeDB()], note)
 }
@@ -3331,6 +3365,12 @@ func runForget(dir string, args []string) error {
 		shared = sharedRowsAmong(dir, pr.Keys)
 	}
 	result, err := index.Forget(dir, o)
+	if !o.DryRun {
+		// The digests cached beside the index quote sessions as prose, and a
+		// forget left them there: recall never served them past their minute,
+		// and the text was still on the disk (#3411).
+		dropHookCaches(dir)
+	}
 	if err != nil {
 		// The tombstone is already written; what failed is the rebuild that
 		// takes the records out. Handing back `mkdir /…/idx.tmp: permission
@@ -4529,4 +4569,31 @@ func betweenAll(s, marker string) []string {
 		out = append(out, strings.TrimSpace(rest[:j]))
 		s = rest[j+len(marker):]
 	}
+}
+
+// flagName is the flag without its value, so `--limit=3` and `--limit 3` are
+// recognised as the same spelling.
+func flagName(a string) string {
+	if i := strings.IndexByte(a, '='); i >= 0 {
+		return a[:i]
+	}
+	return a
+}
+
+// capTierHits bounds the two tiers that build their own hits — the ranked
+// relevance list and the error signature — which never went through the cap in
+// RunDetailed: `--limit 3` printed the whole retrieval window of fifty
+// sessions there while the exact tier printed three (#3345). With no flag they
+// keep the window they have always served, which the JSON envelope's own test
+// pins; only what the reader asked for binds them.
+func capTierHits(hits []search.Hit, o search.Options) ([]search.Hit, bool) {
+	if o.Limit == 0 {
+		return hits, false
+	}
+	// A limit the reader typed binds even beside --all, which is how the exact
+	// tier has always read the pair: --all lifts the default, and the number
+	// asked for is still the number wanted. Letting --all win here made the
+	// same two flags mean opposite things depending on which tier answered
+	// (review of #3345).
+	return search.CapHits(hits, o.Limit, false)
 }
