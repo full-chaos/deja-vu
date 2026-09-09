@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "revision": 1,
+  "rules": [
+    {
+      "id": "INS-telemetry",
+      "revision": 1,
+      "kind": "constraint",
+      "text": "Validate telemetry before closing this task.",
+      "authority": "owner",
+      "status": "active",
+      "strength": "must",
+      "absolute": true,
+      "priority": 100,
+      "scope": {},
+      "lifetime": "persistent",
+      "source": "file://synthetic/acceptance.md#telemetry"
+    }
+  ]
+}

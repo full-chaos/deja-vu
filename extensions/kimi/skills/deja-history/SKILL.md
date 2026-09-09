@@ -3,7 +3,11 @@ name: deja-history
 description: Search the user's past AI coding sessions. Use when they say things like 'didn't we fix this before', 'what did we decide about X', or before re-debugging an error that may already be solved.
 ---
 
-Search deja before re-deriving past work: when the user refers to earlier sessions or decisions, before debugging an error, and before implementing something that may already exist. It searches this machine's own history across every AI coding tool used on it, going back further than deja itself was installed.
+At the beginning of substantive work, call the listed `deja` tool with `mode: "ctx_resume"` for the current workspace and active task when known. Treat applicable `absolute` and `required` instructions in the returned context as binding. Use that packet before independently reconstructing project history.
+
+Retrieve historical memory or another source only when ctx reports a required gap, the snapshot is stale or invalid, the task requires source-of-truth verification, or more evidence is necessary. After meaningful durable progress, call the listed `deja` tool with `mode: "ctx_checkpoint"` and confirmed findings, decisions, implementation state, failures, test results, unresolved questions, and next actions. Do not checkpoint private reasoning.
+
+Search deja only when ctx needs historical evidence: when the user refers to earlier sessions or decisions, before debugging an error, and before implementing something that may already exist. It searches this machine's own history across every AI coding tool used on it, going back further than deja itself was installed.
 
 If these tools are not available in this session, the same index is reachable through the shell: `deja search --json "<query>"`, `deja ctx <query>`, `deja blame <path> --json`.
 

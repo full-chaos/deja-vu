@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "revision": 7,
+  "rules": [
+    {
+      "id": "repo.validate-before-close",
+      "revision": 1,
+      "kind": "constraint",
+      "text": "Run the relevant validation before declaring the task complete.",
+      "authority": "owner",
+      "status": "active",
+      "strength": "must",
+      "absolute": true,
+      "priority": 100,
+      "scope": {},
+      "lifetime": "persistent",
+      "source": "file:///workspace/AGENTS.md"
+    }
+  ]
+}

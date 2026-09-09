@@ -10,6 +10,9 @@ import (
 
 func TestCtxCacheCLIIsLocalAndPreservesLegacyCtx(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("USERPROFILE", root)
+	t.Setenv("DEJA_INSTRUCTIONS_FILE", filepath.Join(root, "instructions.json"))
 	t.Setenv("DEJA_CTX_DIR", filepath.Join(root, "ctx"))
 	repo := filepath.Join(root, "repo")
 	if err := os.Mkdir(repo, 0700); err != nil {
@@ -21,7 +24,7 @@ func TestCtxCacheCLIIsLocalAndPreservesLegacyCtx(t *testing.T) {
 		t.Fatal(err)
 	}
 	out.Reset()
-	if err := runCtxCache(filepath.Join(root, "index.db"), []string{"resume", "--workspace", repo, "--task", "T-1", "--budget", "1000"}, strings.NewReader(""), &out); err != nil {
+	if err := runCtxCache(filepath.Join(root, "index.db"), []string{"resume", "--workspace", repo, "--task", "T-1", "--budget", "10000"}, strings.NewReader(""), &out); err != nil {
 		t.Fatal(err)
 	}
 	var result struct {
@@ -40,6 +43,9 @@ func TestCtxCacheCLIIsLocalAndPreservesLegacyCtx(t *testing.T) {
 
 func TestCtxCacheMCPModesAndAliases(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("USERPROFILE", root)
+	t.Setenv("DEJA_INSTRUCTIONS_FILE", filepath.Join(root, "instructions.json"))
 	t.Setenv("DEJA_CTX_DIR", filepath.Join(root, "ctx"))
 	repo := filepath.Join(root, "repo")
 	if err := os.Mkdir(repo, 0700); err != nil {

@@ -194,10 +194,11 @@ search historical sessions unless `lookup` is explicitly requested:
 | --- | --- |
 | `deja ctx resume [--workspace PATH] [--task ID] [--budget TOKENS]` | Return the newest bounded snapshot and say whether it is a hit, miss, or stale. |
 | `deja ctx checkpoint [--workspace PATH] [--task ID]` | Read structured durable state as JSON from stdin; private reasoning should not be included. |
-| `deja ctx status` / `deja ctx refresh` | Explain component freshness or update only changed identity/Git metadata. |
+| `deja ctx status` / `deja ctx refresh` | Explain component freshness or incrementally reconcile changed identity, Git, instruction, and task metadata. |
 | `deja ctx diff` / `deja ctx history` | Inspect immutable snapshot history and working-state changes. |
 | `deja ctx explain --item ID` | Show why a checkpoint item is active and where it came from. |
-| `deja ctx invalidate [--layer NAME]` | Mark all context or one component stale. |
+| `deja ctx promote --item ID --to project\|task\|permanent\|ephemeral` | Change an item's retention layer without rewriting its provenance. |
+| `deja ctx invalidate [--layer NAME] [--source ALIAS]` | Mark all context or one component/source stale. |
 | `deja ctx lookup --query TEXT` | Explicitly cross into historical retrieval for omitted evidence or a required gap. |
 
 Checkpoint JSON accepts `objective`, `status`, `project`, `confirmed`,
@@ -208,6 +209,25 @@ Every item carries a stable `id`, concise `text`, and provenance `source`.
 and gap counters. Git HEAD, branch, and dirty-worktree changes are tracked
 independently; refresh records a required validation gap instead of pretending
 that cached task conclusions were automatically re-proven.
+
+Agents should resume before recall: at the start of substantive work, use
+`ctx resume` for the workspace and active task, follow applicable `absolute`
+and `required` instructions, and retrieve historical memory only for a reported
+gap, stale/invalid context, source-of-truth verification, or needed evidence.
+Checkpoint durable conclusions after meaningful progress, never private
+reasoning. MCP agents call the listed `deja` tool with `mode: "ctx_resume"`
+and later `mode: "ctx_checkpoint"`; legacy `deja_ctx_*` aliases remain only for
+already-wired clients. See the [context-cache reference](docs/ctx-cache.md) for the packet,
+freshness, retention, and MCP contracts.
+
+**Native instructions**
+
+`deja instructions` is an experimental, opt-in advisory delivery path for
+standing instructions, separate from historical memory. It supports `example`,
+`apply`, `export`, `resolve`, `hook`, and `install`. The registry path is
+`DEJA_INSTRUCTIONS_FILE` when set, otherwise `$XDG_CONFIG_HOME/deja/instructions.json`
+(or `~/.config/deja/instructions.json`). `ctx` resolves applicable approved
+instructions without semantic recall.
 
 <details>
 <summary>Using what it finds, and moving it between machines</summary>
@@ -242,14 +262,15 @@ Full reference: [commands](https://vshulcz.github.io/deja-vu/guide/commands.html
 The server exposes one tool, `deja`, with a `mode`. `deja install` wires it in, so
 this is only needed to configure an agent by hand. The six older tool names
 (`recall`, `recall_context`, `blame`, `fix`, `how`, `remember`) still answer for
-anything already wired to them.
+anything already wired to them. The unlisted `deja_ctx_*` names are also legacy
+aliases; agents should call `deja` with the corresponding `ctx_*` mode.
 
 <details>
 <summary>Arguments and return shapes</summary>
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `deja` | `mode`, plus `query`, `path`, `error`, `what`, `text`, `tags?`, `harness?`, `project?`, `since?`, `limit?`, `offset?`, `all?`, `workspace?`, `task_id?`, `token_budget?`, `state?`, `item_id?`, `layer?` | Depends on the mode, below. |
+| `deja` | `mode`, plus `query`, `path`, `error`, `what`, `text`, `tags?`, `harness?`, `project?`, `since?`, `limit?`, `offset?`, `all?`, `workspace?`, `task_id?`, `token_budget?`, `component_versions?`, `state?`, `item_id?`, `layer?`, `source?`, `to?` | Depends on the mode, below. |
 
 | Mode | Arguments it reads | Returns |
 | --- | --- | --- |

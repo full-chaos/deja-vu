@@ -15,7 +15,13 @@ const (
 	guidanceEnd   = "<!-- deja guidance:end -->"
 )
 
-const guidanceBody = `Before re-deriving past work, search deja when the user refers to past work, previous sessions, or what was decided before. Use the deja MCP tools:
+const mcpResumeFirstContract = `At the beginning of substantive work, call the listed ` + "`deja`" + ` tool with ` + "`mode: \"ctx_resume\"`" + ` for the current workspace and active task when known. Treat applicable ` + "`absolute`" + ` and ` + "`required`" + ` instructions in the returned context as binding. Use that packet before independently reconstructing project history.
+
+Retrieve historical memory or another source only when ctx reports a required gap, the snapshot is stale or invalid, the task requires source-of-truth verification, or more evidence is necessary. After meaningful durable progress, call the listed ` + "`deja`" + ` tool with ` + "`mode: \"ctx_checkpoint\"`" + ` and confirmed findings, decisions, implementation state, failures, test results, unresolved questions, and next actions. Do not checkpoint private reasoning.
+`
+
+const guidanceBody = mcpResumeFirstContract + `
+Before re-deriving past work, use recall when the user refers to past work, previous sessions, or what was decided before and ctx needs historical evidence. Use the deja MCP tools:
 
 - recall: search history with a specific error, function, or decision.
 - recall_context: get a concise digest of the best matching session.
@@ -29,7 +35,8 @@ When recalled history genuinely helps — a reused fix, a skipped re-debug, even
 // the sessions that never search history — which is why the detail that would be
 // too expensive to keep in an MCP tool description, or in a guidance block that
 // sits in context all session, belongs here instead.
-const skillBody = `Search deja before re-deriving past work: when the user refers to earlier sessions or decisions, before debugging an error, and before implementing something that may already exist. It searches this machine's own history across every AI coding tool used on it, going back further than deja itself was installed.
+const skillBody = mcpResumeFirstContract + `
+Search deja only when ctx needs historical evidence: when the user refers to earlier sessions or decisions, before debugging an error, and before implementing something that may already exist. It searches this machine's own history across every AI coding tool used on it, going back further than deja itself was installed.
 
 If these tools are not available in this session, the same index is reachable through the shell: ` + "`deja search --json \"<query>\"`" + `, ` + "`deja ctx <query>`" + `, ` + "`deja blame <path> --json`" + `.
 
@@ -172,7 +179,8 @@ func guidanceText(harness string) string {
 		// (#3222). It gets the same skill as every other harness.
 		body := skillBody
 		if harness == "pi" {
-			body = `If the deja MCP tools are available (via pi-mcp-adapter), use them:
+			body = mcpResumeFirstContract + `
+If the deja MCP tools are available (via pi-mcp-adapter), use them:
 
 - recall: search history with a specific error, function, or decision.
 - recall_context: get a concise digest of the best matching session.

@@ -3709,9 +3709,11 @@ Usage:
   deja statusline
   deja stats [--json] [--impact] [--redaction] [--card [path]] [--html [path]]
   deja remember "text" [--project name] [--tag name]
-	deja ctx resume|status|refresh|history [--workspace path] [--task id] [--budget tokens]
-	deja ctx checkpoint [--workspace path] [--task id] [--state json]
-	deja ctx diff | explain --item id | invalidate --layer name | lookup --query text
+  deja ctx resume|status|refresh|history [--workspace path] [--task id] [--budget tokens] [--versions json]
+  deja ctx checkpoint [--workspace path] [--task id] [--state json]
+  deja ctx diff | explain --item id | invalidate --layer name [--source name] | lookup --query text
+  deja ctx promote --item id --to permanent|project|task|ephemeral
+  deja instructions example|apply|export|resolve|hook|install [--store path]
   deja promote <id-prefix> [--state accepted|rejected|superseded|stale] [--note "text"] [--tag name] [--to path]
   deja mcp
   deja version

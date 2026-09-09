@@ -16,7 +16,11 @@ metadata:
         bins: [deja]
 ---
 
-Search deja before re-deriving past work: when the user refers to earlier sessions or decisions, before debugging an error, and before implementing something that may already exist. It searches this machine's own history across every AI coding tool used on it, going back further than deja itself was installed.
+At the beginning of substantive work, run `deja ctx resume --workspace "$PWD"` and include `--task <active-task-id>` when known. Treat applicable `absolute` and `required` instructions in the returned context as binding. Use that packet before independently reconstructing project history.
+
+Use `deja ctx lookup --query "<topic>"` or another source only when ctx reports a required gap, the snapshot is stale or invalid, the task requires source-of-truth verification, or more evidence is necessary. After meaningful durable progress, send structured conclusions to `deja ctx checkpoint --workspace "$PWD"` (and the active task when known): confirmed findings, decisions, implementation state, failures, tests, unresolved questions, and next actions. Do not checkpoint private reasoning.
+
+Search deja only when ctx needs historical evidence: when the user refers to earlier sessions or decisions, before debugging an error, and before implementing something that may already exist. It searches this machine's own history across every AI coding tool used on it, going back further than deja itself was installed.
 
 This skill drives the `deja` binary through the shell. If the deja MCP tools (recall, recall_context, blame, fix, how, remember) are available in this session, use those instead — same index, one less hop. They appear only when `deja install` has wired this harness.
 

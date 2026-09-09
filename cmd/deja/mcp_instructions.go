@@ -11,9 +11,12 @@ import (
 // channel on harnesses that have no hooks of their own.
 func mcpInstructions(dir string) string {
 	var b strings.Builder
+	b.WriteString("At the start of substantive work, call the listed `deja` tool with `mode: \"ctx_resume\"` for the current workspace and active task when known. ")
+	b.WriteString("Treat applicable absolute and required instructions in that context as binding, and use the returned working state before independently reconstructing project history. ")
+	b.WriteString("Use historical recall or other source retrieval only for a required gap, stale or invalid context, source-of-truth verification, or evidence the packet lacks. ")
+	b.WriteString("After meaningful durable progress, call the listed `deja` tool with `mode: \"ctx_checkpoint\"` and confirmed findings, decisions, implementation state, failures, test results, unresolved questions, and next actions; never checkpoint private reasoning. ")
 	b.WriteString("deja indexes this user's past sessions across every AI coding tool they use. ")
-	b.WriteString("Call the deja tool with mode recall before debugging an error or re-implementing anything that might already exist, ")
-	b.WriteString("and whenever the user implies the work happened before (\"didn't we fix this?\", \"what was that error\").")
+	b.WriteString("Use the deja recall mode when one of those allowed historical-retrieval cases needs past-session evidence, including a prior error or decision.")
 	if s := readWarmupStatus(dir); s != nil {
 		b.WriteString(" The index is still building (")
 		b.WriteString(s.progress())
