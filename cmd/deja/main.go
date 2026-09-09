@@ -875,8 +875,11 @@ func ctxFromIDPrefix(dir, q string) (bool, error) {
 
 func cmdCtx(dir string, rest []string) error {
 	if len(rest) < 1 {
-		return idPrefixNeeded(dir, "ctx needs a query or an id-prefix",
+		return idPrefixNeeded(dir, "ctx needs a subcommand, query, or an id-prefix",
 			"ctx needs query or id-prefix (see `deja last`)")
+	}
+	if isCtxCacheCommand(rest[0]) {
+		return runCtxCache(dir, rest, os.Stdin, os.Stdout)
 	}
 	// ctx takes no flags, and --json/--harness/--project/--since all exist on
 	// neighbouring commands — so reaching for one here is the obvious mistake.
@@ -3706,6 +3709,9 @@ Usage:
   deja statusline
   deja stats [--json] [--impact] [--redaction] [--card [path]] [--html [path]]
   deja remember "text" [--project name] [--tag name]
+	deja ctx resume|status|refresh|history [--workspace path] [--task id] [--budget tokens]
+	deja ctx checkpoint [--workspace path] [--task id] [--state json]
+	deja ctx diff | explain --item id | invalidate --layer name | lookup --query text
   deja promote <id-prefix> [--state accepted|rejected|superseded|stale] [--note "text"] [--tag name] [--to path]
   deja mcp
   deja version

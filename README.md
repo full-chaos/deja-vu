@@ -184,6 +184,31 @@ $ deja "jwt refresh token"
 | `deja fix <error>` | What this machine ran after that same error before, when the error did not come back. |
 | `deja friction` | Errors that hit three or more separate sessions, with the harnesses named. |
 
+**Resume current work locally**
+
+`ctx` also provides a materialized, agent-independent resume layer. These
+subcommands read and write `~/.cache/deja/ctx` (or `DEJA_CTX_DIR`) and do not
+search historical sessions unless `lookup` is explicitly requested:
+
+| Command | What it does |
+| --- | --- |
+| `deja ctx resume [--workspace PATH] [--task ID] [--budget TOKENS]` | Return the newest bounded snapshot and say whether it is a hit, miss, or stale. |
+| `deja ctx checkpoint [--workspace PATH] [--task ID]` | Read structured durable state as JSON from stdin; private reasoning should not be included. |
+| `deja ctx status` / `deja ctx refresh` | Explain component freshness or update only changed identity/Git metadata. |
+| `deja ctx diff` / `deja ctx history` | Inspect immutable snapshot history and working-state changes. |
+| `deja ctx explain --item ID` | Show why a checkpoint item is active and where it came from. |
+| `deja ctx invalidate [--layer NAME]` | Mark all context or one component stale. |
+| `deja ctx lookup --query TEXT` | Explicitly cross into historical retrieval for omitted evidence or a required gap. |
+
+Checkpoint JSON accepts `objective`, `status`, `project`, `confirmed`,
+`implemented`, `failing`, `unknown`, `decisions`, `tests`, `next_actions`,
+session notes, evidence, explicit `gaps`, and conflicts.
+Every item carries a stable `id`, concise `text`, and provenance `source`.
+`ctx status` also reports local resume hit/miss, refresh, checkpoint, lookup,
+and gap counters. Git HEAD, branch, and dirty-worktree changes are tracked
+independently; refresh records a required validation gap instead of pretending
+that cached task conclusions were automatically re-proven.
+
 <details>
 <summary>Using what it finds, and moving it between machines</summary>
 
@@ -224,7 +249,7 @@ anything already wired to them.
 
 | Tool | Arguments | Returns |
 | --- | --- | --- |
-| `deja` | `mode`, plus `query`, `path`, `error`, `what`, `text`, `tags?`, `harness?`, `project?`, `since?`, `limit?`, `offset?`, `all?` | Depends on the mode, below. |
+| `deja` | `mode`, plus `query`, `path`, `error`, `what`, `text`, `tags?`, `harness?`, `project?`, `since?`, `limit?`, `offset?`, `all?`, `workspace?`, `task_id?`, `token_budget?`, `state?`, `item_id?`, `layer?` | Depends on the mode, below. |
 
 | Mode | Arguments it reads | Returns |
 | --- | --- | --- |
