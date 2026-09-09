@@ -1381,3 +1381,13 @@ func firstSentences(s string, n int) string {
 	}
 	return s
 }
+
+// IsCompactionSummary is isCompactionSummary for callers outside the package:
+// a resumed session opens with the harness's own summary of the half it threw
+// away, and a reader counting questions must not count it as one.
+func IsCompactionSummary(trimmed string) bool { return isCompactionSummary(trimmed) }
+
+// IsHookStatusLine is isHookEcho for callers outside the package: a harness
+// that pastes a hook's status bar back into the transcript wrote that line,
+// and a reader counting what a person said must not count it.
+func IsHookStatusLine(t string) bool { return isHookEcho(t) }

@@ -13,8 +13,10 @@ import (
 )
 
 var (
-	antigravityRequestOpenRE  = regexp.MustCompile(`^\s*<USER_REQUEST>\s*`)
-	antigravityRequestCloseRE = regexp.MustCompile(`\s*</USER_REQUEST>\s*$`)
+	antigravityRequestTagRE = regexp.MustCompile(`[ \t]*\n?\s*</?USER_REQUEST>\s*`)
+	// "Comments on artifact URI: file:///…/implementation_plan.md" and the
+	// sentence under it, which is the IDE recording what the person clicked.
+	antigravityArtifactCommentRE = regexp.MustCompile(`(?m)^Comments on artifact URI:.*$|^The user has (?:approved|rejected) this document\.$`)
 )
 
 var antigravityUserBlockREs = []*regexp.Regexp{
@@ -35,6 +37,56 @@ func AntigravityRoots() []string {
 		if fi, err := os.Stat(root); err == nil && fi.IsDir() {
 			out = append(out, root)
 		}
+	}
+	return out
+}
+
+// AntigravitySidecarFiles lists what an Antigravity store keeps beside the
+// transcript deja reads: the full log, the chunk files it is written in, the
+// message records and the metadata beside a plan. Everything lives under
+// `.system_generated`, so the row could say nothing about any of it until
+// #3377.
+func AntigravitySidecarFiles() []string {
+	var out []string
+	for _, root := range AntigravityRoots() {
+		out = append(out, walkFiles(root, func(p string) bool {
+			rel, err := filepath.Rel(root, p)
+			if err != nil {
+				return false
+			}
+			parts := strings.Split(filepath.ToSlash(rel), "/")
+			// Outside a conversation: the settings, the caches, the update
+			// marker, the MCP and plugin files deja itself installs. Named one
+			// by one — exempting everything outside brain/ swallowed a
+			// transcript restored beside it, which is what this row exists to
+			// find (review of #3377).
+			if parts[0] != "brain" {
+				switch parts[0] {
+				case "cache", "mcp", "plugins", "updater", "tmp":
+					return true
+				}
+				switch filepath.Base(p) {
+				case "settings.json", "history.jsonl", "import_manifest.json":
+					return true
+				}
+				return false
+			}
+			base := filepath.Base(p)
+			dir := filepath.ToSlash(filepath.Dir(p))
+			switch {
+			case base == "read.json", base == "remember.json":
+				return true
+			case strings.HasSuffix(base, ".metadata.json"):
+				return true
+			case base == "transcript_full.jsonl":
+				// Only when it is the second copy of a log deja does read: a
+				// session whose only artefact is the full transcript has its
+				// content nowhere else, and the row must say so.
+				return fileExists(filepath.Join(filepath.Dir(p), "transcript.jsonl"))
+			}
+			return strings.Contains(dir, "/.system_generated/messages") ||
+				strings.Contains(dir, "/logs/chunks/")
+		})...)
 	}
 	return out
 }
@@ -113,11 +165,17 @@ func antigravitySessionID(path string) string {
 }
 
 func cleanAntigravityUserContent(text string) string {
+	// The IDE's own blocks can sit inside the request tag as well as beside it.
 	for _, re := range antigravityUserBlockREs {
 		text = re.ReplaceAllString(text, "")
 	}
-	text = antigravityRequestOpenRE.ReplaceAllString(text, "")
-	text = antigravityRequestCloseRE.ReplaceAllString(text, "")
+	// The comment the IDE writes when a document is approved or rejected: it
+	// stands above an empty <USER_REQUEST>, and taking the tag off only when it
+	// opened the content indexed that comment as the person's words (#3326).
+	text = antigravityArtifactCommentRE.ReplaceAllString(text, "")
+	// The tags come off wherever they stand and whatever is around them stays:
+	// a person can write above the tag, and a turn can carry two of them.
+	text = antigravityRequestTagRE.ReplaceAllString(text, "\n")
 	return strings.TrimSpace(text)
 }
 
@@ -140,8 +198,16 @@ func antigravityStep(kind, text string, t time.Time) []model.Message {
 			out = append(out, model.Message{Role: RoleCommand, Text: "$ " + cmd, Time: t})
 		}
 	case "VIEW_FILE", "CODE_ACTION", "LIST_DIRECTORY":
-		if p := antigravityPath(text); p != "" && IndexToolPaths() {
+		p := antigravityPath(text)
+		if p != "" && IndexToolPaths() {
 			out = append(out, model.Message{Role: RoleFiles, Text: p, Time: t})
+		}
+		// An edit tool writes the change as a diff block; the removed lines
+		// are the span the other harnesses record as an edit (#3279).
+		if p != "" && IndexEdits() {
+			if span := antigravityRemovedLines(text); span != "" {
+				out = append(out, model.Message{Role: RoleEdit, Text: p + "\n" + span, Time: t})
+			}
 		}
 	}
 	if IndexToolOutput() {
@@ -163,9 +229,40 @@ func antigravityField(text, label string) string {
 	return ""
 }
 
+// antigravityEditSentence is how the edit tools name their file: "The
+// following changes were made by the replace_file_content tool to: <path>."
+// — a sentence, not a labelled line, so the label list never saw an edit
+// (#3279).
+var antigravityEditSentence = regexp.MustCompile(`changes were made by the \S+ tool to: (\S+?)\.?(?:\s|$)`)
+
+// antigravityRemovedLines is the span an edit took out: the "-" lines of the
+// step's diff block, without the hunk headers, bounded like every edit span.
+func antigravityRemovedLines(text string) string {
+	var lines []string
+	in := false
+	for _, line := range strings.Split(text, "\n") {
+		switch {
+		case strings.HasPrefix(line, "[diff_block_start]"):
+			in = true
+		case strings.HasPrefix(line, "[diff_block_end]"):
+			in = false
+		case in && strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---"):
+			lines = append(lines, line[1:])
+		}
+	}
+	span := strings.TrimSpace(strings.Join(lines, "\n"))
+	if len(span) > editSpanMax {
+		span = span[:editSpanMax]
+	}
+	return span
+}
+
 // antigravityPath pulls the file a step names, as a plain path: the transcript
 // writes them as file:// URIs, sometimes in backticks.
 func antigravityPath(text string) string {
+	if m := antigravityEditSentence.FindStringSubmatch(text); m != nil {
+		return strings.TrimPrefix(strings.Trim(m[1], "`"), "file://")
+	}
 	for _, label := range []string{"File Path:", "Created file", "Edited file", "Modified file"} {
 		v := antigravityField(text, label)
 		if v == "" {

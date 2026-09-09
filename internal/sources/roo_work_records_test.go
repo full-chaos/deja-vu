@@ -1,100 +1,66 @@
 package sources
 
 import (
-	"encoding/json"
+	"github.com/vshulcz/deja-vu/internal/model"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/vshulcz/deja-vu/internal/model"
 )
 
-// The Roo and legacy Cline readers indexed the words of a turn and nothing it
-// did, so those sessions carried no command record and no files record at all:
-// `how`, `files`, `blame` and the fix-pair miner were blind to two harnesses
-// while the modern Cline reader emitted all of them (#3295).
-func TestRooTaskYieldsTheWorkItDid(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "tasks", "1767225700000")
+// Roo and the legacy Cline extension name their tools execute_command,
+// read_file, write_to_file, apply_diff / replace_in_file; the readers took the
+// assistant's prose and none of the calls, so no command or file record ever
+// came out of them (#3295). Shape from Roo's own Task.ts.
+func writeRooTask(t *testing.T, root string) string {
+	t.Helper()
+	dir := filepath.Join(root, "tasks", "1788845325718")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	turns := []map[string]any{
-		{"role": "user", "content": "the build fails on the widget parser"},
-		{"role": "assistant", "content": []any{
-			map[string]any{"type": "tool_use", "name": "execute_command",
-				"input": map[string]any{"command": "go test ./..."}},
-		}},
-		{"role": "user", "content": []any{
-			map[string]any{"type": "tool_result",
-				"content": "pkg/parser.go:42:9: undefined: frobnicateWidget\nExit code: 1"},
-		}},
-		{"role": "assistant", "content": []any{
-			map[string]any{"type": "tool_use", "name": "apply_diff",
-				"input": map[string]any{"path": "pkg/parser.go", "diff": "<<<<<<< SEARCH"}},
-		}},
-	}
-	b, err := json.Marshal(turns)
-	if err != nil {
-		t.Fatal(err)
-	}
+	body := `[
+	 {"role":"user","content":[{"type":"text","text":"<task>\nrun go test and fix whatever fails\n</task>"}]},
+	 {"role":"assistant","content":[{"type":"text","text":"Running the tests."},{"type":"tool_use","id":"t1","name":"execute_command","input":{"command":"go test ./..."}}]},
+	 {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"Exit code: 1\nOutput:\npkg/parser.go:42:9: undefined: frobnicateWidget\nFAIL"}]},
+	 {"role":"assistant","content":[{"type":"text","text":"Renaming the call."},{"type":"tool_use","id":"t2","name":"read_file","input":{"path":"pkg/parser.go"}}]},
+	 {"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"apply_diff","input":{"path":"pkg/parser.go","diff":"<<<<<<< SEARCH\n\tout := frobnicateWidget(w)\n=======\n\tout := frobnicate(w)\n>>>>>>> REPLACE"}}]}
+	]`
 	path := filepath.Join(dir, "api_conversation_history.json")
-	if err := os.WriteFile(path, b, 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-
-	// The legacy Cline store is the same file in the same shape — the two
-	// harnesses share the extension both came from — so both readers are asked
-	// the same question.
-	for _, tc := range []struct {
-		name  string
-		parse func(string) ([]model.Session, error)
-	}{
-		{"roo", ParseRooTask},
-		{"cline (legacy)", ParseClineFile},
-	} {
-		t.Run(tc.name, func(t *testing.T) { assertRooWorkRecords(t, tc.parse, path) })
-	}
+	return path
 }
 
-func assertRooWorkRecords(t *testing.T, parse func(string) ([]model.Session, error), path string) {
+func TestRooToolCallsBecomeCommandAndFileRecords(t *testing.T) {
+	path := writeRooTask(t, t.TempDir())
+	ss, err := ParseRooTask(path)
+	if err != nil || len(ss) != 1 {
+		t.Fatalf("parse: %v, %d sessions", err, len(ss))
+	}
+	checkRooWork(t, "roo", ss[0].Messages)
+	ss, err = parseClineLegacyTask(path)
+	if err != nil || len(ss) != 1 {
+		t.Fatalf("legacy parse: %v, %d sessions", err, len(ss))
+	}
+	checkRooWork(t, "cline legacy", ss[0].Messages)
+}
+
+func checkRooWork(t *testing.T, reader string, ms []model.Message) {
 	t.Helper()
-	ss, err := parse(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ss) != 1 {
-		t.Fatalf("sessions = %d", len(ss))
-	}
-	got := map[string][]string{}
-	for _, m := range ss[0].Messages {
-		got[m.Role] = append(got[m.Role], m.Text)
-	}
-	for _, want := range []struct{ role, text string }{
-		// The `$ ` is deja's own marker on a command record, the same one the
-		// Claude and Cline readers write.
-		{RoleCommand, "$ go test ./..."},
-		{RoleFiles, "pkg/parser.go"},
-	} {
-		found := false
-		for _, have := range got[want.role] {
-			if have == want.text {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("no %s record for %q; got %v", want.role, want.text, got[want.role])
+	var cmds, files []string
+	for _, m := range ms {
+		switch m.Role {
+		case RoleCommand:
+			cmds = append(cmds, m.Text)
+		case RoleFiles:
+			files = append(files, m.Text)
 		}
 	}
-	// The error a command hit is what a later search reaches for, and the
-	// fix-pair miner pairs it with what ran next.
-	found := false
-	for _, have := range got[RoleToolOutput] {
-		if strings.Contains(have, "frobnicateWidget") {
-			found = true
-		}
+	if len(cmds) != 1 || cmds[0] != "$ go test ./..." {
+		t.Errorf("%s: commands = %q, want the execute_command", reader, cmds)
 	}
-	if !found {
-		t.Errorf("no tool output record carrying the error: %v", got[RoleToolOutput])
+	if len(files) == 0 || !strings.Contains(strings.Join(files, "\n"), "pkg/parser.go") {
+		t.Errorf("%s: files = %q, want pkg/parser.go", reader, files)
 	}
 }

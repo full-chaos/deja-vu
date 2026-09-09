@@ -77,6 +77,27 @@ func LoadAider() []model.Session {
 
 const aiderSessionMark = "# aider chat started at "
 
+// aiderSlashCommand reports whether a logged input line is one of aider's own
+// commands: a slash, a bare word, then the end of the line or a space.
+func aiderSlashCommand(line string) bool {
+	// Trimmed and case-folded: a logged input keeps the spacing the person
+	// typed, and "/GIT status" is the same command as "/git status".
+	t := strings.ToLower(strings.TrimSpace(line))
+	if !strings.HasPrefix(t, "/") {
+		return false
+	}
+	word := strings.TrimPrefix(strings.Fields(t)[0], "/")
+	if word == "" {
+		return false
+	}
+	for _, r := range word {
+		if (r < 'a' || r > 'z') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
 func ParseAiderFile(path string) ([]model.Session, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -91,6 +112,16 @@ func ParseAiderFile(path string) ([]model.Session, error) {
 	var buf []string
 	inFence := false
 	idx := 0
+	// aider marks its own output with "> " on the first line only: the
+	// --verbose configuration dump and a multi-line commit message continue
+	// unprefixed, and those lines read as the assistant speaking — one of them
+	// went on to title the session (#3311). Two rules cover what aider writes:
+	// nothing before the session's first `#### ` turn is speech (the banner
+	// and the dump come before anyone has asked anything, and the dump has
+	// blank lines inside it), and a line directly under a "> " line is the
+	// rest of that block.
+	afterOutput := false
+	seenUser := false
 
 	flush := func() {
 		if cur == nil || len(buf) == 0 {
@@ -133,6 +164,7 @@ func ParseAiderFile(path string) ([]model.Session, error) {
 			id := aiderSessionID(path, idx)
 			cur = &model.Session{Harness: "aider", ID: id, Project: project, Path: path, Started: ts, Updated: ts}
 			inFence = false
+			afterOutput, seenUser = false, false
 			continue
 		}
 		if cur == nil {
@@ -140,6 +172,7 @@ func ParseAiderFile(path string) ([]model.Session, error) {
 		}
 		if strings.HasPrefix(line, "```") {
 			inFence = !inFence
+			afterOutput = false
 			if role == "" {
 				role = "assistant"
 			}
@@ -152,28 +185,37 @@ func ParseAiderFile(path string) ([]model.Session, error) {
 		}
 		switch {
 		case strings.HasPrefix(line, "#### "):
+			afterOutput = false
+			seenUser = true
+			t := strings.TrimPrefix(line, "#### ")
+			// aider logs its own commands the same way — `/undo`, `/clear`,
+			// `/add x` — and they are not the person's question; a message
+			// that merely opens with a path ("/etc/hosts is wrong") is (#3248).
+			if aiderSlashCommand(t) {
+				flush()
+				role = ""
+				continue
+			}
 			if role != "user" {
 				flush()
 				role = "user"
 			}
-			t := strings.TrimPrefix(line, "#### ")
 			if t == "<blank>" {
 				t = ""
-			}
-			// aider writes every input as a #### line, its own commands
-			// included, so `/undo` became a user message and `/clear` was
-			// glued onto the question typed after it (#3248). A command ends
-			// the turn rather than joining it.
-			if aiderSlashCommand(t) {
-				flush()
-				continue
 			}
 			buf = append(buf, t)
 		case strings.HasPrefix(line, "> "), line == ">":
 			// tool/system output: ends any assistant block, not indexed as a message
 			flush()
+			afterOutput = true
 		case strings.TrimSpace(line) == "":
+			afterOutput = false
 			buf = append(buf, "")
+		case afterOutput, !seenUser:
+			// The rest of the output block the "> " line opened, or the
+			// banner and the --verbose dump aider prints before the first
+			// turn.
+			continue
 		default:
 			if role != "assistant" {
 				flush()
@@ -184,39 +226,6 @@ func ParseAiderFile(path string) ([]model.Session, error) {
 	}
 	endSession()
 	return out, nil
-}
-
-// aiderCommands are aider's own inputs, which it records in the transcript the
-// same way it records a question. Only the ones that take no prose, or whose
-// argument is a path or a shell line rather than something the person said —
-// `/ask` and `/code` carry a real question and stay.
-var aiderCommands = map[string]bool{
-	"add": true, "architect": true, "chat-mode": true, "clear": true, "clipboard": true,
-	"code": false, "commit": true, "copy": true, "diff": true, "drop": true,
-	"editor": true, "exit": true, "git": true, "help": true, "lint": true, "load": true,
-	"ls": true, "map": true, "map-refresh": true, "model": true, "models": true,
-	"multiline-mode": true, "paste": true, "quit": true, "read-only": true, "report": true,
-	"reset": true, "run": true, "save": true, "settings": true, "test": true,
-	"tokens": true, "undo": true, "voice": true, "web": true,
-}
-
-// aiderSlashCommand reports that a line is one of aider's own commands rather
-// than something the person asked.
-//
-// The name has to be one aider has, not merely a leading slash: "/etc/hosts is
-// wrong on the build box" opens the same way and is the reader's, and so is a
-// line that starts with any absolute path.
-func aiderSlashCommand(line string) bool {
-	t := strings.TrimSpace(line)
-	if !strings.HasPrefix(t, "/") || len(t) < 2 {
-		return false
-	}
-	name := t[1:]
-	if i := strings.IndexAny(name, " \t"); i >= 0 {
-		name = name[:i]
-	}
-	drop, known := aiderCommands[strings.ToLower(name)]
-	return known && drop
 }
 
 // aider has no session ids; derive a stable one from file path + ordinal.
