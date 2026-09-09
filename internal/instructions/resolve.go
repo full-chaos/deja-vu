@@ -57,6 +57,11 @@ func Resolve(s Snapshot, c Context) (Result, error) {
 			out.Excluded = append(out.Excluded, item)
 			continue
 		}
+		if r.EffectiveFrom != nil && c.Now.Before(*r.EffectiveFrom) {
+			item.Reason = "not effective yet"
+			out.Excluded = append(out.Excluded, item)
+			continue
+		}
 		if r.ExpiresAt != nil && !c.Now.Before(*r.ExpiresAt) {
 			item.Reason = "expired"
 			out.Excluded = append(out.Excluded, item)
@@ -81,6 +86,9 @@ func Resolve(s Snapshot, c Context) (Result, error) {
 	}
 	sortSelections(out.Applicable)
 	sortSelections(out.Conditional)
+	var supersessionConflicts []Conflict
+	out.Applicable, out.Excluded, supersessionConflicts = applySupersession(out.Applicable, out.Excluded)
+	out.Conflicts = append(out.Conflicts, supersessionConflicts...)
 	groups := make(map[string][]Rule)
 	for _, item := range out.Applicable {
 		if item.Rule.ConflictKey != "" {
@@ -164,6 +172,45 @@ func Resolve(s Snapshot, c Context) (Result, error) {
 	sortSelections(out.Excluded)
 	sort.Slice(out.Conflicts, func(i, j int) bool { return out.Conflicts[i].Key < out.Conflicts[j].Key })
 	return out, nil
+}
+
+// applySupersession only removes a rule when one, applicable active rule names
+// it as its successor. Several successors are an explicit unresolved conflict:
+// guessing a winner would make an approved instruction disappear silently.
+func applySupersession(applicable, excluded []Selection) ([]Selection, []Selection, []Conflict) {
+	byID := make(map[string]Selection, len(applicable))
+	for _, item := range applicable {
+		byID[item.Rule.ID] = item
+	}
+	successors := make(map[string][]string)
+	for _, item := range applicable {
+		for _, target := range item.Rule.Supersedes {
+			if _, ok := byID[target]; ok {
+				successors[target] = append(successors[target], item.Rule.ID)
+			}
+		}
+	}
+	drop := make(map[string]string)
+	var conflicts []Conflict
+	for target, ids := range successors {
+		sort.Strings(ids)
+		if len(ids) == 1 {
+			drop[target] = ids[0]
+			continue
+		}
+		conflicts = append(conflicts, Conflict{Key: "supersession:" + target, RuleIDs: append([]string{target}, ids...)})
+	}
+	kept := make([]Selection, 0, len(applicable))
+	for _, item := range applicable {
+		if successor, ok := drop[item.Rule.ID]; ok {
+			item.Reason = "explicitly superseded by " + successor
+			excluded = append(excluded, item)
+			continue
+		}
+		kept = append(kept, item)
+	}
+	sortSelections(kept)
+	return kept, excluded, conflicts
 }
 
 func match(s Scope, c Context) (string, string) {

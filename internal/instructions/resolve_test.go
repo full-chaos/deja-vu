@@ -260,6 +260,89 @@ func TestConflictAndDefaults(t *testing.T) {
 		t.Fatal("default competed with a must")
 	}
 }
+func TestExplicitSupersessionAndEffectiveWindow(t *testing.T) {
+	old := rule("old")
+	newer := rule("new")
+	newer.Supersedes = []string{"old"}
+	result, err := Resolve(snapshot(old, newer), ctx())
+	if err != nil || len(result.Applicable) != 1 || result.Applicable[0].Rule.ID != "new" {
+		t.Fatalf("explicit successor did not win: %#v %v", result, err)
+	}
+	if len(result.Excluded) != 1 || result.Excluded[0].Reason != "explicitly superseded by new" {
+		t.Fatalf("superseded predecessor was hidden: %#v", result.Excluded)
+	}
+
+	future := rule("future")
+	starts := instant.Add(time.Hour)
+	future.EffectiveFrom = &starts
+	result, err = Resolve(snapshot(future), ctx())
+	if err != nil || len(result.Applicable) != 0 || len(result.Excluded) != 1 || result.Excluded[0].Reason != "not effective yet" {
+		t.Fatalf("effective window=%#v %v", result, err)
+	}
+	future.EffectiveFrom = &instant
+	result, err = Resolve(snapshot(future), ctx())
+	if err != nil || len(result.Applicable) != 1 {
+		t.Fatalf("effective_from boundary excluded its rule: %#v %v", result, err)
+	}
+	badWindow := rule("bad-window")
+	badWindow.EffectiveFrom = &starts
+	ends := instant
+	badWindow.ExpiresAt = &ends
+	bad(t, snapshot(badWindow).Validate())
+
+	first, second := rule("first"), rule("second")
+	first.Supersedes, second.Supersedes = []string{"old"}, []string{"old"}
+	result, err = Resolve(snapshot(old, first, second), ctx())
+	if err != nil || len(result.Conflicts) != 1 || result.Conflicts[0].Key != "supersession:old" || len(result.Applicable) != 3 || len(result.Excluded) != 0 {
+		t.Fatalf("competing successors were not explicit and non-destructive: %#v %v", result, err)
+	}
+
+	mandatory := rule("mandatory")
+	weak := rule("weak")
+	weak.Kind, weak.Strength, weak.Supersedes = "preference", "should", []string{"mandatory"}
+	bad(t, snapshot(mandatory, weak).Validate())
+	ownerRule := rule("owner-rule")
+	projectSuccessor := rule("project-successor")
+	projectSuccessor.Authority, projectSuccessor.Supersedes = "project", []string{"owner-rule"}
+	bad(t, snapshot(ownerRule, projectSuccessor).Validate())
+	absolute := rule("absolute")
+	absolute.Absolute = true
+	nonAbsolute := rule("non-absolute")
+	nonAbsolute.Supersedes = []string{"absolute"}
+	bad(t, snapshot(absolute, nonAbsolute).Validate())
+	absoluteSuccessor := rule("absolute-successor")
+	absoluteSuccessor.Absolute, absoluteSuccessor.Supersedes = true, []string{"absolute"}
+	if err := snapshot(absolute, absoluteSuccessor).Validate(); err != nil {
+		t.Fatalf("equally absolute successor was rejected: %v", err)
+	}
+
+	inactive := rule("inactive-successor")
+	inactive.Status, inactive.Supersedes = "candidate", []string{"old"}
+	result, err = Resolve(snapshot(old, inactive), ctx())
+	if err != nil || len(result.Applicable) != 1 || result.Applicable[0].Rule.ID != "old" {
+		t.Fatalf("inactive successor superseded a binding rule: %#v %v", result, err)
+	}
+
+	superseded := rule("already-superseded")
+	superseded.Status = "superseded"
+	if err := snapshot(superseded).Validate(); err != nil {
+		t.Fatalf("superseded status was rejected: %v", err)
+	}
+
+	unknown := rule("unknown")
+	unknown.Supersedes = []string{"missing"}
+	bad(t, snapshot(unknown).Validate())
+	self := rule("self")
+	self.Supersedes = []string{"self"}
+	bad(t, snapshot(self).Validate())
+	duplicate, target := rule("duplicate"), rule("target")
+	duplicate.Supersedes = []string{"target", "target"}
+	bad(t, snapshot(duplicate, target).Validate())
+	cycleA, cycleB := rule("cycle-a"), rule("cycle-b")
+	cycleA.Supersedes, cycleB.Supersedes = []string{"cycle-b"}, []string{"cycle-a"}
+	bad(t, snapshot(cycleA, cycleB).Validate())
+}
+
 func TestStrictJSON(t *testing.T) {
 	for _, data := range []string{`{"version":1,"version":2}`, `{"version":1,"rules":[{"id":"a","id":"b"}]}`, `{} {}`, `{"unknown":1}`, `{"version":`, strings.Repeat("[", 66) + strings.Repeat("]", 66), `{"a":]}`, `[}`} {
 		var s Snapshot

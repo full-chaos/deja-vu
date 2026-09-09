@@ -27,22 +27,24 @@ type Snapshot struct {
 }
 
 type Rule struct {
-	ID          string     `json:"id"`
-	Revision    uint64     `json:"revision"`
-	Kind        string     `json:"kind"`
-	Text        string     `json:"text"`
-	Authority   string     `json:"authority"`
-	Status      string     `json:"status"`
-	Strength    string     `json:"strength"`
-	Absolute    bool       `json:"absolute"`
-	Priority    int        `json:"priority"`
-	Scope       Scope      `json:"scope"`
-	Lifetime    string     `json:"lifetime"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	Source      string     `json:"source"`
-	ConflictKey string     `json:"conflict_key,omitempty"`
-	Value       string     `json:"value,omitempty"`
-	Runbook     *Runbook   `json:"runbook,omitempty"`
+	ID            string     `json:"id"`
+	Revision      uint64     `json:"revision"`
+	Kind          string     `json:"kind"`
+	Text          string     `json:"text"`
+	Authority     string     `json:"authority"`
+	Status        string     `json:"status"`
+	Strength      string     `json:"strength"`
+	Absolute      bool       `json:"absolute"`
+	Priority      int        `json:"priority"`
+	Scope         Scope      `json:"scope"`
+	Lifetime      string     `json:"lifetime"`
+	EffectiveFrom *time.Time `json:"effective_from,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	Supersedes    []string   `json:"supersedes,omitempty"`
+	Source        string     `json:"source"`
+	ConflictKey   string     `json:"conflict_key,omitempty"`
+	Value         string     `json:"value,omitempty"`
+	Runbook       *Runbook   `json:"runbook,omitempty"`
 }
 
 type Scope struct {
@@ -119,6 +121,25 @@ func (s Snapshot) Validate() error {
 		}
 		rules[r.ID] = r
 	}
+	for _, r := range s.Rules {
+		seenSupersedes := make(map[string]bool, len(r.Supersedes))
+		for _, id := range r.Supersedes {
+			if !identifier.MatchString(id) || id == r.ID || seenSupersedes[id] {
+				return fmt.Errorf("rule %q has invalid supersession target %q", r.ID, id)
+			}
+			predecessor, ok := rules[id]
+			if !ok {
+				return fmt.Errorf("rule %q supersedes unknown rule %q", r.ID, id)
+			}
+			if !canSupersede(r, predecessor) {
+				return fmt.Errorf("rule %q cannot weaken superseded rule %q", r.ID, id)
+			}
+			seenSupersedes[id] = true
+		}
+	}
+	if err := validateSupersessionGraph(rules); err != nil {
+		return err
+	}
 	seen := make(map[string]bool, len(s.Exceptions))
 	for _, e := range s.Exceptions {
 		r, ok := rules[e.RuleID]
@@ -133,6 +154,55 @@ func (s Snapshot) Validate() error {
 	return nil
 }
 
+// Supersession is a directed replacement relation. A cycle would make every
+// member both obsolete and authoritative, so reject it at registry approval
+// time instead of letting resolution discard binding rules.
+func validateSupersessionGraph(rules map[string]Rule) error {
+	const (
+		unseen = iota
+		visiting
+		finished
+	)
+	state := make(map[string]int, len(rules))
+	var visit func(string) error
+	visit = func(id string) error {
+		switch state[id] {
+		case visiting:
+			return fmt.Errorf("supersession cycle includes rule %q", id)
+		case finished:
+			return nil
+		}
+		state[id] = visiting
+		for _, next := range rules[id].Supersedes {
+			if err := visit(next); err != nil {
+				return err
+			}
+		}
+		state[id] = finished
+		return nil
+	}
+	for id := range rules {
+		if err := visit(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// canSupersede rejects a registry relationship that would waive a protected
+// rule. An explicit successor may replace a peer or strengthen it, but cannot
+// use a preference or lower authority to disable an absolute, mandatory, or
+// owner-authored constraint.
+func canSupersede(successor, predecessor Rule) bool {
+	if predecessor.Absolute && !successor.Absolute {
+		return false
+	}
+	if predecessor.Strength != "should" && successor.Strength == "should" {
+		return false
+	}
+	return predecessor.Authority != "owner" || successor.Authority == "owner"
+}
+
 func (r Rule) validate() error {
 	if !identifier.MatchString(r.ID) || r.Revision == 0 {
 		return fmt.Errorf("id and positive revision required")
@@ -140,7 +210,7 @@ func (r Rule) validate() error {
 	if !cleanText(r.Text) || len(r.Text) > 32768 || !cleanText(r.Source) {
 		return fmt.Errorf("bounded instruction text and provenance required")
 	}
-	if !oneOf(r.Kind, "constraint", "preference", "decision", "procedure") || !oneOf(r.Authority, "owner", "project", "inferred") || !oneOf(r.Status, "candidate", "active", "revoked") || !oneOf(r.Strength, "must", "must_not", "should") {
+	if !oneOf(r.Kind, "constraint", "preference", "decision", "procedure") || !oneOf(r.Authority, "owner", "project", "inferred") || !oneOf(r.Status, "candidate", "active", "superseded", "revoked") || !oneOf(r.Strength, "must", "must_not", "should") {
 		return fmt.Errorf("invalid kind, authority, status, or strength")
 	}
 	if r.Authority == "inferred" && r.Status == "active" {
@@ -186,6 +256,9 @@ func (r Rule) validate() error {
 		}
 	default:
 		return fmt.Errorf("invalid lifetime")
+	}
+	if r.EffectiveFrom != nil && r.ExpiresAt != nil && !r.EffectiveFrom.Before(*r.ExpiresAt) {
+		return fmt.Errorf("effective_from must precede expires_at")
 	}
 	if (r.ConflictKey == "") != (r.Value == "") || (r.ConflictKey != "" && (!identifier.MatchString(r.ConflictKey) || !scalar(r.Value))) {
 		return fmt.Errorf("conflict_key and value must be valid and supplied together")

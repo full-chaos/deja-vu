@@ -72,17 +72,20 @@ The schema is JSON, version 1. Each rule needs `id`, positive `revision`, `kind`
 | --- | --- |
 | kind | constraint, preference, decision, procedure |
 | authority | owner, project, inferred; inferred records cannot be active |
-| status | candidate, active, revoked |
+| status | candidate, active, superseded, revoked |
 | strength | must, must_not, should; preferences must use should |
 | absolute | Required text; only a current-revision owner-approved exception waives it |
 | priority | -1000 through 1000; ordering/default selection, never a waiver of a must |
 | lifetime | persistent, task, session, ttl |
+| effective_from | Optional RFC3339 start; the rule is excluded as not effective yet before this instant |
+| supersedes | Optional explicit predecessor rule IDs; an applicable successor excludes its predecessor only when it does not weaken an absolute, mandatory, or owner-authored rule. Competing successors remain an explicit conflict |
 | scope | repository, worktree, task, session, environment, path_prefix, tools |
 | source | Original provenance; preserve the original statement and reference |
 | conflict_key + value | Explicit mutually-exclusive setting, such as backend=local |
 | runbook | An absolute local path and lowercase SHA256 for a procedure |
 
-Persistent means until explicitly revised/revoked and forbids an expiry.
+`effective_from` must precede `expires_at` when both are set. Persistent means
+until explicitly revised, superseded, or revoked and forbids an expiry.
 Task/session lifetimes require their matching identity. TTL requires
 `expires_at` in RFC3339. Expiry is inclusive: at that instant it no longer applies.
 Task closure is NOT integrated with a task tracker in v0: clear/change the task
