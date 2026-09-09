@@ -22,7 +22,7 @@ const guidanceBody = `Before re-deriving past work, search deja when the user re
 
 Example: for "what did we decide about token refresh?", call recall with query "token refresh decision", then call recall_context if the result needs more detail.
 
-When recalled history genuinely helps — a reused fix, a skipped re-debug, even a partial hint that changed your approach — say so to the user in one short line at the start of your reply: "déjà vu: <what> — <how it was reused> (deja:<session id>)". Never credit recalls that did not help.`
+When recalled history helps — a reused fix, a skipped re-debug, a hint that changed your approach — open your reply with that one line: "déjà vu: <what it said> — reusing it (deja:<session id>)". One line, at the start, and nothing about recalls that did not help.`
 
 // skillBody is the same guidance for harnesses that read a skill file. A skill
 // is loaded when its description looks relevant, so the manual costs nothing in
@@ -525,9 +525,16 @@ func installGuidance(harness string, uninstall bool) (installResult, error) {
 		if uerr != nil {
 			return installResult{}, markerErrorFor(alt, uerr)
 		}
-		if _, werr := writeIfChanged(alt, oldAlt, []byte(updatedAlt)); werr != nil {
+		altAction, werr := writeIfChanged(alt, oldAlt, []byte(updatedAlt))
+		if werr != nil {
 			return installResult{}, werr
 		}
+		// Both files, and the shared skill written above: the report is what
+		// says which files were touched, and these three were not among them
+		// (#3254).
+		return wroteAll(installResult{Path: path, Action: a, Note: retiredNote},
+			installResult{Path: alt, Action: altAction},
+			installResult{Path: sharedSkillPath(), Action: altAction}), nil
 	}
 	return installResult{Path: path, Action: a, Note: retiredNote}, nil
 }

@@ -245,7 +245,19 @@ func runInstall(dir string, args []string, uninstall bool) error {
 		var err error
 		switch {
 		case !uninstall:
-			err = writeCLISkill()
+			var action string
+			action, err = writeCLISkill()
+			// Every -auto target wrote this file and not one of them said so:
+			// nineteen unreported writes on the screen whose job is saying what
+			// was touched (#3254). Named once, here, rather than in each
+			// target's line.
+			if err == nil && action != "" {
+				done = append(done, lineItem{target: "skill", action: action, path: shortHome(cliSkillPath())})
+				touchedPaths = append(touchedPaths, cliSkillPath())
+				if !banner {
+					fmt.Printf("skill: %s %s\n", action, shortHome(cliSkillPath()))
+				}
+			}
 		case !cliSkillStillWanted(targets):
 			err = removeCLISkill()
 		}
@@ -363,6 +375,20 @@ func keptSnapshotsLine(touched []string) string {
 		len(paths), pluralS(len(paths)), where)
 }
 
+// indexBuiltLine is what an install says about the store it just built. The
+// harness lines above it count what the parser read; this counts what reached
+// the index, and the two disagree by deja's own recall blocks — stripped
+// before anything counts them. Both numbers are true and they answer different
+// questions, so the difference is named rather than left to be noticed (#3386).
+func indexBuiltLine(b index.BuildSummary) string {
+	line := fmt.Sprintf("index: built (%d session%s, %d message%s",
+		b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages))
+	if b.Dropped > 0 {
+		line += fmt.Sprintf(" — %d of deja's own blocks not indexed", b.Dropped)
+	}
+	return line + ")\n"
+}
+
 func installIndexWarmup(dir string, mcp, hooks, guidance int, summary bool) {
 	built := false
 	detected := 0
@@ -383,15 +409,13 @@ func installIndexWarmup(dir string, mcp, hooks, guidance int, summary bool) {
 	}
 	if !summary {
 		if built {
-			b := index.LastBuild
-			fmt.Fprintf(os.Stderr, "index: built (%d session%s, %d message%s)\n", b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages))
+			fmt.Fprint(os.Stderr, indexBuiltLine(index.LastBuild))
 		}
 		return
 	}
 	fmt.Fprintf(os.Stderr, "installed: %d MCP, %d hooks, %d guidance files\n", mcp, hooks, guidance)
 	if built {
-		b := index.LastBuild
-		fmt.Fprintf(os.Stderr, "index: built (%d session%s, %d message%s)\n", b.Sessions, pluralS(b.Sessions), b.Messages, pluralS(b.Messages))
+		fmt.Fprint(os.Stderr, indexBuiltLine(index.LastBuild))
 	} else if !index.HasManifest(dir) && detected > 0 {
 		fmt.Fprintln(os.Stderr, "next: run `deja index` to finish building memory")
 	} else if n := deniedStoreCount(); !index.HasManifest(dir) && n > 0 {
@@ -724,10 +748,17 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	case "kimi":
 		return installMCPJSON(filepath.Join(sources.KimiConfigDir(), "mcp.json"), exe, uninstall)
 	case "kimi-auto":
-		if _, err := installMCPJSON(filepath.Join(sources.KimiConfigDir(), "mcp.json"), exe, uninstall); err != nil {
+		// Both halves in the result: the report is what says which files were
+		// touched, and this one wrote mcp.json without ever naming it (#3254).
+		mcp, err := installMCPJSON(filepath.Join(sources.KimiConfigDir(), "mcp.json"), exe, uninstall)
+		if err != nil {
 			return installResult{}, err
 		}
-		return installKimiAuto(exe, uninstall)
+		hooks, err := installKimiAuto(exe, uninstall)
+		if err != nil {
+			return installResult{}, err
+		}
+		return wroteAll(mcp, hooks), nil
 	case "zed":
 		return installZedMCP(sources.ZedSettingsPath(), exe, uninstall)
 	case "cline":
@@ -735,10 +766,15 @@ func installTarget(target, exe string, uninstall bool) (installResult, error) {
 	case "roo":
 		return installRoo(exe, uninstall)
 	case "cline-auto":
-		if _, err := installMCPJSON(sources.ClineMCPSettingsPath(), exe, uninstall); err != nil {
+		mcp, err := installMCPJSON(sources.ClineMCPSettingsPath(), exe, uninstall)
+		if err != nil {
 			return installResult{}, err
 		}
-		return installClineAuto(exe, uninstall)
+		plugin, err := installClineAuto(exe, uninstall)
+		if err != nil {
+			return installResult{}, err
+		}
+		return wroteAll(mcp, plugin), nil
 	case "continue":
 		return installContinue(exe, uninstall)
 	case "crush":
