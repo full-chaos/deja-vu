@@ -567,6 +567,29 @@ var agentArtifactMarkers = []string{
 	`{"type":`,
 }
 
+// isReviewVerdict reports whether the text is a review agent's report rather
+// than something concluded about the work.
+//
+// These read as decisions to every rule here — they are full of "approved",
+// "fixed", "findings" — and they are about one diff on one day, which makes them
+// the worst thing to carry forward. Read from the lines deja would have served
+// before an edit on a real store: `README.md — last session on it ended:
+// VERDICT: APPROVED ISSUES: - None.`, `index.tsx — No findings.`, and worst,
+// `config.go — prior decision: Deploy: NO-DEPLOY until at least findings 1 and 2
+// are fixed.` — a hold from a review of something else entirely, handed to an
+// agent months later as the standing position on that file.
+func isReviewVerdict(trimmed string) bool {
+	if strings.Contains(trimmed, "REQUIRED_FIXES:") || strings.Contains(trimmed, "NO-DEPLOY") {
+		return true
+	}
+	for _, p := range []string{"VERDICT:", "Findings:", "No findings", "Deploy:"} {
+		if strings.HasPrefix(trimmed, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func IsAgentArtifact(text string) bool {
 	for _, m := range agentArtifactMarkers {
 		if strings.Contains(text, m) {
@@ -579,7 +602,7 @@ func IsAgentArtifact(text string) bool {
 		return true
 	}
 	trimmed := strings.TrimSpace(text)
-	if IsCompactionSummary(trimmed) || IsHookStatusLine(trimmed) {
+	if IsCompactionSummary(trimmed) || IsHookStatusLine(trimmed) || isReviewVerdict(trimmed) {
 		return true
 	}
 	// Harness preambles injected as user turns: <environment_context>,
@@ -619,7 +642,12 @@ func IsAgentArtifact(text string) bool {
 
 // compactionOutlineRE is the numbered outline the summary opens with; a person
 // asking "Summary: what is the Primary Request and Intent here?" has no "1.".
-var compactionOutlineRE = regexp.MustCompile(`^Summary:\s*1\.\s*Primary Request and Intent`)
+//
+// The heading arrives emphasised as often as not — `1. **Primary Request and
+// Intent:**` — and without that the block was read as something a person wrote.
+// Found where it does the most damage: `promote` was keeping "asked: Summary: 1.
+// **Primary Request and Intent:** …" as the decision a session reached.
+var compactionOutlineRE = regexp.MustCompile(`^Summary:\s*1\.\s*[*_]{0,2}\s*Primary Request and Intent`)
 
 // IsCompactionSummary reports whether a message is the block a harness writes
 // as the first user turn after a compaction — Claude Code's "Summary: 1.
@@ -1039,6 +1067,14 @@ func endsWord(text string) bool {
 // шардирование" promoted a session about something else entirely.
 func CarriesDecisionExcept(text string, asked []string) bool {
 	low := strings.ToLower(text)
+	// deja asks an agent to credit a recall it used — "déjà vu: … — reusing
+	// it" — and that sentence reports what a past session decided, so every
+	// decision marker in the quoted line fires on it. Found at the file line:
+	// `doctor_auto.go … prior decision: deja-vu recalled:` — deja quoting
+	// itself quoting a session, offered as the decision about a file.
+	if quotesDeja(low) {
+		return false
+	}
 	for _, p := range planAfterMarker {
 		// A plan may still report an outcome elsewhere in the line, so this
 		// blanks the plan wording rather than disqualifying the whole line.
@@ -1057,6 +1093,22 @@ func CarriesDecisionExcept(text string, asked []string) bool {
 			}
 		}
 		if !skip {
+			return true
+		}
+	}
+	return false
+}
+
+// quotesDeja reports whether the line is an agent repeating what deja said.
+// The credit line deja asks for is the common case; the block headers are what
+// a pasted injection looks like.
+func quotesDeja(low string) bool {
+	for _, p := range []string{
+		"déjà vu:", "deja vu:", "deja-vu recalled", "deja recalled",
+		"recalled from this machine", "recalled history from prior sessions",
+		"<deja-recall", "deja found sessions",
+	} {
+		if strings.Contains(low, p) {
 			return true
 		}
 	}
