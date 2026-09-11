@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/vshulcz/deja-vu/internal/model"
 	"github.com/vshulcz/deja-vu/internal/redact"
@@ -67,8 +66,14 @@ func ExtractCompactionContext(s model.Session, opts ExtractOptions) model.Compac
 			if IsAgentArtifact(m.Text) {
 				continue
 			}
+			// The open items are taken out of the text the conclusion is built
+			// from: one turn often states both — "Fixed and the suite is green.
+			// Осталось: сбросить счётчик …" — and the packet printed that
+			// sentence twice, once as a gap and once inside the conclusion, out
+			// of a budget that drops items to fit.
+			open := explicitOpenItems(m.Text, ref)
 			if CarriesDecision(m.Text) {
-				text := contextProse(m.Text, contextFactBytes)
+				text := contextProse(withoutOpenLines(m.Text, open), contextFactBytes)
 				if text != "" && !hasFact(c.Conclusions, text) {
 					if len(c.Conclusions) == opts.MaxItems {
 						c.Truncated = true
@@ -77,7 +82,7 @@ func ExtractCompactionContext(s model.Session, opts ExtractOptions) model.Compac
 					}
 				}
 			}
-			for _, item := range explicitOpenItems(m.Text, ref) {
+			for _, item := range open {
 				if item.Kind == "gap" {
 					if len(c.Gaps) == opts.MaxItems {
 						c.Truncated = true
@@ -228,21 +233,52 @@ func trivialContinuation(text string) bool {
 	if text == "" {
 		return true
 	}
+	// Punctuation between the words too: "thanks, continue" and "ага, давай" are
+	// the same turn as without the comma.
 	low := strings.ToLower(strings.Trim(text, " .,!?:;"))
-	switch low {
-	case "y", "proceed", "please continue", "continue please":
-		return true
-	}
-	for _, nudge := range nudgeWords {
-		if low == nudge {
-			return true
+	low = strings.Join(strings.Fields(strings.Map(func(r rune) rune {
+		switch r {
+		case ',', ';', '.', '!', '?', ':':
+			return ' '
 		}
-		// "давай дальше", "ok go on": a nudge and a word or two, nothing else.
-		if strings.HasPrefix(low, nudge+" ") && utf8.RuneCountInString(low) < askMinRunes+10 {
-			return true
+		return r
+	}, low)), " ")
+	// "ok go on", "да давай дальше": nudges all the way down, and nothing else.
+	// Bounding by length instead let a new instruction through as a nudge — and
+	// "давай <do X>" is how an instruction is usually given on this store:
+	// measured against this rule, "давай починим экспортер", "ok cap the retries
+	// at three", "continue with the parser fix", "yes revert it" and "go fix the
+	// pool" all read as "carry on", so the packet kept naming the task the reader
+	// had just replaced.
+	return onlyNudges(low)
+}
+
+// continuationWords are the nudge words plus the ways of saying only "carry on"
+// that the handover picker has no use for: `nudgeWords` is shared with it, and
+// these belong to this rule alone.
+var continuationWords = append(append([]string{}, nudgeWords...),
+	"y", "proceed", "please", "please continue", "continue please", "please do it")
+
+// onlyNudges reports whether the turn is made of nudge words and nothing else.
+// Longest match first, so "давай дальше" is one nudge rather than "давай" plus a
+// word it does not know.
+func onlyNudges(low string) bool {
+	for low != "" {
+		best := ""
+		for _, nudge := range continuationWords {
+			if len(nudge) <= len(best) {
+				continue
+			}
+			if low == nudge || strings.HasPrefix(low, nudge+" ") {
+				best = nudge
+			}
 		}
+		if best == "" {
+			return false
+		}
+		low = strings.TrimSpace(strings.TrimPrefix(low, best))
 	}
-	return false
+	return true
 }
 
 func contextRef(s model.Session, m model.Message) model.ContextRef {
@@ -277,6 +313,26 @@ type classifiedOpenItem struct {
 	Kind string
 }
 
+// withoutOpenLines is the message without the lines that became open items, so a
+// turn that states a conclusion and what is left over is charged once for each.
+func withoutOpenLines(text string, open []classifiedOpenItem) string {
+	if len(open) == 0 {
+		return text
+	}
+	drop := make(map[string]bool, len(open))
+	for _, item := range open {
+		drop[item.Text] = true
+	}
+	var kept []string
+	for _, line := range strings.Split(text, "\n") {
+		if drop[contextProse(line, contextFactBytes)] {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
 func explicitOpenItems(text string, ref model.ContextRef) []classifiedOpenItem {
 	var out []classifiedOpenItem
 	for _, line := range strings.Split(text, "\n") {
@@ -287,9 +343,9 @@ func explicitOpenItems(text string, ref model.ContextRef) []classifiedOpenItem {
 		low := strings.ToLower(line)
 		kind := ""
 		switch {
-		case hasLabel(low, "gap"), hasLabel(low, "unverified"), hasLabel(low, "missing"), hasLabel(low, "blocked"):
+		case hasAnyLabel(low, gapLabels):
 			kind = "gap"
-		case hasLabel(low, "conflict"), hasLabel(low, "disagreement"), hasLabel(low, "contradiction"):
+		case hasAnyLabel(low, conflictLabels):
 			kind = "conflict"
 		}
 		if kind != "" {
@@ -299,9 +355,53 @@ func explicitOpenItems(text string, ref model.ContextRef) []classifiedOpenItem {
 	return out
 }
 
+// gapLabels are the ways a turn says what is still to be done, at the start of
+// the line where the shape is unambiguous.
+//
+// The list was gap/unverified/missing/blocked, and nobody writes those: measured
+// over 72137 assistant lines on a real store, that shape appeared once. The words
+// below, in the same line-initial shape, appear 28 times and every one of the
+// fourteen sampled was genuinely an open item ("Осталось: **страница сравнения**
+// …", "Что осталось: две дальние формулировки"). The shape is what keeps this
+// precise — "осталось" in the middle of a sentence is usually "12 of 17 jobs are
+// left", which is not an open item at all.
+var gapLabels = []string{
+	"gap", "unverified", "missing", "blocked",
+	"still open", "open question", "open questions", "open item", "open items",
+	"what's left", "whats left", "left to do", "not done", "not verified", "todo",
+	"осталось", "что осталось", "остаётся", "остается", "остался",
+	"открытый вопрос", "открытые вопросы", "не сделал", "чего не сделал",
+	"не доделал", "не проверено",
+}
+
+var conflictLabels = []string{"conflict", "disagreement", "contradiction", "конфликт", "противоречие"}
+
+func hasAnyLabel(line string, labels []string) bool {
+	for _, label := range labels {
+		if hasLabel(line, label) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasLabel reports whether the line opens with this label. The dash forms are
+// how the same thing is written in prose — "**Открытый вопрос — OpenClaw плагин
+// …**" — and the bold markers are stripped rather than spelled into every label.
 func hasLabel(line, label string) bool {
-	line = strings.TrimLeft(line, "-* \t")
-	return strings.HasPrefix(line, label+":") || strings.HasPrefix(line, label+"**:")
+	line = strings.TrimLeft(line, "-*#> \t")
+	line = strings.TrimPrefix(line, "**")
+	if !strings.HasPrefix(line, label) {
+		return false
+	}
+	rest := strings.TrimPrefix(strings.TrimPrefix(line, label), "**")
+	rest = strings.TrimLeft(rest, " ")
+	for _, sep := range []string{":", "—", "-", "–"} {
+		if strings.HasPrefix(rest, sep) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasFact(facts []model.ContextFact, text string) bool {
@@ -467,10 +567,16 @@ func boundCompactionContext(c model.CompactionContext) model.CompactionContext {
 		}
 		c.Truncated = true
 		switch {
-		case len(c.Conclusions) > 0:
-			c.Conclusions = c.Conclusions[1:]
+		// The command list goes before the conclusions. A resuming agent can
+		// re-run a command; it cannot re-derive what the last session settled,
+		// and that is the whole reason the packet exists. Measured on the local
+		// model with a packet over its budget: conclusions-first answered the
+		// question 3 of 3 times against 1 of 3 when the command list was kept
+		// and the conclusions were the first thing dropped.
 		case len(c.Tests) > 0:
 			c.Tests = c.Tests[1:]
+		case len(c.Conclusions) > 0:
+			c.Conclusions = c.Conclusions[1:]
 		case len(c.Gaps) > 1:
 			c.Gaps = c.Gaps[:len(c.Gaps)-1]
 		case len(c.Conflicts) > 1:
@@ -524,8 +630,14 @@ func RenderCompactionContext(c model.CompactionContext, byteBudget int) string {
 	}
 	addOpenSection(&b, &omittedAny, limit, "Explicit gaps", c.Gaps)
 	addOpenSection(&b, &omittedAny, limit, "Explicit conflicts", c.Conflicts)
-	addTestSection(&b, &omittedAny, limit, c.Tests)
+	// Conclusions before the command list, for the reason boundCompactionContext
+	// drops the list first: the render budget cuts from the bottom, so whatever
+	// is printed last is what a tight packet loses.
+	// Conclusions before the command list, for the reason boundCompactionContext
+	// drops the list first: the render budget cuts from the bottom, so whatever
+	// is printed last is what a tight packet loses.
 	addFactSection(&b, &omittedAny, limit, "Assistant-reported conclusions", c.Conclusions)
+	addTestSection(&b, &omittedAny, limit, c.Tests)
 	if omittedAny && b.Len()+len(omitted) <= byteBudget {
 		b.WriteString(omitted)
 	}
@@ -543,30 +655,49 @@ func RenderCompactionContext(c model.CompactionContext, byteBudget int) string {
 	return out
 }
 
+// renderFreshness says whether the conclusions below still describe this
+// checkout, in the words a resuming agent can act on.
+//
+// It used to print the fingerprints: `head=<40 hex>, branch=master,
+// worktree=<64 hex>, checked=<stamp>` — 150 bytes of a 1.4 KB packet, and the
+// worktree hash is deja's own digest of the tree, which nothing outside deja can
+// do anything with. What the agent needs is the verdict the recovery path has
+// already worked out: unchanged, or changed and here is the commit it was
+// captured at, which is enough for a diff.
+//
+// The error case also read as "Repository freshness unavailable: Repository
+// changed since compaction." — the recovery path puts its verdict in the same
+// field, so the prefix contradicted it.
 func renderFreshness(f model.RepositoryFreshness) string {
 	if strings.HasPrefix(f.WorktreeState, "partial:") {
 		return "Repository fingerprint is partial; validate files and tests before reusing conclusions.\n"
 	}
 	if f.Error != "" {
-		return "Repository freshness unavailable: " + f.Error + "\n"
+		line := f.Error
+		if !strings.HasPrefix(strings.ToLower(line), "repository") {
+			line = "Repository freshness unavailable: " + line
+		}
+		if head := shortHead(f.Head); head != "" {
+			line += " Captured at " + head + "."
+		}
+		return line + "\n"
 	}
-	var parts []string
-	if f.Head != "" {
-		parts = append(parts, "head="+f.Head)
-	}
-	if f.Branch != "" {
-		parts = append(parts, "branch="+f.Branch)
-	}
-	if f.WorktreeState != "" {
-		parts = append(parts, "worktree="+f.WorktreeState)
-	}
-	if !f.CheckedAt.IsZero() {
-		parts = append(parts, "checked="+f.CheckedAt.UTC().Format(time.RFC3339))
-	}
-	if len(parts) == 0 {
+	if f.Head == "" && f.Branch == "" {
 		return "Repository freshness unavailable: hook did not record it.\n"
 	}
-	return "Repository freshness: " + strings.Join(parts, ", ") + "\n"
+	line := "Repository unchanged since capture"
+	if f.Branch != "" {
+		line += " (branch " + f.Branch + ")"
+	}
+	return line + ".\n"
+}
+
+// shortHead is a commit an agent can pass to git, without the rest of the hash.
+func shortHead(head string) string {
+	if len(head) < 12 {
+		return head
+	}
+	return head[:12]
 }
 
 func addOpenSection(b *strings.Builder, omitted *bool, limit int, title string, items []model.ContextOpenItem) {
