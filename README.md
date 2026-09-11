@@ -239,6 +239,14 @@ anything already wired to them.
 
 ## Supported harnesses
 
+With auto-recall installed, Claude Code and Codex compaction hooks automatically
+save a bounded continuation packet in the existing local index. The next hook
+restores the objective, conclusions, recorded tests, explicit gaps/conflicts,
+and provenance for the same session and workspace. Repository changes are
+flagged for validation. `deja stats` measures raw tool calls before the first
+edit after compaction. See [automatic compaction recovery](docs/compaction.md)
+for supported inputs, privacy controls, and limits.
+
 <!-- matrix:start -->
 aider &middot; Amp &middot; Antigravity &middot; Claude Code &middot; Cline &middot; Codex CLI &middot; Copilot CLI &middot; VS Code Copilot Chat &middot; Cursor &middot; DeepSeek Harness &middot; Gemini CLI &middot; Goose &middot; Grok Build &middot; Hermes &middot; Kimi Code &middot; omp (Oh My Pi) &middot; OpenClaw &middot; opencode &middot; Continue &middot; Crush &middot; pi &middot; prime-agent (PrimeIntellect) &middot; Qwen Code &middot; Roo Code &middot; Zed.
 

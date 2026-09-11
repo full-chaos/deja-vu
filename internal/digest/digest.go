@@ -649,6 +649,13 @@ func IsAgentArtifact(text string) bool {
 // **Primary Request and Intent:** …" as the decision a session reached.
 var compactionOutlineRE = regexp.MustCompile(`^Summary:\s*1\.\s*[*_]{0,2}\s*Primary Request and Intent`)
 
+// compactionIntentHeadingRE is the same heading that identifies a host
+// compaction summary, including the Markdown emphasis current hosts put around
+// the title. Keep parsing and recognition in step: recognising an emphasised
+// summary while failing to extract its intent leaves a resumed session with no
+// objective when its only later turn is "continue".
+var compactionIntentHeadingRE = regexp.MustCompile(`(?m)(?:^|Summary:\s*)1\.\s*[*_]{0,2}\s*Primary Request and Intent\s*(?:[*_]{0,2}\s*:\s*[*_]{0,2}|[*_]{0,2})`)
+
 // IsCompactionSummary reports whether a message is the block a harness writes
 // as the first user turn after a compaction — Claude Code's "Summary: 1.
 // Primary Request and Intent: …" and the "This session is being continued
@@ -711,12 +718,11 @@ func compactedHalf(s model.Session) string {
 // compactionIntent is the "Primary Request and Intent" section of a compaction
 // summary, cut to the first few lines of it.
 func compactionIntent(summary string) string {
-	const heading = "1. Primary Request and Intent"
-	i := strings.Index(summary, heading)
-	if i < 0 {
+	loc := compactionIntentHeadingRE.FindStringIndex(summary)
+	if loc == nil {
 		return ""
 	}
-	rest := summary[i+len(heading):]
+	rest := summary[loc[1]:]
 	rest = strings.TrimLeft(rest, ":* \n")
 	// The next numbered heading ends it; a summary that has none is cut by the
 	// line budget below.

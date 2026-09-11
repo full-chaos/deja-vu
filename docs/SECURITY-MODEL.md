@@ -40,6 +40,14 @@ location. The directory contains:
   the few files each session touched most, and hashes — not text — of the
   questions it asked.
 
+At a supported pre-compaction hook, `manifest.gob` also retains redacted,
+transcript-derived continuation packets for at most 32 session/workspace pairs,
+with a 24 KiB limit per packet. These contain objectives, conclusions, recorded
+tests, explicit gaps/conflicts, provenance, and repository fingerprints. They
+remain local, are omitted from sync export, and follow ignored/excluded project
+and forgotten-session controls. `deja forget` removes matching packets even
+before their source sessions have been indexed. See [compaction recovery](compaction.md).
+
 Privacy control files are primary data, not cache data: the XDG-aware
 `~/.config/deja/tombstones` list prevents forgotten source sessions from being
 re-ingested, and `~/.config/deja/exclude` contains project patterns skipped at
@@ -54,6 +62,10 @@ Usage events are appended to the sibling file `<index-dir>.usage.jsonl`. This
 sidecar records the kind and time of local search, recall, context, and hook
 use. It rotates at 1 MiB and retains 14 days; it does not contain session text
 or queries.
+
+Compaction capture and first-edit measurement events use this same bounded log.
+They carry hashed session/workspace identifiers, a capture revision, action
+counts, and short failure reasons. They do not contain the recovery packet.
 
 The index and sidecar never leave the machine through indexing, search, MCP,
 stats, or hook operation. The MCP server uses JSON-RPC over standard input and
